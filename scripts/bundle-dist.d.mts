@@ -20,3 +20,11 @@ export declare function buildSplitEsbuildExecInvocation(args: {
 	argv: string[];
 	options: { cwd: string; stdio: "inherit" };
 };
+
+/** TASK-130: installs the host runtime packages the split bins inline; returns the names it added. */
+export declare function provisionHostRuntimePackages(): string[];
+
+/** TASK-130: removes exactly the packages {@link provisionHostRuntimePackages} added. */
+export declare function removeProvisionedPackages(
+	names: readonly string[],
+): void;
