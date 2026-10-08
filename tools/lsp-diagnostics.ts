@@ -272,6 +272,20 @@ function lspUnavailableMessage(
 	return `LSP unavailable for ${filePath}: ${reason}; ready=${health.serverCountReady ?? 0}/${health.serverCountAttempted ?? 0}.${candidates}.${stale}`;
 }
 
+/**
+ * TASK-130: the primary analyzer for this file has no ready client (e.g. no
+ * Python analyzer installed). Auxiliary servers answering for the file is not a
+ * primary verdict, so this is reported as unavailable — never as clean.
+ */
+function primaryUnavailableMessage(filePath: string): string {
+	const primary = primaryServerId(filePath);
+	return (
+		`LSP unavailable for ${filePath}: ` +
+		`${primary ? `primary server ${primary} has no ready client` : "no primary LSP server for this file"}; ` +
+		"no diagnostics were confirmed, so this is not a clean result."
+	);
+}
+
 function boundedPositiveInt(
 	value: unknown,
 	fallback: number,
@@ -616,6 +630,11 @@ type DiagnosticsCollectionResult = {
 	 * getDiagnostics fallback) → treated as "unknown" (no demotion).
 	 */
 	binding?: DiagnosticBinding;
+	/**
+	 * TASK-130: the primary server had no ready client, so no touch answered and
+	 * the unscoped aggregate read was NOT used as the file's verdict.
+	 */
+	primaryUnavailable?: boolean;
 };
 
 async function collectDiagnosticsForFile(
@@ -635,6 +654,7 @@ async function collectDiagnosticsForFile(
 	serverScope: "primary" | "all" = "all",
 ): Promise<DiagnosticsCollectionResult> {
 	let timedOut = false;
+	let primaryUnavailable = false;
 	let content: string | undefined;
 	// `touchFile` is the authoritative collection boundary for every scope: it
 	// preserves per-touch timeout, content-binding, and silent-clean confirmation
@@ -738,6 +758,8 @@ async function collectDiagnosticsForFile(
 			saved: true,
 		});
 		timedOut = touched?.inconclusive === true;
+		// TASK-130: scoped to the primary, an empty touch means no primary client.
+		primaryUnavailable = touched === undefined && serverScope === "primary";
 	} catch {
 		// Non-fatal: getDiagnostics may still have stale/health information.
 	}
@@ -795,6 +817,9 @@ async function collectDiagnosticsForFile(
 			touched?.diagnosticsUnsupportedServerIds ?? [],
 		content,
 		binding,
+		// TASK-130: the primary had no ready client and the aggregate read found
+		// nothing. That empty result is not a primary verdict — report unavailable.
+		primaryUnavailable: primaryUnavailable && filtered.length === 0,
 	};
 }
 
@@ -1324,6 +1349,7 @@ async function collectFileDiagnosticResult(
 		content: collectedContent,
 		binding,
 		tooLargeReason,
+		primaryUnavailable,
 		skipReason,
 	} = await collectDiagnosticsForFile(
 		file,
@@ -1347,7 +1373,7 @@ async function collectFileDiagnosticResult(
 	// be merged in rather than discarded.
 	let effectiveRawDiags = rawDiags;
 	let confirmation: "clean" | "unconfirmed" | undefined;
-	if (diagnosticsUnsupportedServerIds.length > 0) {
+	if (primaryUnavailable || diagnosticsUnsupportedServerIds.length > 0) {
 		// No diagnostic provider and no push evidence is a capability boundary,
 		// not a clean result and not a timeout.
 		confirmation = undefined;
@@ -1445,7 +1471,8 @@ async function collectFileDiagnosticResult(
 		scopeKey !== undefined &&
 		confirmation !== "unconfirmed" &&
 		diagnosticsUnsupportedServerIds.length === 0 &&
-		unconfirmedServerIds.length === 0
+		unconfirmedServerIds.length === 0 &&
+		!primaryUnavailable
 	) {
 		// #3088: the entry records the INLINE-suppressed set, never the
 		// disposition/rule-policy-filtered one. An inline `pi-lens-ignore` comment
@@ -1469,7 +1496,9 @@ async function collectFileDiagnosticResult(
 	return {
 		file,
 		diagnostics: diagnosticsToFileDiags(file, filteredDiags),
-		unavailable: lspUnavailableMessage(file, health),
+		unavailable:
+			lspUnavailableMessage(file, health) ??
+			(primaryUnavailable ? primaryUnavailableMessage(file) : undefined),
 		confirmation,
 		timedOut: confirmation === "unconfirmed" ? timedOut : undefined,
 		...(rootFallback && { rootFallback }),
@@ -1508,6 +1537,7 @@ async function runFileDiagnostics(
 		content: collectedContent,
 		binding,
 		tooLargeReason,
+		primaryUnavailable,
 		skipReason,
 	} = await collectDiagnosticsForFile(
 		absPath,
@@ -1534,7 +1564,9 @@ async function runFileDiagnostics(
 	const lspHealth = lspService.getDiagnosticsHealth?.(absPath) as
 		| LspHealthLike
 		| undefined;
-	const unavailable = lspUnavailableMessage(absPath, lspHealth);
+	const unavailable =
+		lspUnavailableMessage(absPath, lspHealth) ??
+		(primaryUnavailable ? primaryUnavailableMessage(absPath) : undefined);
 	// #533: an empty result needs a confirmed/unconfirmed verdict — a push-only,
 	// silent-on-clean server (classic typescript) publishes nothing on a
 	// clean→clean edit, so "0 diagnostics" from it is unverifiable, not clean.
@@ -1546,7 +1578,7 @@ async function runFileDiagnostics(
 	// diagnostics it surfaces are merged in, not discarded.
 	let effectiveRawDiags = rawDiags;
 	let confirmation: "clean" | "unconfirmed" | undefined;
-	if (diagnosticsUnsupportedServerIds.length > 0) {
+	if (primaryUnavailable || diagnosticsUnsupportedServerIds.length > 0) {
 		confirmation = undefined;
 	} else if (skipReason !== undefined) {
 		confirmation = "unconfirmed";
