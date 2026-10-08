@@ -287,7 +287,6 @@ export function provisionHostRuntimePackages() {
 				"--no-package-lock",
 				"--ignore-scripts",
 				"--legacy-peer-deps",
-				"--omit=dev",
 				"--omit=peer",
 				...specs,
 			],
