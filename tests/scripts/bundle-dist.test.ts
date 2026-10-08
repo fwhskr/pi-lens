@@ -132,8 +132,23 @@ describe("buildSplitEsbuildExecInvocation (#3219)", () => {
 			// Chunks at the dist/ ROOT, beside index.js: shared code's
 			// import.meta.url then resolves where the single-file bundle's does.
 			expect(split.argv).toContain("--chunk-names=chunk-[hash]");
-			expect(split.argv.filter((a) => a.startsWith("--external:"))).toEqual(
-				index.argv.filter((a) => a.startsWith("--external:")),
+			// TASK-130: standalone bins cannot rely on pi supplying the host
+			// runtime packages, so they are bundled; the index bundle keeps them
+			// external. Everything else stays external in both.
+			const splitExternals = split.argv.filter((a) =>
+				a.startsWith("--external:"),
+			);
+			const indexExternals = index.argv.filter((a) =>
+				a.startsWith("--external:"),
+			);
+			expect(splitExternals).not.toContain("--external:@earendil-works/pi-tui");
+			expect(splitExternals).not.toContain("--external:typebox");
+			expect(indexExternals).toContain("--external:@earendil-works/pi-tui");
+			expect(splitExternals).toEqual(
+				indexExternals.filter(
+					(a) =>
+						!a.includes("@earendil-works/pi-tui") && a !== "--external:typebox",
+				),
 			);
 			expect(split.argv.find((a) => a.startsWith("--banner:js="))).toContain(
 				"__pilensCreateRequire",

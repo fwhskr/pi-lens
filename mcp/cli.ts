@@ -148,8 +148,17 @@ async function buildGraph(): Promise<void> {
 	);
 }
 
+const USAGE =
+	"usage: pi-lens build-graph [--cwd <dir>]\n" +
+	"  Builds the review graph for <dir> (default: current directory) and exits.\n";
+
 async function main(): Promise<void> {
 	const command = process.argv[2];
+	// Informational flags exit 0 before any work (TASK-130).
+	if (command === "--help" || command === "-h" || command === "help") {
+		process.stdout.write(USAGE);
+		return;
+	}
 	if (command !== "build-graph") {
 		fail("usage: pi-lens build-graph [--cwd <dir>]");
 	}

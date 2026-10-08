@@ -70,7 +70,10 @@ import {
 	buildIsolatedExecInvocation,
 	createIsolatedExecPrefix,
 } from "./lib/exec-isolation.mjs";
-import { BUNDLE_EXTERNALS } from "./lib/host-provided-deps.mjs";
+import {
+	BUNDLE_EXTERNALS,
+	HOST_PROVIDED_RUNTIME_PACKAGES,
+} from "./lib/host-provided-deps.mjs";
 
 const ESBUILD_VERSION = "0.28.1";
 
@@ -122,6 +125,15 @@ export const SPLIT_ENTRIES = [
 // embedded runtime; native/wasm ones are dynamic-imported by absolute path.
 // Single source of truth — see ./lib/host-provided-deps.mjs (#1926).
 const EXTERNAL = BUNDLE_EXTERNALS;
+
+// The split entries are standalone Node bins (pi-lens, pi-lens-mcp, the workers),
+// not extensions loaded inside pi, so pi never supplies their host runtime
+// packages. Leaving those external made the installed `pi-lens` CLI fail at
+// import with ERR_MODULE_NOT_FOUND for @earendil-works/pi-tui (TASK-130). They
+// are bundled into the split chunks instead. dist/index.js keeps them external.
+const SPLIT_EXTERNAL = EXTERNAL.filter(
+	(name) => !HOST_PROVIDED_RUNTIME_PACKAGES.includes(name),
+);
 
 // esbuild's ESM output wraps bundled CommonJS modules (e.g. vscode-jsonrpc) in a
 // shim that throws on any dynamic require(); a pure-ESM Node process has no
@@ -204,7 +216,7 @@ export function buildSplitEsbuildExecInvocation({
 			"--format=esm",
 			"--splitting",
 			"--chunk-names=chunk-[hash]",
-			...EXTERNAL.map((name) => `--external:${name}`),
+			...SPLIT_EXTERNAL.map((name) => `--external:${name}`),
 			`--banner:js=${REQUIRE_BANNER}`,
 			`--outdir=${splitOutDir}`,
 		],
