@@ -60,6 +60,7 @@ import {
 	cpSync,
 	existsSync,
 	readFileSync,
+	readdirSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
@@ -248,12 +249,32 @@ function runEsbuild(build) {
 	}
 }
 
+/** Top-level package directories under node_modules, scoped ones as "@scope/name". */
+function installedTopLevelPackages() {
+	const nodeModules = path.join(root, "node_modules");
+	const names = new Set();
+	if (!existsSync(nodeModules)) return names;
+	for (const entry of readdirSync(nodeModules)) {
+		if (entry.startsWith(".")) continue;
+		if (entry.startsWith("@")) {
+			for (const scoped of readdirSync(path.join(nodeModules, entry))) {
+				names.add(`${entry}/${scoped}`);
+			}
+		} else {
+			names.add(entry);
+		}
+	}
+	return names;
+}
+
 /**
  * Host-provided runtime packages the standalone bins inline (see SPLIT_EXTERNAL)
- * but that a production-only install does not contain. Returns the names this
- * call installed, so the caller removes exactly those afterwards: the extension
- * entry keeps them external, and pi's loader must keep serving them, never a
- * copy left in this package's node_modules (#1926).
+ * but that a production-only install does not contain. Installs them with
+ * --no-save and returns every top-level package that install added (the
+ * requested ones plus anything npm pulled in), so the caller removes exactly
+ * those afterwards: the extension entry keeps them external, and pi's loader
+ * must keep serving them, never a copy left in this package's node_modules
+ * (#1926).
  *
  * @returns {string[]}
  */
@@ -276,8 +297,11 @@ export function provisionHostRuntimePackages() {
 		);
 		process.exit(1);
 	}
+	const before = installedTopLevelPackages();
 	try {
-		// --ignore-scripts keeps this install from re-running `prepare`.
+		// --ignore-scripts keeps this install from re-running `prepare`. No
+		// --omit=dev: npm would drop the named packages, which are not in
+		// package.json.
 		execFileSync(
 			process.execPath,
 			[
@@ -298,10 +322,10 @@ export function provisionHostRuntimePackages() {
 		);
 		process.exit(1);
 	}
-	return missing;
+	return [...installedTopLevelPackages()].filter((name) => !before.has(name));
 }
 
-/** Remove only the packages {@link provisionHostRuntimePackages} installed. */
+/** Remove only the packages {@link provisionHostRuntimePackages} added. */
 export function removeProvisionedPackages(names) {
 	for (const name of names) {
 		rmSync(path.join(root, "node_modules", name), {
