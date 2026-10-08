@@ -248,6 +248,70 @@ function runEsbuild(build) {
 	}
 }
 
+/**
+ * Host-provided runtime packages the standalone bins inline (see SPLIT_EXTERNAL)
+ * but that a production-only install does not contain. Returns the names this
+ * call installed, so the caller removes exactly those afterwards: the extension
+ * entry keeps them external, and pi's loader must keep serving them, never a
+ * copy left in this package's node_modules (#1926).
+ *
+ * @returns {string[]}
+ */
+export function provisionHostRuntimePackages() {
+	const manifest = JSON.parse(
+		readFileSync(path.join(root, "package.json"), "utf8"),
+	);
+	const missing = HOST_PROVIDED_RUNTIME_PACKAGES.filter(
+		(name) =>
+			!existsSync(path.join(root, "node_modules", name, "package.json")),
+	);
+	if (missing.length === 0) return [];
+	const specs = missing.map(
+		(name) =>
+			`${name}@${manifest.devDependencies?.[name] ?? manifest.peerDependencies?.[name] ?? "*"}`,
+	);
+	if (!npmCli || !isNpmCli) {
+		console.error(
+			`[bundle] cannot provision ${missing.join(", ")} without npm_execpath; run via npm.`,
+		);
+		process.exit(1);
+	}
+	try {
+		// --ignore-scripts keeps this install from re-running `prepare`.
+		execFileSync(
+			process.execPath,
+			[
+				npmCli,
+				"install",
+				"--no-save",
+				"--no-package-lock",
+				"--ignore-scripts",
+				"--legacy-peer-deps",
+				"--omit=dev",
+				"--omit=peer",
+				...specs,
+			],
+			{ cwd: root, stdio: "inherit" },
+		);
+	} catch (err) {
+		console.error(
+			`[bundle] provisioning ${specs.join(", ")} failed: ${err?.message ?? err}`,
+		);
+		process.exit(1);
+	}
+	return missing;
+}
+
+/** Remove only the packages {@link provisionHostRuntimePackages} installed. */
+export function removeProvisionedPackages(names) {
+	for (const name of names) {
+		rmSync(path.join(root, "node_modules", name), {
+			recursive: true,
+			force: true,
+		});
+	}
+}
+
 export function main() {
 	if (!existsSync(distEntry)) {
 		console.error(
@@ -285,10 +349,18 @@ export function main() {
 	// workers, so this must run before anything overwrites dist/mcp/*.js; a
 	// previous partial run is detected by dist/workers/ and not re-bundled.
 	if (!existsSync(path.join(root, "dist", "workers"))) {
-		rmSync(splitOutDir, { recursive: true, force: true });
-		if (!runEsbuild(buildSplitEsbuildExecInvocation)) process.exit(1);
-		cpSync(splitOutDir, path.join(root, "dist"), { recursive: true });
-		rmSync(splitOutDir, { recursive: true, force: true });
+		// A git install runs this under `npm install --omit=dev`, which leaves the
+		// host-provided runtime packages absent, so esbuild cannot inline them into
+		// the standalone bins. Provision them for this build only (see below).
+		const provisioned = provisionHostRuntimePackages();
+		try {
+			rmSync(splitOutDir, { recursive: true, force: true });
+			if (!runEsbuild(buildSplitEsbuildExecInvocation)) process.exit(1);
+			cpSync(splitOutDir, path.join(root, "dist"), { recursive: true });
+			rmSync(splitOutDir, { recursive: true, force: true });
+		} finally {
+			removeProvisionedPackages(provisioned);
+		}
 		console.error(
 			`[bundle] wrote ${SPLIT_ENTRIES.length} split entries and their shared chunks`,
 		);
