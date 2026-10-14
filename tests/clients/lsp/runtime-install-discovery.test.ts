@@ -1,6 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ChildProcess } from "node:child_process";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { PassThrough } from "node:stream";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { LSPProcess } from "../../../clients/lsp/launch.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 // Drive the candidate-resolution chain without touching disk/toolchains: mock
@@ -35,6 +39,23 @@ import {
 	TypeScriptServer,
 } from "../../../clients/lsp/server.js";
 import { ensureTool } from "../../../clients/installer/index.js";
+
+function makeFakeProcess(): LSPProcess {
+	return {
+		process: new ChildProcess(),
+		stdin: new PassThrough(),
+		stdout: new PassThrough(),
+		stderr: new PassThrough(),
+		pid: 0,
+		command: "synthetic-lsp",
+		args: [],
+	};
+}
+
+function ownedTempDir(): string | undefined {
+	const env = launchLSP.mock.calls.at(-1)?.[2]?.env;
+	return typeof env?.TMPDIR === "string" ? env.TMPDIR : undefined;
+}
 
 const isWin = process.platform === "win32";
 const sep = (...parts: string[]) => path.join(...parts);
@@ -143,16 +164,30 @@ describe("runtime-install / discovery server wiring (#241)", () => {
 			id === "typescript-language-server" ? GLOBAL_TLS : undefined,
 		);
 		launchLSP.mockReset();
-		launchLSP.mockResolvedValue({ kill: vi.fn() } as never);
-		const fs = await import("node:fs");
+		const fakeProcess = makeFakeProcess();
+		launchLSP.mockResolvedValue(fakeProcess);
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ts-no-cwd-ts-"));
+		const agentDir = path.join(tmp, ".pi", "agent");
+		vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
 		const oldCwd = process.cwd();
+		let tempDir: string | undefined;
 		process.chdir(tmp);
 		try {
 			// A root + cwd with no node_modules/.bin/typescript-language-server and no
 			// node_modules/typescript, so only ensureTool discovery can resolve either
 			// the LSP binary or tsserver.
 			const res = await TypeScriptServer.spawn(tmp, { allowInstall: false });
+			tempDir = ownedTempDir();
+			expect(tempDir).toEqual(expect.any(String));
+			const ownedDir = tempDir as string;
+			expect(ownedDir).not.toBe(os.tmpdir());
+			expect(path.dirname(ownedDir)).toBe(path.join(agentDir, "var", "tmp"));
+			expect(fs.existsSync(ownedDir)).toBe(true);
+			expect(launchLSP.mock.calls.at(-1)?.[2]?.env).toMatchObject({
+				TMPDIR: ownedDir,
+				TMP: ownedDir,
+				TEMP: ownedDir,
+			});
 			expect(vi.mocked(ensureTool)).toHaveBeenCalledWith(
 				"typescript-language-server",
 				{ allowInstall: false },
@@ -162,11 +197,19 @@ describe("runtime-install / discovery server wiring (#241)", () => {
 			});
 			expect(triedCommands()).toContain(GLOBAL_TLS);
 			expect(res).toBeDefined();
+			fakeProcess.process.emit("close", 0, null);
+			await expect
+				.poll(() => fs.existsSync(ownedDir), { timeout: 1000 })
+				.toBe(false);
 		} finally {
+			fakeProcess.process.emit("close", 0, null);
+			const temp = tempDir ?? ownedTempDir();
+			if (temp) await fs.promises.rm(temp, { recursive: true, force: true });
 			process.chdir(oldCwd);
 			removeTempDirSync(tmp);
 			vi.mocked(ensureTool).mockReset();
 			vi.mocked(ensureTool).mockResolvedValue(undefined);
+			vi.unstubAllEnvs();
 		}
 	});
 

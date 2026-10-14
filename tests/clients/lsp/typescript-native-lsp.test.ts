@@ -1,3 +1,5 @@
+import { ChildProcess } from "node:child_process";
+import { PassThrough } from "node:stream";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,9 +26,23 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 }));
 
 import { TypeScriptServer } from "../../../clients/lsp/server.js";
+import type { LSPProcess } from "../../../clients/lsp/launch.js";
 
 const dirs: string[] = [];
-const fakeProcess = { kill: vi.fn() } as never;
+let fakeProcess: LSPProcess;
+
+function ownedTempEnvironment(): NodeJS.ProcessEnv {
+	const temp = launchLSP.mock.calls.at(-1)?.[2].env.TMPDIR;
+	expect(temp).toEqual(expect.any(String));
+	expect(temp).not.toBe(os.tmpdir());
+	const agentDir = process.env.PI_CODING_AGENT_DIR;
+	expect(agentDir).toEqual(expect.any(String));
+	expect(path.dirname(temp as string)).toBe(
+		path.join(agentDir as string, "var", "tmp"),
+	);
+	expect(fs.existsSync(temp as string)).toBe(true);
+	return { TMPDIR: temp as string, TMP: temp as string, TEMP: temp as string };
+}
 
 function addTypeScriptPackage(root: string, version: string): void {
 	fs.mkdirSync(path.join(root, "node_modules", "typescript"), {
@@ -40,6 +56,7 @@ function addTypeScriptPackage(root: string, version: string): void {
 
 function makeProject(version: string): string {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ts-native-"));
+	vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, ".pi", "agent"));
 	dirs.push(root);
 	addTypeScriptPackage(root, version);
 	return root;
@@ -96,13 +113,30 @@ describe("TypeScript native LSP selection", () => {
 		ensureTool.mockResolvedValue(undefined);
 		getToolEnvironment.mockClear();
 		launchLSP.mockReset();
+		fakeProcess = {
+			process: new ChildProcess(),
+			stdin: new PassThrough(),
+			stdout: new PassThrough(),
+			stderr: new PassThrough(),
+			pid: 0,
+			command: "synthetic-lsp",
+			args: [],
+		};
 		launchLSP.mockResolvedValue(fakeProcess);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
+		fakeProcess.process.emit("close", 0, null);
+		const temp = launchLSP.mock.calls.at(-1)?.[2].env.TMPDIR;
+		if (temp) {
+			await expect
+				.poll(() => fs.existsSync(temp), { timeout: 1000 })
+				.toBe(false);
+		}
 		for (const dir of dirs.splice(0)) {
 			removeTempDirSync(dir);
 		}
+		vi.unstubAllEnvs();
 	});
 
 	it("launches the project-local TypeScript 7 binary in native LSP mode", async () => {
@@ -161,6 +195,7 @@ describe("TypeScript native LSP selection", () => {
 			env: {
 				PI_LENS_TEST_TOOLCHAIN: "1",
 				TSSERVER_PATH: tsserverPath,
+				...ownedTempEnvironment(),
 			},
 		});
 		expect(result?.initialization).toEqual({
@@ -186,6 +221,7 @@ describe("TypeScript native LSP selection", () => {
 			env: {
 				PI_LENS_TEST_TOOLCHAIN: "1",
 				TSSERVER_PATH: tsserverPath,
+				...ownedTempEnvironment(),
 			},
 		});
 		expect(result?.initialization).toEqual({
@@ -208,6 +244,7 @@ describe("TypeScript native LSP selection", () => {
 				env: {
 					PI_LENS_TEST_TOOLCHAIN: "1",
 					TSSERVER_PATH: undefined,
+					...ownedTempEnvironment(),
 				},
 			});
 			expect(ensureTool).toHaveBeenCalledWith("typescript", {
@@ -235,6 +272,7 @@ describe("TypeScript native LSP selection", () => {
 			env: {
 				PI_LENS_TEST_TOOLCHAIN: "1",
 				TSSERVER_PATH: tsserverPath,
+				...ownedTempEnvironment(),
 			},
 		});
 		expect(result?.initialization).toEqual({
@@ -271,6 +309,7 @@ describe("TypeScript native LSP selection", () => {
 			env: {
 				PI_LENS_TEST_TOOLCHAIN: "1",
 				TSSERVER_PATH: tsserverPath,
+				...ownedTempEnvironment(),
 			},
 		});
 		expect(result?.launchVariant).toBe("classic");

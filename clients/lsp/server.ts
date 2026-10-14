@@ -2476,6 +2476,20 @@ const TypeScriptRoot: RootFunction = withRootMarkers(
 	[...TS_CONFIG_MARKERS, ...TS_TOOLING_MARKERS],
 );
 
+// Match Pi's getAgentDir(): honor PI_CODING_AGENT_DIR, then use ~/.pi/agent.
+function resolvePiAgentDir(): string {
+	const configured = process.env.PI_CODING_AGENT_DIR;
+	if (!configured) return path.join(os.homedir(), ".pi", "agent");
+	if (configured === "~") return os.homedir();
+	if (
+		configured.startsWith("~/") ||
+		(process.platform === "win32" && configured.startsWith("~\\"))
+	) {
+		return path.join(os.homedir(), configured.slice(2));
+	}
+	return configured;
+}
+
 export const TypeScriptServer: LSPServerInfo = {
 	id: "typescript",
 	idleEviction: "transparent",
@@ -2544,15 +2558,57 @@ export const TypeScriptServer: LSPServerInfo = {
 		}
 		if (tsserverPath) source = "managed";
 
-		// Use absolute path and proper environment
+		// The classic wrapper creates cancellation directories under os.tmpdir()
+		// without removing them. Own its entire namespace under Pi's agent runtime.
 		const env = await getToolEnvironment();
-		const proc = await launchLSP(lspPath, ["--stdio"], {
-			cwd: root,
-			env: {
-				...env,
-				TSSERVER_PATH: tsserverPath,
-			},
-		});
+		const tempRoot = path.join(resolvePiAgentDir(), "var", "tmp");
+		await fs.mkdir(tempRoot, { recursive: true });
+		const tempDir = await fs.mkdtemp(path.join(tempRoot, "typescript-"));
+		const disposeTemp = async (reason: string): Promise<void> => {
+			const startedAt = Date.now();
+			let error: string | undefined;
+			try {
+				await fs.rm(tempDir, { recursive: true, force: true });
+			} catch (err) {
+				error = err instanceof Error ? err.message : String(err);
+			}
+			logLatency({
+				type: "phase",
+				phase: "lsp_typescript_scratch_cleanup",
+				filePath: root,
+				durationMs: Date.now() - startedAt,
+				metadata: {
+					tempDir,
+					reason,
+					status: error ? "failed" : "removed",
+					error,
+				},
+			});
+		};
+		let proc: LSPProcess;
+		try {
+			proc = await launchLSP(lspPath, ["--stdio"], {
+				cwd: root,
+				env: {
+					...env,
+					TSSERVER_PATH: tsserverPath,
+					TMPDIR: tempDir,
+					TMP: tempDir,
+					TEMP: tempDir,
+				},
+			});
+		} catch (err) {
+			await disposeTemp("failed-launch");
+			throw err;
+		}
+		// A server can close during launchLSP's startup observation window.
+		if (proc.process.exitCode !== null || proc.process.signalCode !== null) {
+			await disposeTemp("closed-during-launch");
+		} else {
+			proc.process.once("close", () => {
+				void disposeTemp("close");
+			});
+		}
 
 		return {
 			process: proc,
