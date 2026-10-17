@@ -59,8 +59,8 @@ import { execFileSync } from "node:child_process";
 import {
 	cpSync,
 	existsSync,
-	readFileSync,
 	readdirSync,
+	readFileSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
