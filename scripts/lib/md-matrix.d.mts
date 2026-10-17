@@ -92,6 +92,17 @@ export const FIRST_PUBLISH_EXPIRY_DAYS: number;
 /** #3401: consecutive agreeing runs before a `clean-behavior`/`tier` change is written. */
 export const TIER_CHANGE_AGREE_RUNS: number;
 
+export function advancePendingClass(
+	confirmed: string,
+	pending: { value: string; runs: number } | undefined,
+	observed: string,
+	agreeRuns: number,
+): {
+	confirmed: string;
+	pending?: { value: string; runs: number };
+	committed: boolean;
+};
+
 export interface MatrixObservation {
 	lang: string;
 	firstPublish?: string | null;
@@ -100,14 +111,37 @@ export interface MatrixObservation {
 }
 
 export interface RefreshState {
-	"first-publish"?: Record<string, { firstMissed: string }>;
+	"first-publish"?: Record<
+		string,
+		{
+			firstMissed?: string;
+			pendingFirstPublish?: "direct" | "empty-first";
+			runs?: number;
+		}
+	>;
 	"clean-behavior"?: Record<
 		string,
 		{ pendingBehavior: string; pendingTier: string; runs: number }
 	>;
+	"idle-eviction"?: Record<string, { nights: IdleEvictionNight[] }>;
 }
 
 export function parseRefreshState(text: string): RefreshState;
+
+/** #3989: the refresh-state key holding the idle-eviction promotion bookkeeping. */
+export const IDLE_EVICTION_KEY: "idle-eviction";
+
+export interface IdleEvictionNight {
+	day: string;
+	rssMb: number | null;
+	coldMs: number;
+}
+
+/** #3989: replace the `idle-eviction` key of the refresh-state block. */
+export function setIdleEvictionState(
+	text: string,
+	idleEviction: Record<string, { nights: IdleEvictionNight[] }>,
+): string;
 
 export function refreshCapabilityMatrix(
 	text: string,
@@ -134,3 +168,9 @@ export function refreshCapabilityMatrix(
 	pendingLangs: string[];
 	committedLangs: string[];
 };
+
+/** Whole UTC days since a real YYYY-MM-DD stamp; null for an invalid stamp. */
+export function elapsedDays(from: unknown, to: string): number | null;
+
+/** The `clean-behavior` values that are a measurement of anything (#3401). */
+export const MEASURED_CLEAN_BEHAVIORS: Set<string>;

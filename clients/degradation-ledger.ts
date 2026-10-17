@@ -64,6 +64,10 @@ export type DegradationKind =
 	 * the project root; once per session.
 	 */
 	| "actionable-warnings-quickfix-uncredited"
+	/** #4309: a resolved executable belongs to the adopted or session project. */
+	| "adopted-root-binary-refused"
+	/** #4309: an autonomous formatter or fixer is disabled for an adopted file. */
+	| "adopted-root-writer-skipped"
 	/**
 	 * #3748: a model-facing advisory (`clients/agent-nudge.ts`'s queue) never
 	 * reached a `context` call. Subject `cap:<scope id>`: the queue already held
@@ -98,6 +102,7 @@ export type DegradationKind =
 	| "ast-grep-napi-language-unavailable"
 	/** A managed-tool verification probe exceeded its retained output bound. */
 	| "ast-grep-napi-unavailable"
+	| "ast-grep-rule-invalid"
 	/**
 	 * #2722: a managed-tool verification probe returned a NON-VERDICT — the
 	 * #208 transport-required matcher was armed, never matched, and the kept
@@ -142,6 +147,29 @@ export type DegradationKind =
 	| "bash-view-clipped"
 	| "biome-explain-unavailable"
 	/**
+	 * #4484 round 2: a write's dispatch did not observe a recorded inline
+	 * blocker, and the blocker's runner or language server reached no verdict
+	 * on that write (failed, timed out, unanswered, still in flight). The
+	 * blocker stays pending. One subject per file key, counted across the
+	 * session.
+	 */
+	| "blocker-carried-unobserved"
+	/**
+	 * #4137 round 3: `clearInlineBlockers` refused a clean result from a run
+	 * without authorship (an opaque recovery, #3226) over the very bytes an
+	 * authored verdict recorded; the inline blocker record stays. One subject per
+	 * file key, counted across the session.
+	 */
+	| "blocker-clear-refused"
+	/**
+	 * #4484 round 3: a write could not align its bytes to the bytes the file's
+	 * recorded blockers were read from (no stored line hashes, a file over the
+	 * alignment caps, or a rewrite past `MAX_ALIGNMENT_EDITS`). Each recorded
+	 * line and owed line is taken at its recorded number instead. Once per file
+	 * per session.
+	 */
+	| "blocker-position-unaligned"
+	/**
 	 * #3594: `acquireBoundedPidFileLock`'s wait (the durable-store sync
 	 * waiter) was skipped because the same top-generation holder an earlier
 	 * wait ran out on is still there. The call falls back at once, same as
@@ -154,6 +182,8 @@ export type DegradationKind =
 	| "cascade-budget-override-disarmed"
 	/** Deferred cascade admission reached its bounded in-memory queue. */
 	| "cascade-pending-cap"
+	/** #4487: the pending neighbour-error record reached its cap. */
+	| "cascade-pending-neighbors-evicted"
 	| "cascade-tier3-backlog-evicted"
 	/**
 	 * #3511: the change-log lock stayed held past its bounded wait (or its
@@ -215,6 +245,13 @@ export type DegradationKind =
 	 * cannot carry, since the warm-only callers never reach selection.
 	 */
 	/**
+	 * #1129 decision B: a root inside a real git checkout below the host tmpdir
+	 * got a process-owned data dir, so nothing it records outlives the process
+	 * (and a durable dir it may have had before is not read). Subject is the
+	 * slug hash; recorded once per root via the session-start data-dir drain.
+	 */
+	| "data-dir-ephemeral"
+	/**
 	 * #2874: a pre-hash project data-dir slug directory was renamed once to
 	 * its hashed slug (or an old/new pair was found coexisting and the new
 	 * one preferred), so two roots that differ only in separator-vs-hyphen
@@ -222,6 +259,24 @@ export type DegradationKind =
 	 * Recorded ONCE per migrated directory via the session-start drain.
 	 */
 	| "data_dir_migrated"
+	/**
+	 * A dead-code scan that missed the turn_end budget finished in the
+	 * background and was NOT used (#4117): its session ended before it settled
+	 * (`session-ended`), or it failed (`scan-failed`; a timeout or kill also
+	 * backs the root off). Subject is the client id; counted, because a slow root
+	 * repeats it every turn.
+	 */
+	| "dead-code-late-scan-dropped"
+	/**
+	 * #3814: the commit gate's pre-check of settled collect-later runner answers
+	 * (`absorbSettledRunnerBlockers`) threw. The gate falls back to the blocker
+	 * map as it stood, and the turn-end drain still records those answers. Subject
+	 * is `commit_gate`; counted, so a recurring fault is one row, not one per
+	 * commit.
+	 */
+	| "deferred-blocker-gate-error"
+	/** A deferred formatter outlived its bounded drain and has no clean result. */
+	| "deferred-format-unsettled"
 	| "demoted-finding-retired"
 	| "diagnostic-retained-unreconciled"
 	| "dispatch-non-absolute-baseline-path"
@@ -245,6 +300,14 @@ export type DegradationKind =
 	/** #2007: `git status` could not answer for that same decision. */
 	| "fact-store-pinned-over-budget"
 	/**
+	 * #4454: the fish runner could not find `fish` next to `fish_indent`, so it
+	 * checked formatting but not syntax (`fish_indent --check` reports no syntax
+	 * error). Subject is the tool; recorded once per session via
+	 * `recordDegradationOnce`, since the binary's absence does not change per
+	 * file.
+	 */
+	| "fish-syntax-check-unavailable"
+	/**
 	 * The blind review-graph read (`getCachedReviewGraph`) either DROPPED a
 	 * persisted snapshot because its git stamp names a different worktree, or
 	 * SERVED one whose stamp names a different HEAD (#1961). Subject is
@@ -261,6 +324,8 @@ export type DegradationKind =
 	 * Subject is the tool.
 	 */
 	| "fix-run-agent-edit-overwritten"
+	/** A bounded pre-run call was not carried into a fixer run (#3830). */
+	| "fix-run-pending-call-cap"
 	/**
 	 * #3830: a whole-package fixer's restore left a file alone, and named it
 	 * possibly lost, because a newer agent edit may have won (a call in flight,
@@ -356,6 +421,14 @@ export type DegradationKind =
 	 */
 	| "gradle-ktlint-scan-budget-exceeded"
 	| "grammar-blocked"
+	/**
+	 * #3096: `holdOwnChildPid` found the held-pid set full of still-live
+	 * groups and `BoundedSet.add` dropped the oldest, usually the longest-lived
+	 * LSP leader, so a group kill after that leader dies is refused. Counted;
+	 * subject is the call site (`lsp-spawn`), a fixed tiny set; the dropped
+	 * pids are in the reason and the per-call drop count in the metadata.
+	 */
+	| "held-own-pid-evicted"
 	/**
 	 * A selected formatter's executable was proven absent (#2413): its
 	 * `resolveCommand` probed every install location and PATH and found nothing,
@@ -462,6 +535,14 @@ export type DegradationKind =
 	 */
 	| "instance-registry-lock-legacy-held"
 	/**
+	 * A sync registry-lock acquisition returned without waiting because an
+	 * async registry op of this process holds the lock: that holder cannot
+	 * release while a sync wait blocks the event loop. The caller queues behind
+	 * it (`instance-registry-deregister-queued`). Subject is the resolved lock
+	 * target.
+	 */
+	| "instance-registry-lock-own-hold"
+	/**
 	 * #3476: a registry-lock acquisition took over a generation whose holder
 	 * was dead or past the 5 s lease. Subject is the resolved lock target.
 	 */
@@ -484,6 +565,23 @@ export type DegradationKind =
 	 * normalized root it would have registered.
 	 */
 	| "instance-registry-registration-superseded"
+	/**
+	 * #3654: the File I/O Lifecycle Bridge dropped a `mutate` facet. The entry
+	 * was malformed, out of scope, ignored, refused under `no-read-guard`, or
+	 * failed its bookkeeping; a `delete` facet that fails its confirm gate (still
+	 * present on disk) reports here too. Subject is `"${caller}:${reason}"` — the
+	 * exact pair the synchronous `RecordResult` also returned, so a monitor can
+	 * join this row to the caller's own drop count.
+	 */
+	| "io-bridge-mutate-dropped"
+	/**
+	 * #3654: the File I/O Lifecycle Bridge dropped a `read` facet, for the same
+	 * reasons and with the same `"${caller}:${reason}"` subject as
+	 * `io-bridge-mutate-dropped`. A v1 `read-bridge` zero-line read of a
+	 * non-empty or unreadable file (#3652) reports here as
+	 * `<consumer>:bookkeeping-error`; it was `read-bridge-zero-line-dropped`.
+	 */
+	| "io-bridge-read-dropped"
 	/**
 	 * #3383: a newline-framed reader (`createWarmIpcLineReader`) discarded an
 	 * unterminated line that had grown past `MAX_FRAMED_LINE_BYTES`. The peer is
@@ -539,6 +637,7 @@ export type DegradationKind =
 	 */
 	| "log-sink-truncate-refused"
 	| "log-sink-write-failure"
+	| "lsp-adopted-root-evicted"
 	| "lsp-breaker"
 	| "lsp-capability-skip"
 	/**
@@ -559,6 +658,31 @@ export type DegradationKind =
 	/** An availability probe exceeded its advertised wall-clock budget (#2131). */
 	| "lsp-client-skipped-unavailable-command"
 	/**
+	 * #3968: a `lsp.servers.<id>.covers` claim was accepted WITHOUT runner-id
+	 * validation, because no runner registry had populated this process yet
+	 * (the first session's `loadLSPConfig` races the fire-and-forget dispatch
+	 * warm-up — the fail-open arm `clients/dispatch/known-runner-ids.ts`
+	 * names). Not an acceptance of unknown data without note: the claim is
+	 * recorded as unvalidated, the next session's load validates it, and the
+	 * record names exactly which claim it was. Subject `<file>\0<covers
+	 * pointer>`; once per session.
+	 */
+	| "lsp-covers-unvalidated"
+	/**
+	 * #4346: a diagnostics call resolved the imports of only the first
+	 * `CREATED_IMPORT_SCAN_MAX_FILES` finding-bearing files, so a module the
+	 * rest import, created outside pi-lens, may not reach a server that caches
+	 * a failed lookup. Subject is `capped`. Once per session.
+	 */
+	| "lsp-created-import-scan-incomplete"
+	/**
+	 * #4476: the walk of a root's declaration files passed its directory or
+	 * file cap, so a declaration file created, edited or deleted outside
+	 * pi-lens under that root reaches no language server and refuses no
+	 * diagnostics-cache entry (clients/out-of-band-changes.ts). Once per root.
+	 */
+	| "lsp-declaration-look-capped"
+	/**
 	 * `loadWebTreeSitter()` (clients/deps/web-tree-sitter.js) rejected during
 	 * MODULE EVALUATION, not resolution (#1592). Node's ESM loader permanently
 	 * memoizes a module record that threw while evaluating, so re-importing
@@ -569,6 +693,14 @@ export type DegradationKind =
 	/** A retired LSP diagnostics call was redirected to lens_diagnostics. */
 	| "lsp-diagnostics-compatibility"
 	| "lsp-diagnostics-file-too-large"
+	/**
+	 * #3965: a `paths` request's directory expansion reached the shared
+	 * `MAX_FILES` bound, so later entries were not checked. Subject is the
+	 * workspace cwd; `recordDegradationOnce` keeps one row per workspace per
+	 * session, and the rendered result carries the same `(capped at N)`
+	 * disclosure so a caller never reads a truncated scan as a full answer.
+	 */
+	| "lsp-diagnostics-paths-cap"
 	| "lsp-diagnostics-timeout"
 	| "lsp-diagnostics-unsupported"
 	/**
@@ -598,6 +730,13 @@ export type DegradationKind =
 	 * `incrementDegradationCount` keeps one bounded entry per file.
 	 */
 	| "lsp-edit-stale-content"
+	/**
+	 * #4320: this process cannot tell when a path was born (the filesystem
+	 * reports no birth time, or Node reports ctime as it without statx), so a
+	 * file created while a language server runs is announced as Changed.
+	 * Subject is the cause: `no-birth-time` or `ctime-alias`. Once per cause.
+	 */
+	| "lsp-file-birth-unknown"
 	/**
 	 * An idle LSP client was released by the shared idle-eviction timer (a
 	 * server whose registry `idleEviction` is `transparent`); it respawns on the
@@ -686,6 +825,10 @@ export type DegradationKind =
 	 * "hung" server is truly hung or just answering late.
 	 */
 	| "lsp-pull-unconfirmed"
+	/** A config registry decision dropped or admitted executable project data. */
+	| "lsp-registry-decision"
+	/** A host-created pi-agent staging root was declined as an LSP root. */
+	| "lsp-root-declined"
 	/**
 	 * The abandoned request behind an `lsp-pull-late-answer` timeout REJECTED
 	 * instead of answering (#1774) — e.g. a permanent server error such as
@@ -721,6 +864,8 @@ export type DegradationKind =
 	 * server and file for the same reason every other pull kind does.
 	 */
 	| "lsp-session-root-evicted"
+	/** A sibling LSP notification failed while touching a file. */
+	| "lsp-sibling-announcement"
 	/**
 	 * A language-server child process CLOSED without pi-lens having asked it to
 	 * (#1969). `clientShutdown()` sets `state.shutdownRequested`, so evictions
@@ -817,6 +962,14 @@ export type DegradationKind =
 	 * epoch sends it on every call, and one row is the signal.
 	 */
 	| "mutation-bridge-invalid-branch-epoch"
+	/**
+	 * #4140: a v1 mutation-bridge producer (`ast_grep_replace`, LSP, observed
+	 * replay, a third-party v1 bridge) supplied a path outside the project or
+	 * one that could not be resolved, so its bookkeeping was not admitted. Once
+	 * per `<consumer>:out-of-scope`, the path in the reason. The v2 io-bridge
+	 * records the same drop as `io-bridge-mutate-dropped` and never this.
+	 */
+	| "mutation-bridge-out-of-scope"
 	| "native-read-clipped"
 	/**
 	 * #3524: the file moved between a native read's tool_call and its
@@ -842,6 +995,17 @@ export type DegradationKind =
 	| "observed-mutation-dir-cap"
 	/** An observed directory mutation exceeded the same-turn analysis fan-out. */
 	| "observed-mutation-dispatch-cap"
+	/**
+	 * #4137: a pending bash baseline was dropped before its `tool_result` took
+	 * it, so that call could not prove it authored its own writes and withheld
+	 * their blockers. Subject `overwrite`: a baseline with the same key was
+	 * replaced (a host with no distinct tool-call ids, or a reused id). Subject
+	 * `cap`: more baselines were pending than the store keeps, so the oldest
+	 * went. Subject `unsettled`: a baseline outlived its turn with no
+	 * `tool_result` (the call was blocked or aborted before it ran) and was
+	 * retired; a result that still arrives loses its authorship. Counted.
+	 */
+	| "opaque-baseline-lost"
 	/** Opaque mutation was analyzed without granting autonomous writer rights. */
 	| "opaque-mutation-ownership-boundary"
 	/** Opengrep completed with partial parsing warnings (#2943). */
@@ -884,6 +1048,14 @@ export type DegradationKind =
 	 */
 	| "path-variant-unresolved"
 	/**
+	 * #4402: a persist host's worker `message` listener contained a message.
+	 * Subject is `<host> persist worker: rejected` (no routable `id` and
+	 * `generation`; dropped) or `<host> persist worker: threw` (handling it
+	 * threw; caught so the host survives). Reason carries the shape verdict or
+	 * the error message.
+	 */
+	| "persist-worker-message-contained"
+	/**
 	 * #3311: a registry entry declares `pipConstraints`, but the constraints file
 	 * the pip ladder hands to `PIP_CONSTRAINT` could not be written. The install
 	 * then proceeds UNCONSTRAINED — the pre-#3311 resolution — so this row is the
@@ -908,6 +1080,10 @@ export type DegradationKind =
 	 * itself already landed; only the hash is missing. Subject is the file path.
 	 */
 	| "pipeline-post-write-hash-unavailable"
+	/** #4543: first-write capture exceeded its deadline or capacity (once/session). */
+	| "pre-edit-capture-incomplete"
+	/** A mounted process bridge refused calls during a primary-session gap. */
+	| "process-bridge-unavailable"
 	/**
 	 * #2146, #3140: an incompatible process-singleton cell was discarded and
 	 * replaced with a fresh value (`clients/process-singletons.ts`,
@@ -941,12 +1117,31 @@ export type DegradationKind =
 	 */
 	| "project-snapshot-serialize-failed"
 	/**
+	 * #4400: the host could not remove a project-snapshot stage file from inside
+	 * the persist worker's `message` listener (a directory in its place, or a
+	 * Windows handle held by antivirus). The reap is contained so the host
+	 * survives and the persist continues. Subject is the gz body path (the stage
+	 * path for a late result); reason carries the error message.
+	 */
+	| "project-snapshot-stage-reap-failed"
+	/**
 	 * The orphan backstop's OWN process-table scanner blew the scan timeout and
 	 * had to be tree-killed (#1864 review F3). Reason carries the kill verdict,
 	 * so a scanner that survived its own sweep's escalation — an orphan sweep
 	 * leaking an orphan — is visible rather than silent.
 	 */
 	| "query-predicates-invalid"
+	/**
+	 * #4131: another writer changed a file the agent authored without a read
+	 * (a bash write, a created file), or a mutation-bridge write landed on it
+	 * with no pre-write check (#4187 R2-4, the row's `writer: "bridge"`), so
+	 * its authorship ended (`ReadGuard.retireChangedAuthorship`) and its next
+	 * edit needs a read. Subject is the file; counted, the read-guard.log row
+	 * on the rising edge.
+	 */
+	/** Counted authorship-cap evictions; read-guard.log is rising-edge only. */
+	| "read-guard-authorship-cap"
+	| "read-guard-authorship-retired"
 	/**
 	 * #2524: the resource sampler's OWN process-table scanner (heartbeat CPU/RSS
 	 * sampling, `RESOURCE_SAMPLE_QUERY_TIMEOUT_MS` 2000ms — a much tighter and
@@ -992,6 +1187,13 @@ export type DegradationKind =
 	 * mismatch) is diagnosable from the ledger alone.
 	 */
 	| "read-guard-record-cap-trim"
+	/**
+	 * #1649: a file the read-accounting scan (`scanFileLines`) would not read,
+	 * because its size is over the byte gate (V8's string limit, past which
+	 * the released whole-file read threw). Its reads count one line and keep no
+	 * line hashes, as they did before. Subject is the file; once per file.
+	 */
+	| "read-guard-scan-byte-gate"
 	/**
 	 * #3521: a deferred writer (the agent_settled sweep or the format, autofix
 	 * or LSP quick-fix drain) captured the read guard's branch epoch before a
@@ -1162,6 +1364,16 @@ export type DegradationKind =
 	 * while the host is already exiting, so a second row would never be read.
 	 */
 	| "safe-spawn-signal-reraise-unsupported"
+	/**
+	 * A project scanner (vulture, jscpd) was started over a root that holds a
+	 * linked worktree it could not be told to leave out (#4117): the project's
+	 * own scanner config could not be read, so passing the exclusion would have
+	 * replaced it, or the worktree's path cannot be spelled in the scanner's
+	 * argument (a comma, a glob character). The scan then counts the worktree's
+	 * files as the project's. Subject is the scanner; counted, because the same
+	 * root is rescanned every session and turn.
+	 */
+	| "scan-worktree-exclusion-skipped"
 	/** A duplicate RPC session start was suppressed after its first full pass. */
 	/** A self-drift baseline could not be verified within its available evidence. */
 	| "self-drift-hash-budget-exhausted"
@@ -1172,6 +1384,8 @@ export type DegradationKind =
 	 * session cannot take it stale later. Once per start reason.
 	 */
 	| "session-scope-handoff-discarded"
+	/** An unclaimed successor hand-off exceeded its fixed retention window. */
+	| "session-scope-handoff-expired"
 	/**
 	 * #3881: a primary shutdown landed while its own `session_start` was still
 	 * in flight, before it adopted; it forwarded the slot left for that start
@@ -1199,6 +1413,9 @@ export type DegradationKind =
 	 * gap was classified `concurrent-secondary` instead of taking the primary
 	 * slot. Subject `expired`: no successor started within
 	 * `SUCCESSOR_PENDING_TTL_MS`, so the marker stopped declining starts.
+	 * #3855: subject `not-the-successor`: a non-`startup` start in that gap
+	 * whose reason and key differ from the successor the shutdown named (a
+	 * subagent's own replacement) was classified `concurrent-secondary`.
 	 */
 	| "session-successor-pending"
 	/**
@@ -1320,6 +1537,8 @@ export type DegradationKind =
 	 * kind. Once per file per session; subject is the file path.
 	 */
 	| "startup-analyzer-disabled"
+	/** A project-size bound skipped the session-start warm pipeline (#4126). */
+	| "startup-warm-skipped"
 	/**
 	 * Automatic test ownership is indeterminate: filesystem identity or marker
 	 * I/O failed, a target walk hit its depth bound, or the dispatch walk missed.
@@ -1401,6 +1620,9 @@ export type DegradationKind =
 	| "tool-cwd-resolution"
 	/** A loader request named a configured-disabled tool. */
 	| "tool-disabled"
+	| "tool-result-adopted-project"
+	/** A project edit was outside the session root and skipped analysis (#4218). */
+	| "tool-result-outside-project-root"
 	/** #3612: a lazy-tool activation arrived before its activation's session scope began. */
 	| "tool-set-scope-unavailable"
 	/**
@@ -1474,6 +1696,23 @@ export type DegradationKind =
 	/** The host context could not provide a stable session identity (#2815). */
 	| "turn-context-identity-fallback"
 	/**
+	 * #3901: the turn-end cap cut an item-bearing advisory (knip, dead-code,
+	 * call-graph impact) that showed only items already re-offered once, or the
+	 * per-session parked-lane bound evicted a lane, so those items were NOT
+	 * parked again. A part showing a new item is parked and counted under
+	 * `turn-end-sections-held`. Counted; subject is the family
+	 * (`knip` | `dead-code` | `call-graph`), a fixed set.
+	 */
+	| "turn-end-advisory-carry-dropped"
+	/**
+	 * A turn_end knip scan did not fit the budget in a root that has linked
+	 * worktrees nested under it (#3872): knip walks them as project files
+	 * because the project never ignored them. The subject is the scan root.
+	 * Counted, because a busy session defers once per turn; the root's `knip`
+	 * latency rows carry `nestedWorktrees` for each turn.
+	 */
+	| "turn-end-knip-nested-worktrees"
+	/**
 	 * turn_end did not run knip in a checkout whose edit it was handed (#3872):
 	 * the per-turn root cap was reached, or an earlier scan had already spent
 	 * the turn_end budget. The subject is the reason (`root-cap` | `budget`);
@@ -1542,6 +1781,8 @@ export type DegradationKind =
 	 * re-observes the file.
 	 */
 	| "wasm-abort"
+	/** #3834: a retired compiled query stayed alive for an active scan. Counted. */
+	| "wasm-query-batch-disposal-deferred"
 	/**
 	 * #3605: web-tree-sitter trapped (`memory access out of bounds`, `table
 	 * index is out of bounds`, ...) while parsing or querying one file. That
@@ -1551,13 +1792,17 @@ export type DegradationKind =
 	 */
 	| "wasm-trap"
 	/**
-	 * #2626: `resources_discover` (#205) resolved `<packageRoot>/skills` to a
-	 * directory that is absent, unreadable, or holds no `SKILL.md` — pi then
-	 * registers zero skills with no extension error and no stderr. Fires on
-	 * an installed copy missing `skills/`, or on the entry file having been
-	 * copied out of the package tree by a managed extension cache (so the
-	 * nearest `package.json` is the cache's own). Subject is the resolved
-	 * `skills/` path; see `clients/skills-resolver.ts`.
+	 * #2626: the `resources_discover` handler (#205) resolves
+	 * `<packageRoot>/skills` and checks it — absent, unreadable, or holding no
+	 * `SKILL.md`. Before #1416 it also contributed the resolved path to pi, so
+	 * this record meant pi registered zero skills with no extension error and
+	 * no stderr; the contribution is gone, so it now reports only the
+	 * entry-relative health of that directory (the `pi.skills` manifest is the
+	 * registrar and may still deliver the skills). Fires on an installed copy
+	 * missing `skills/`, or on the entry file having been copied out of the
+	 * package tree by a managed extension cache (so the nearest `package.json`
+	 * is the cache's own). Subject is the resolved `skills/` path; see
+	 * `clients/skills-resolver.ts`.
 	 */
 	| "web-tree-sitter-load-failed"
 	| "widget-disposition-reconcile-fallback"
@@ -1700,19 +1945,21 @@ export function recordDegradation(record: DegradationRecord): boolean {
 }
 
 /** Record at most once per kind/subject during the current session. */
-export function recordDegradationOnce(record: DegradationRecord): void {
+export function recordDegradationOnce(record: DegradationRecord): boolean {
 	try {
 		const kind = boundedKind(record.kind);
 		const subject = subjectForLedger(record.subject);
 		const key = `${kind}\0${subject}`;
-		if (onceKeys.has(key)) return;
+		if (onceKeys.has(key)) return false;
 		onceKeys.add(key);
 		if (recordDegradation({ kind, subject, reason: record.reason })) {
 			logDurableDegradation(kind, subject, 1, record.metadata, record.code);
 		}
+		return true;
 	} catch (error) {
 		debugLedgerFailure("record-once", error);
 		// Telemetry must never break the observed path.
+		return false;
 	}
 }
 
@@ -2023,6 +2270,8 @@ const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	// doc comment above) and is frequent/self-healing by design — a `⚠` would
 	// cry wolf on the sampler's ordinary best-effort data loss.
 	"resource-sampler-scanner-escalated",
+	// #1129: an ephemeral data dir for a tmp checkout is decision B working.
+	"data-dir-ephemeral",
 	// #2874: a successful legacy-directory migration is an upgrade tally, not
 	// a call to action. The hash-only subject avoids exposing the project path.
 	"data_dir_migrated",

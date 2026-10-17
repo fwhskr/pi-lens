@@ -9,7 +9,7 @@
  * - Conditional runners (when)
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	clearCoverageNoticeState,
 	clearLatencyReports,
@@ -18,7 +18,12 @@ import {
 	RunnerRegistry,
 	dispatchForFile as runDispatchForFile,
 } from "../../../clients/dispatch/dispatcher.js";
+import {
+	observeRunnerLatency,
+	resetObservedRunnerLatency,
+} from "../../../clients/dispatch/collect-later-tier.js";
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
+import { resetPendingRunnerFindings } from "../../../clients/dispatch/pending-runner-findings.js";
 import type {
 	Diagnostic,
 	RunnerGroup,
@@ -56,6 +61,44 @@ describe("Dispatch Flow", () => {
 	});
 
 	describe("Runner Registration", () => {
+		it("refuses all dispatch runners for an adopted root at the dispatch entry", async () => {
+			// Recurrence: #4257 F1 allowed project-configured runners to execute
+			// after the adopted-root notice, despite the caller's root classification.
+			const run = vi.fn(async () => ({
+				status: "succeeded" as const,
+				diagnostics: [],
+				semantic: "none" as const,
+			}));
+			registerRunner({
+				id: "adopted-runner",
+				appliesTo: ["jsts"],
+				priority: 1,
+				run,
+			});
+			const ctx = createDispatchContext(
+				"test.ts",
+				"/project",
+				{ getFlag: () => false },
+				new FactStore(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				"adopted",
+			);
+			const result = await runDispatchForFile(
+				ctx,
+				[{ mode: "all", runnerIds: ["adopted-runner"] }],
+				registry,
+			);
+			expect(run).not.toHaveBeenCalled();
+			expect(result.diagnostics).toEqual([]);
+		});
+
 		it("registers and retrieves a runner by id", () => {
 			const runner = createCleanRunner("test-runner");
 			registerRunner(runner);
@@ -1128,6 +1171,210 @@ describe("Dispatch Flow", () => {
 			const result = await dispatchForFile(ctx, groups);
 
 			expect(result.diagnostics.map((d) => d.id)).toEqual(["healthy-warning"]);
+			// #4484 round 3 (R1): a precondition that threw never decided the
+			// runner does not apply, so its skip reaches no verdict. Recurrence:
+			// the throw read as "not applicable", a verdict, and retired the
+			// runner's recorded blockers while they were on disk.
+			expect(result.inconclusiveSources?.runnerIds).toEqual(["throws-when"]);
+		});
+
+		it("counts a precondition that declines as a verdict (#4484 round 3)", async () => {
+			registerRunner(createConditionalRunner("declines", () => false));
+			const result = await dispatchForFile(createMockContext("test.ts"), [
+				{ mode: "all", runnerIds: ["declines"] },
+			]);
+			expect(result.inconclusiveSources).toBeUndefined();
+		});
+	});
+
+	// #4484 round 3 (R4): lines an earlier write owed a runner because it
+	// reached no verdict join that runner's range, and only that runner's.
+	// Recurrence: a blocker first written while its runner had no verdict was
+	// withheld as out of range on the next write and never recorded (TLC
+	// MutOwedRanges, witness row 15).
+	describe("owed ranges (#4484 round 3)", () => {
+		it("widens only the owing runner's range", async () => {
+			const seen = new Map<string, unknown>();
+			for (const id of ["owed", "settled"]) {
+				registerRunner({
+					id,
+					appliesTo: ["jsts"],
+					priority: 1,
+					run: async (ctx) => {
+						seen.set(id, ctx.modifiedRanges);
+						return { status: "succeeded", diagnostics: [], semantic: "none" };
+					},
+				});
+			}
+			const ctx = createDispatchContext(
+				"test.ts",
+				"/project",
+				{ getFlag: () => false },
+				new FactStore(),
+				undefined,
+				[{ start: 1, end: 1 }],
+			);
+			await dispatchForFile(
+				{ ...ctx, owedRanges: new Map([["owed", [{ start: 2, end: 3 }]]]) },
+				[{ mode: "all", runnerIds: ["owed", "settled"] }],
+			);
+			expect(seen.get("owed")).toEqual([{ start: 1, end: 3 }]);
+			expect(seen.get("settled")).toEqual([{ start: 1, end: 1 }]);
+		});
+
+		// A collect-later run settles on its own and owes the next write
+		// nothing. Recurrence: unmarked, a runner deferred on every write would
+		// owe every edited line for good and widen each later edit's range.
+		it("names a collect-later run in flight apart from the runners that owe", async () => {
+			registerRunner(createCleanRunner("slow"));
+			observeRunnerLatency({
+				projectRoot: "/project",
+				runnerId: "slow",
+				durationMs: 60_000,
+			});
+			try {
+				const ctx = createDispatchContext(
+					"test.ts",
+					"/project",
+					{ getFlag: () => false },
+					new FactStore(),
+					undefined,
+					[{ start: 1, end: 1 }],
+					"/project",
+					1,
+				);
+				const result = await dispatchForFile(ctx, [
+					{ mode: "all", runnerIds: ["slow"] },
+				]);
+				expect(result.inconclusiveSources?.runnerIds).toEqual(["slow"]);
+				expect(result.inconclusiveSources?.collectLaterRunnerIds).toEqual([
+					"slow",
+				]);
+			} finally {
+				resetObservedRunnerLatency();
+				resetPendingRunnerFindings();
+			}
+		});
+	});
+
+	// #4509: napi runs under Gate B while it holds a recorded blocker, beside
+	// the ast-grep server whose copies carry another identity.
+	describe("covered runs (#4509)", () => {
+		const finding = (
+			line: number,
+			serverId?: string,
+			over: Partial<Diagnostic> = {},
+		): Diagnostic => ({
+			id: `f-${line}`,
+			message: "Function returns 'unknown'",
+			filePath: "test.ts",
+			line,
+			severity: "error",
+			semantic: "blocking",
+			tool: serverId ? "lsp" : "ast-grep-napi",
+			// The spellings each runner gives one rule: the server's LSP copy
+			// carries its source, napi's the rule id. The two keys differ, so
+			// the overlap dedupe keeps both.
+			rule: serverId ? "ast-grep:no-unknown-returns" : "no-unknown-returns",
+			...(serverId && { serverId }),
+			...over,
+		});
+		const register = (laneAnswers: boolean, lane: Partial<Diagnostic> = {}) => {
+			registerRunner({
+				id: "lane",
+				appliesTo: ["jsts"],
+				priority: 1,
+				run: async () => ({
+					status: "succeeded",
+					// A silent server delivers none of its copies.
+					diagnostics: laneAnswers ? [finding(3, "srv", lane)] : [],
+					semantic: "blocking",
+					...(!laneAnswers && { unconfirmedServerIds: ["srv"] }),
+				}),
+			});
+			registerRunner({
+				id: "peer",
+				appliesTo: ["jsts"],
+				priority: 2,
+				run: async () => ({
+					status: "succeeded",
+					diagnostics: [finding(3), finding(5)],
+					semantic: "blocking",
+					coveredBy: { runnerId: "lane", serverId: "srv" },
+				}),
+			});
+		};
+		const run = async () => {
+			const ctx = createDispatchContext(
+				"test.ts",
+				"/project",
+				{ getFlag: () => false },
+				new FactStore(),
+			);
+			const result = await dispatchForFile(ctx, [
+				{ mode: "all", runnerIds: ["lane", "peer"] },
+			]);
+			return result.diagnostics.map((d) => `${d.runnerId}@${d.line}`).sort();
+		};
+
+		// Recurrence (#4491 row 18b, probe P35): the run and the lane both
+		// delivered the finding on the line the lane flagged: one finding,
+		// listed twice in the STOP block.
+		it("drops a covered run's finding where its answering lane flagged the line", async () => {
+			register(true);
+			expect(await run()).toEqual(["lane@3", "peer@5"]);
+		});
+
+		// Recurrence (#4491 row 26, probe P33): a covered run's verdict with
+		// its lane silent is the only reading of the bytes; dropping or
+		// voiding it would retire napi's blocker with the violation on disk.
+		it("delivers a covered run's findings when its lane is silent", async () => {
+			register(false);
+			expect(await run()).toEqual(["peer@3", "peer@5"]);
+		});
+
+		// Recurrence (#4529 review R1, probe P45): the drop keyed by line
+		// alone, so a team sgconfig's server flagging another rule on napi's
+		// blocker line swapped napi's blocker out, or at warning left `✓ clean`.
+		it("keeps a covered run's finding where its lane flagged another rule on the line", async () => {
+			register(true, { rule: "ast-grep:other-rule" });
+			expect(await run()).toEqual(["lane@3", "peer@3", "peer@5"]);
+		});
+
+		// Recurrence (#4529 review R1): a team sgconfig can downgrade the same
+		// rule, and the server's warning copy then stood for napi's blocker,
+		// so nothing blocked.
+		it("keeps a covered run's blocker where its lane's copy of the rule is weaker", async () => {
+			register(true, { severity: "warning", semantic: "warning" });
+			expect(await run()).toEqual(["lane@3", "peer@3", "peer@5"]);
+		});
+
+		// A cover may name a runner and no server (`coveredBy.serverId` is
+		// optional). Reading every finding as that lane's copy would drop the
+		// run's own findings that no lane delivers.
+		it("reads only the lane runner's copies when the cover names no server", async () => {
+			registerRunner({
+				id: "lane",
+				appliesTo: ["jsts"],
+				priority: 1,
+				run: async () => ({
+					status: "succeeded",
+					diagnostics: [finding(3)],
+					semantic: "blocking",
+				}),
+			});
+			registerRunner({
+				id: "peer",
+				appliesTo: ["jsts"],
+				priority: 2,
+				run: async () => ({
+					status: "succeeded",
+					diagnostics: [finding(3), finding(5)],
+					semantic: "blocking",
+					coveredBy: { runnerId: "lane" },
+				}),
+			});
+			expect(await run()).toEqual(["lane@3", "peer@5"]);
 		});
 	});
 

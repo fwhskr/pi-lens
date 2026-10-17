@@ -1,11 +1,25 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as fileUtils from "../../clients/file-utils.js";
 import { gatedPromise } from "../support/fault-injection.js";
 import {
 	cleanupTestEnvironmentsDrained,
 	setupTestEnvironment,
 } from "./test-utils.js";
+
+// #4133: record the report-directory cleanup the scan-setup guard must reach.
+// The `node:fs` namespace is not spy-writable, so the seam is a delegating
+// `rmSync` mock that still performs the real removal.
+const { trackedRmSync } = vi.hoisted(() => ({
+	trackedRmSync: vi.fn(),
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	trackedRmSync.mockImplementation(actual.rmSync);
+	return { ...actual, rmSync: trackedRmSync };
+});
 
 const ensureTool = vi.fn();
 const findNodeToolBinary = vi.fn();
@@ -695,6 +709,223 @@ describe("jscpd-client in-flight ABA release (#1968)", () => {
 			await cleanupTestEnvironmentsDrained("pi-lens-jscpd-", {
 				beforeDrain: () => client.shutdown(),
 			});
+		}
+	});
+});
+
+/**
+ * #4133: `runScan` creates its report directory before any project-controlled
+ * file is read. The ignore-pattern setup reads the project's `.gitignore` and
+ * lens config, so it sits inside the cleanup guard: a throw there must still
+ * remove the directory. The guard is defence-in-depth — `getProjectIgnoreGlobs`
+ * already swallows IO and parse errors — and covers a future throwing read. It
+ * was reverted in-branch (`12c3a0449`) before PR #4136 merged, and its
+ * regression was dropped with it; this re-pins both.
+ */
+describe("jscpd-client scan setup cleanup (#4133)", () => {
+	it("removes the report directory when scan setup throws", async () => {
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const { tmpDir } = setupTestEnvironment("pi-lens-jscpd-setup-");
+		trackedRmSync.mockClear();
+		const ignoreGlobs = vi
+			.spyOn(fileUtils, "getProjectIgnoreGlobs")
+			.mockImplementationOnce(() => {
+				throw new Error("ignore setup failed");
+			});
+		try {
+			const client = new JscpdClient(false) as unknown as {
+				scan: (
+					cwd: string,
+					minLines: number,
+					minTokens: number,
+					isTsProject: boolean,
+				) => Promise<{ success: boolean }>;
+				ensureAvailable: () => Promise<boolean>;
+				hasSourceFilesRecursive: (dir: string) => boolean;
+			};
+			vi.spyOn(client, "ensureAvailable").mockResolvedValue(true);
+			vi.spyOn(client, "hasSourceFilesRecursive").mockReturnValue(true);
+
+			const result = await client.scan(tmpDir, 5, 50, false);
+
+			expect(result.success).toBe(false);
+			expect(trackedRmSync).toHaveBeenCalledWith(
+				expect.stringContaining(`${path.sep}pi-lens-jscpd-`),
+				{ recursive: true, force: true },
+			);
+		} finally {
+			ignoreGlobs.mockRestore();
+			await cleanupTestEnvironmentsDrained("pi-lens-jscpd-");
+		}
+	});
+
+	it("creates the report directory under PI_LENS_TEST_SCANNER_TMPDIR when set", async () => {
+		// #4133: a harness that owns a scanner root points the report directory
+		// there, so a process killed before the scan's `finally` leaves its orphan
+		// inside a root the harness sweeps instead of the shared tmpdir.
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const { tmpDir } = setupTestEnvironment("pi-lens-jscpd-report-scan-");
+		const { tmpDir: reportRoot } = setupTestEnvironment(
+			"pi-lens-jscpd-report-root-",
+		);
+		const previous = process.env.PI_LENS_TEST_SCANNER_TMPDIR;
+		process.env.PI_LENS_TEST_SCANNER_TMPDIR = reportRoot;
+		trackedRmSync.mockClear();
+		try {
+			const client = new JscpdClient(false) as unknown as {
+				scan: (
+					cwd: string,
+					minLines: number,
+					minTokens: number,
+					isTsProject: boolean,
+				) => Promise<{ success: boolean }>;
+				ensureAvailable: () => Promise<boolean>;
+				hasSourceFilesRecursive: (dir: string) => boolean;
+			};
+			vi.spyOn(client, "ensureAvailable").mockResolvedValue(true);
+			vi.spyOn(client, "hasSourceFilesRecursive").mockReturnValue(true);
+
+			await client.scan(tmpDir, 5, 50, false);
+
+			expect(trackedRmSync).toHaveBeenCalledWith(
+				expect.stringContaining(`${reportRoot}${path.sep}pi-lens-jscpd-`),
+				{ recursive: true, force: true },
+			);
+		} finally {
+			if (previous === undefined)
+				delete process.env.PI_LENS_TEST_SCANNER_TMPDIR;
+			else process.env.PI_LENS_TEST_SCANNER_TMPDIR = previous;
+			await cleanupTestEnvironmentsDrained("pi-lens-jscpd-");
+		}
+	});
+});
+
+/**
+ * #4505 round 2: `shutdown()` waits for a scan that is still in its
+ * availability probe.
+ *
+ * Recurrence: `scan()` fills `inFlight` only after its own `ensureAvailable()`
+ * probe (up to the 1.5 s `probeTimeout`), and the session_start task calls
+ * `ensureAvailable()` before `scan()`. A drain inside that window saw an empty
+ * map and returned; the fork then exited mid-scan and stranded the
+ * `pi-lens-jscpd-*` report directory. The review probe measured `shutdown()`
+ * returning at 203 ms for a scan that finished near 2600 ms.
+ *
+ * The probe and the scan are held at the process boundary (`safeSpawnAsync`),
+ * so the real client, availability checker and `shutdown()` run.
+ */
+describe("jscpd-client shutdown covers the availability probe (#4505)", () => {
+	const SPAWN_OK = { error: undefined, status: 0, stdout: "", stderr: "" };
+
+	/** Enough event-loop turns for a drain to return if nothing holds it. */
+	async function settleTurns(): Promise<void> {
+		for (let turn = 0; turn < 200; turn++)
+			await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+
+	beforeEach(async () => {
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockReset();
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue(SPAWN_OK);
+		ensureTool.mockReset();
+		findNodeToolBinary.mockReset();
+		findNodeToolBinary.mockResolvedValue(null);
+		const helpers =
+			await import("../../clients/dispatch/runners/utils/runner-helpers.js");
+		helpers.resetDispatchAvailabilityState();
+	});
+
+	it("waits for the probe and the scan that follows it", async () => {
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+		const { tmpDir } = setupTestEnvironment("pi-lens-jscpd-probe-");
+		const probe = gatedPromise<typeof SPAWN_OK>();
+		const scanSpawn = gatedPromise<typeof SPAWN_OK>();
+		try {
+			fs.writeFileSync(path.join(tmpDir, "src.ts"), "const x = 1;\n");
+			vi.mocked(safeSpawnMod.safeSpawnAsync)
+				.mockImplementationOnce((() => probe.promise) as never)
+				.mockImplementationOnce((() => scanSpawn.promise) as never);
+			const client = new JscpdClient(false);
+			let scanSettled = false;
+			const scan = client.scan(tmpDir).then((result) => {
+				scanSettled = true;
+				return result;
+			});
+			let drained = false;
+			const drain = client.shutdown().then(() => {
+				drained = true;
+			});
+
+			await settleTurns();
+			expect(drained).toBe(false);
+
+			probe.resolve(SPAWN_OK);
+			await settleTurns();
+			expect(drained).toBe(false);
+
+			scanSpawn.resolve(SPAWN_OK);
+			await drain;
+			expect(scanSettled).toBe(true);
+			expect((await scan).success).toBe(true);
+		} finally {
+			probe.resolve(SPAWN_OK);
+			scanSpawn.resolve(SPAWN_OK);
+			await cleanupTestEnvironmentsDrained("pi-lens-jscpd-");
+		}
+	});
+
+	it("keeps waiting when a second probe starts after the first settles", async () => {
+		// session_start's task shape: ensureAvailable(), then scan(), whose own
+		// ensureAvailable() is a second probe that begins after the first one
+		// settled. A drain that waits for the probes it sees once returns here.
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+		const helpers =
+			await import("../../clients/dispatch/runners/utils/runner-helpers.js");
+		const { tmpDir } = setupTestEnvironment("pi-lens-jscpd-probe2-");
+		const first = gatedPromise<typeof SPAWN_OK>();
+		const second = gatedPromise<typeof SPAWN_OK>();
+		const scanSpawn = gatedPromise<typeof SPAWN_OK>();
+		try {
+			fs.writeFileSync(path.join(tmpDir, "src.ts"), "const x = 1;\n");
+			vi.mocked(safeSpawnMod.safeSpawnAsync)
+				.mockImplementationOnce((() => first.promise) as never)
+				.mockImplementationOnce((() => second.promise) as never)
+				.mockImplementationOnce((() => scanSpawn.promise) as never);
+			const client = new JscpdClient(false);
+			let chainSettled = false;
+			const chain = (async () => {
+				await client.ensureAvailable();
+				// A fresh probe for the scan's own check, as after a cooldown.
+				helpers.resetDispatchAvailabilityState();
+				return client.scan(tmpDir);
+			})().then((result) => {
+				chainSettled = true;
+				return result;
+			});
+			let drained = false;
+			const drain = client.shutdown().then(() => {
+				drained = true;
+			});
+
+			first.resolve(SPAWN_OK);
+			await settleTurns();
+			expect(drained).toBe(false);
+
+			second.resolve(SPAWN_OK);
+			await settleTurns();
+			expect(drained).toBe(false);
+
+			scanSpawn.resolve(SPAWN_OK);
+			await drain;
+			expect(chainSettled).toBe(true);
+			expect((await chain).success).toBe(true);
+		} finally {
+			first.resolve(SPAWN_OK);
+			second.resolve(SPAWN_OK);
+			scanSpawn.resolve(SPAWN_OK);
+			await cleanupTestEnvironmentsDrained("pi-lens-jscpd-");
 		}
 	});
 });

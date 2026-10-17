@@ -1495,7 +1495,7 @@ describe("release-QA skills-registration verdict (#2619 review N3)", () => {
 		name: `skill:${name}`,
 		sourceInfo: {
 			path: `${PKG}/skills/${name}/SKILL.md`,
-			source: "extension:index",
+			source: "package:manifest",
 			...over,
 		},
 	});
@@ -1506,21 +1506,22 @@ describe("release-QA skills-registration verdict (#2619 review N3)", () => {
 		skill("pi-lens-write-tree-sitter-rule"),
 	];
 
-	it("passes four in-package skills registered by the extension's own handler", () => {
+	it("passes four in-package skills registered by the package manifest", () => {
 		const verdict = classifySkillsRegistration(four(), PKG);
 		expect(verdict.status).toBe("pass");
-		expect(verdict.shows).toContain("4/4 via extension:index");
+		expect(verdict.shows).toContain("0 via extension:index, must be 0");
 	});
 
-	it("fails when a skill was registered by the manifest instead of the handler", () => {
-		// The F2 fix, as its own case: #2587 proved one registrar can be broken
-		// for four releases while the other silently covers for it, so the row
-		// names which half is load-bearing.
+	it("fails when a skill was re-added by the extension's own handler (#1416)", () => {
+		// #1416: the handler contributed `<packageRoot>/skills`, pi merged it
+		// raw, and every skill it registered is labelled `extension:index` —
+		// which undid the settings package filters. One such skill is the
+		// regression this row now guards.
 		const commands = four();
-		commands[0].sourceInfo.source = "package:manifest";
+		commands[0].sourceInfo.source = "extension:index";
 		const verdict = classifySkillsRegistration(commands, PKG);
 		expect(verdict.status).toBe("fail");
-		expect(verdict.shows).toContain("3/4 via extension:index");
+		expect(verdict.shows).toContain("1 via extension:index, must be 0");
 	});
 
 	it("fails when a skill resolved outside the installed package", () => {
@@ -1586,7 +1587,11 @@ describe("release-QA pack call site (#3887 F1)", () => {
 			fs.mkdirSync(binDir, { recursive: true });
 			for (const rel of [
 				"scripts/release-qa.mjs",
+				// release-qa imports the shared RPC driver (#4401), and its phase reader.
+				"scripts/rpc-load-check.mjs",
+				"scripts/lib/latency-log-phases.mjs",
 				"scripts/lib/md-matrix.mjs",
+				"scripts/lib/mcp-stdio-client.mjs",
 				"scripts/lib/git-fixture-env.mjs",
 				"scripts/supply-host-provided-deps.mjs",
 				"scripts/lib/host-provided-deps.mjs",
@@ -1701,7 +1706,11 @@ describe("release-QA dirty-checkout refusal (#2619 review F1)", () => {
 			fs.mkdirSync(path.join(root, "scripts", "lib"), { recursive: true });
 			for (const rel of [
 				"scripts/release-qa.mjs",
+				// release-qa imports the shared RPC driver (#4401), and its phase reader.
+				"scripts/rpc-load-check.mjs",
+				"scripts/lib/latency-log-phases.mjs",
 				"scripts/lib/md-matrix.mjs",
+				"scripts/lib/mcp-stdio-client.mjs",
 				"scripts/lib/git-fixture-env.mjs",
 			]) {
 				fs.copyFileSync(path.join(REPO_ROOT, rel), path.join(root, rel));
@@ -2093,6 +2102,65 @@ describe("release-QA codemode nested guard row (#3805)", () => {
 			} finally {
 				fs.rmSync(dir, { recursive: true, force: true });
 			}
+		});
+
+		describe("reads the version from the binary's output, never its path", () => {
+			const probeFakePi = async (
+				dirName: string,
+				script: string,
+			): Promise<{ detail: string; status: string }> => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-qa-4176-"));
+				try {
+					const binDir = path.join(dir, dirName);
+					fs.mkdirSync(binDir);
+					const fakePi = path.join(binDir, "fake-pi.mjs");
+					fs.writeFileSync(fakePi, `#!/usr/bin/env node\n${script}\n`);
+					fs.chmodSync(fakePi, 0o755);
+					return await runCodemodeNestedProbe({
+						piBin: fakePi,
+						env: { PATH: process.env.PATH },
+						scratchRoot: dir,
+					});
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			};
+
+			it("skips an old pi installed under a path that embeds a new version", async () => {
+				const probe = await probeFakePi(
+					"tools-9.9.9",
+					"console.log('0.98.9');",
+				);
+				expect(probe.status).toBe("unreachable");
+				expect(probe.detail).toContain("pi 0.98.9 has no built-in codemode");
+			});
+
+			it("does not skip a new pi for age under a path that embeds an old version", async () => {
+				const probe = await probeFakePi(
+					"tools-0.1.0",
+					"console.log('0.99.2');",
+				);
+				expect(probe.status).toBe("unreachable");
+				expect(probe.detail).not.toContain("no built-in codemode");
+				expect(probe.detail).toContain("pi-ai");
+			});
+
+			it("does not skip a new pi for age under a path with no version", async () => {
+				const probe = await probeFakePi("tools", "console.log('0.99.2');");
+				expect(probe.detail).not.toContain("no built-in codemode");
+				expect(probe.detail).toContain("pi-ai");
+			});
+
+			it("reports an unreadable version, not the path's, when --version fails", async () => {
+				const probe = await probeFakePi(
+					"tools-9.9.9",
+					"console.error('boom');process.exit(1);",
+				);
+				expect(probe.status).toBe("unreachable");
+				expect(probe.detail).toContain("could not read a pi version");
+				expect(probe.detail).not.toContain("9.9.9");
+				expect(probe.detail).not.toContain("has no built-in codemode");
+			});
 		});
 	});
 

@@ -114,6 +114,10 @@ interface World {
 	listThrows?: boolean;
 	listTransientFailures?: number;
 	prStateThrows?: boolean;
+	/** #3754: whether master has a merge queue (the GraphQL `mergeQueue{id}` read). */
+	mergeQueueEnabled?: boolean;
+	/** #3754: an unreadable queue read (`readMergeQueueState` returns null). */
+	graphqlThrows?: boolean;
 	/** closing issues per merged PR number, and each issue's state. */
 	closing?: Record<number, number[]>;
 	issueStates?: Record<number, string>;
@@ -154,6 +158,17 @@ function ghFor(w: World) {
 	) => {
 		w.calls.push(args.join(" "));
 		if (args[0] === "repo") return `${w.owner}/pi-lens`;
+		if (args[0] === "api" && args[1] === "graphql") {
+			if (w.graphqlThrows) throw new Error("HTTP 502: graphql unavailable");
+			return JSON.stringify({
+				data: {
+					repository: {
+						mergeQueue: w.mergeQueueEnabled ? { id: "MQ_test" } : null,
+						pullRequest: { isInMergeQueue: false, mergeQueueEntry: null },
+					},
+				},
+			});
+		}
 		if (args[0] === "run" && args[1] === "rerun") {
 			w.mutations.push(args.join(" "));
 			if (w.rerunThrows) throw new Error("HTTP 403: rerun refused");
@@ -505,6 +520,17 @@ describe("run — failing-test extraction from the recorded job log (#3700)", ()
 		expect(exitCode).toBe(EXIT_SUCCESS);
 		expect(w.calls.some((call) => call.includes("/actions/jobs/"))).toBe(false);
 	});
+
+	// Recurrence (#4005): the per-PR `MUTATION` line (and its `/comments` read)
+	// outliving the mutation job it reported on, as a permanent PENDING or
+	// "unreadable" line on every verdict.
+	it("prints no MUTATION line and reads no PR comments", async () => {
+		const w = world({ prs: [{ number: 5, checkRuns: GREEN }] });
+		const { exitCode, lines } = await cli(["5"], w);
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(lines.join("\n")).not.toMatch(/MUTATION/i);
+		expect(w.calls.some((call) => call.includes("/comments"))).toBe(false);
+	});
 });
 
 describe("run — gating and advisory reported apart (#3700)", () => {
@@ -517,7 +543,7 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 					number: 5,
 					checkRuns: [
 						...GREEN,
-						row("mutation (advisory)", "failure", 21),
+						row("jscpd (advisory)", "failure", 21),
 						row("OSV scan (advisory)", "timed_out", 22),
 						row("PR body (advisory)", "success", 23),
 					],
@@ -528,8 +554,49 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 		expect(exitCode).toBe(EXIT_SUCCESS);
 		expect(lines).toContain("Gating: 2 checks, 0 failing");
 		expect(lines).toContain(
-			"Advisory (never gates): 3 checks, 2 red: OSV scan (advisory) (timed_out), mutation (advisory) (failure)",
+			"Advisory (never gates): 3 checks, 2 red: OSV scan (advisory) (timed_out), jscpd (advisory) (failure)",
 		);
+	});
+
+	it("includes the failed Vitest count for a red Windows advisory", async () => {
+		const windows = job(
+			"unit-tests-fail-101554674114",
+			"Tests  56 failed | 1593 passed | 19 skipped (1668)\n",
+		);
+		windows.json.name = "Unit tests Windows (advisory)";
+		const w = world({
+			prs: [
+				{
+					number: 5,
+					checkRuns: [...GREEN, jobRow(windows)],
+				},
+			],
+			jobs: [windows],
+		});
+		const { exitCode, lines } = await cli(["5"], w);
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(lines).toContain(
+			"Advisory (never gates): 1 checks, 1 red: Unit tests Windows (advisory) (failure, 56 failed)",
+		);
+	});
+
+	// Recurrence: #4042 review F2 — a persistent advisory red must not reread
+	// the same Actions job metadata and log on every watch poll for one head.
+	it("reads advisory failure details once per watched head", async () => {
+		const windows = job(
+			"unit-tests-fail-101554674114",
+			"Tests  56 failed | 1593 passed | 19 skipped (1668)\n",
+		);
+		windows.json.name = "Unit tests Windows (advisory)";
+		const w = world({
+			prs: [{ number: 5, login: "apmantza", checkRuns: [jobRow(windows)] }],
+			jobs: [windows],
+		});
+		const result = await cli(["--watch-open", "--stream", "--wait", "180"], w);
+		expect(result.exitCode).toBe(EXIT_PENDING);
+		expect(
+			w.calls.filter((call) => call.includes("/actions/jobs/101554674114")),
+		).toHaveLength(2);
 	});
 
 	it("keeps a gating red out of the advisory line and an advisory red out of the gating line", async () => {
@@ -540,7 +607,7 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 					checkRuns: [
 						row("Unit tests", "failure", 11),
 						GREEN[1],
-						row("mutation (advisory)", "failure", 21),
+						row("jscpd (advisory)", "failure", 21),
 					],
 				},
 			],
@@ -551,7 +618,7 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 			"Gating: 2 checks, 1 failing: Unit tests (failure)",
 		);
 		expect(lines).toContain(
-			"Advisory (never gates): 1 checks, 1 red: mutation (advisory) (failure)",
+			"Advisory (never gates): 1 checks, 1 red: jscpd (advisory) (failure)",
 		);
 	});
 });
@@ -620,6 +687,40 @@ describe("run — rerun and update-branch remedies (#3700)", () => {
 		expect(out).toContain(
 			`hint: master moved since this failure's merge base (${UNIT_FAIL_MERGE_BASE.slice(0, 9)} -> bbbbbbbbb): gh run rerun replays the old merge commit and cannot pick up what master gained -- use gh pr update-branch 3688`,
 		);
+	});
+
+	// #3754 recurrence: the update-branch hint told the orchestrator to push to a
+	// PR that a merge queue tests on the latest master anyway; the push re-runs
+	// every check and ejects a queued PR.
+	it("withdraws the update-branch hint when master has a merge queue", async () => {
+		const unit = UNIT_FAIL();
+		const w = world({
+			prs: [{ number: 3688, checkRuns: [jobRow(unit), GREEN[1]] }],
+			jobs: [unit],
+			master: "b".repeat(40),
+			mergeQueueEnabled: true,
+		});
+		const { out } = await cli(["3688"], w);
+		expect(out).toContain(
+			`hint: master moved since this failure's merge base (${UNIT_FAIL_MERGE_BASE.slice(0, 9)} -> bbbbbbbbb): the merge queue tests the PR on the latest master, so do not update-branch 3688`,
+		);
+		expect(out).not.toContain("use gh pr update-branch 3688");
+	});
+
+	// #3754: the queue read is optional; an unreadable one (`?.enabled` on null)
+	// must keep the pre-queue update-branch hint instead of throwing the verdict
+	// into a transport error.
+	it("keeps the update-branch hint when the queue read is unreadable", async () => {
+		const unit = UNIT_FAIL();
+		const w = world({
+			prs: [{ number: 3688, checkRuns: [jobRow(unit), GREEN[1]] }],
+			jobs: [unit],
+			master: "b".repeat(40),
+			graphqlThrows: true,
+		});
+		const { exitCode, out } = await cli(["3688"], w);
+		expect(exitCode).toBe(EXIT_FAILURE);
+		expect(out).toContain("use gh pr update-branch 3688");
 	});
 
 	it("gives no update-branch hint when the merge base is still master's head", async () => {

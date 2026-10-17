@@ -17,6 +17,7 @@ import {
 	clearGraphCache,
 	clearReviewGraphWorkspaceCache,
 	flushReviewGraphPersistsForTests,
+	waitForReviewGraphPersistsForTests,
 	getCachedReviewGraph,
 	getGraphSourceFiles,
 	_resetReviewGraphSourcePathMemoForTests,
@@ -428,6 +429,9 @@ describe("review graph service", () => {
 			);
 			await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
 			flushReviewGraphPersistsForTests();
+			// Wait for the offloaded persist to land instead of only a fixed 500 ms
+			// poll: the worker write outlived it on the Windows runner (#4019).
+			await waitForReviewGraphPersistsForTests();
 			for (let i = 0; i < 20 && isReviewGraphMigrationNeeded(env.tmpDir); i++) {
 				await new Promise((r) => setTimeout(r, 25));
 			}
@@ -498,6 +502,9 @@ describe("review graph service", () => {
 			);
 			expect(alphaId).toBeDefined();
 			flushReviewGraphPersistsForTests();
+			// Wait for the offloaded persist to land instead of only a fixed 500 ms
+			// poll: the worker write outlived it on the Windows runner (#4019).
+			await waitForReviewGraphPersistsForTests();
 			for (let i = 0; i < 20 && isReviewGraphMigrationNeeded(env.tmpDir); i++) {
 				await new Promise((r) => setTimeout(r, 25));
 			}
@@ -559,6 +566,9 @@ describe("review graph service", () => {
 			const graph = await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
 			expect(graph.version).toBe(REVIEW_GRAPH_VERSION);
 			flushReviewGraphPersistsForTests();
+			// Wait for the offloaded persist to land instead of only a fixed 500 ms
+			// poll: the worker write outlived it on the Windows runner (#4019).
+			await waitForReviewGraphPersistsForTests();
 			for (let i = 0; i < 20 && isReviewGraphMigrationNeeded(env.tmpDir); i++) {
 				await new Promise((r) => setTimeout(r, 25));
 			}
@@ -890,6 +900,43 @@ describe("review graph service", () => {
 				maxFileCount: 3,
 			});
 			expect(visited).toBeLessThanOrEqual(4);
+		} finally {
+			_setReviewGraphEntryCounterForTests();
+			if (previous === undefined)
+				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = previous;
+			env.cleanup();
+		}
+	});
+
+	it("names the walk interior on the size-skip record: entries visited and walk time (#1979: a cold first walk was undiagnosable from the record)", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-cap-interior-");
+		const previous = process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+		process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = "3";
+		(logLatency as ReturnType<typeof vi.fn>).mockClear();
+		let visited = 0;
+		_setReviewGraphEntryCounterForTests(() => {
+			visited += 1;
+		});
+		try {
+			for (let i = 0; i < 12; i += 1) {
+				createTempFile(
+					env.tmpDir,
+					`source-${i}.ts`,
+					`export const source${i} = ${i};\n`,
+				);
+			}
+			await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
+			const skipRecords = (logLatency as ReturnType<typeof vi.fn>).mock.calls
+				.map((args) => args[0])
+				.filter((entry) => entry?.phase === "review_graph_size_skip");
+			// One record per build, however many entries the walk touched.
+			expect(skipRecords).toHaveLength(1);
+			const metadata = skipRecords[0]?.metadata;
+			expect(metadata?.entriesVisited).toBe(visited);
+			expect(metadata?.entriesVisited).toBeGreaterThan(3);
+			expect(typeof metadata?.walkMs).toBe("number");
+			expect(metadata?.walkMs).toBeGreaterThanOrEqual(0);
 		} finally {
 			_setReviewGraphEntryCounterForTests();
 			if (previous === undefined)

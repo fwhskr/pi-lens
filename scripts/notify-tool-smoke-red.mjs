@@ -11,13 +11,14 @@
  * actual pass/fail verdict and is wired to a FINAL `if: always()` step in
  * tool-smoke.yml, so it runs on every outcome.
  *
- * Reads the run's FIVE gating layer outcomes from env (set by the
+ * Reads the run's SEVEN gating step outcomes from env (set by the
  * workflow step that invokes this script), plus each layer's captured log
  * text from the file paths the workflow's own `tee` steps wrote — never
  * re-derives success/failure or re-parses anything itself beyond those
- * inputs. The five layers are the only steps in tool-smoke.yml WITHOUT
+ * inputs. The seven are the only steps in tool-smoke.yml WITHOUT
  * `continue-on-error: true` (Tool layer, LSP handshake layer, LSP gate,
- * lens_diagnostics mode=full row, Format layer) — the only ones whose outcome
+ * lens_diagnostics mode=full row, Format layer, Resolution layer, and the
+ * LSP evaluated floor of #4514) — the only ones whose outcome
  * can actually turn the job red;
  * see scripts/lib/tool-smoke-drift.mjs's module doc for the shared
  * four-outcome classification this reuses from install-smoke-drift.mjs.
@@ -29,7 +30,9 @@
  *   LSP_GATE_OUTCOME / LSP_GATE_LOG
  *   LENS_FULL_OUTCOME / LENS_FULL_LOG
  *   FORMAT_LAYER_OUTCOME / FORMAT_LAYER_LOG
- *   JOB_STATUS (GitHub's `job.status` context — #2723 review F3: the five
+ *   RESOLUTION_LAYER_OUTCOME / RESOLUTION_LAYER_LOG
+ *   EVALUATED_FLOOR_OUTCOME / EVALUATED_FLOOR_LOG
+ *   JOB_STATUS (GitHub's `job.status` context — #2723 review F3: the six
  *     tracked layers all read "skipped" both when a step BEFORE them failed
  *     — checkout, a setup action, npm install, build:dist — and when the
  *     job was genuinely cancelled; JOB_STATUS disambiguates the two so the
@@ -68,6 +71,10 @@ const LAYERS = /** @type {const} */ ([
 	["LSP_GATE_OUTCOME", "LSP_GATE_LOG", "LSP diagnostics clean-gate"],
 	["LENS_FULL_OUTCOME", "LENS_FULL_LOG", "lens_diagnostics mode=full row"],
 	["FORMAT_LAYER_OUTCOME", "FORMAT_LAYER_LOG", "Format layer"],
+	["RESOLUTION_LAYER_OUTCOME", "RESOLUTION_LAYER_LOG", "Resolution layer"],
+	// #4514: not a smoke layer but a gating step all the same: it fails when a
+	// best-effort LSP producer evaluated less than its floor.
+	["EVALUATED_FLOOR_OUTCOME", "EVALUATED_FLOOR_LOG", "LSP evaluated floor"],
 ]);
 
 const argv = process.argv.slice(2);

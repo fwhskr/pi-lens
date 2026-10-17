@@ -43,6 +43,7 @@ function makeServer(id: string, ext = ".ts"): TestServer {
 		name: id,
 		extensions: [ext],
 		idleEviction: "transparent",
+		role: "language",
 		root: async () => "C:/repo",
 		spawn: vi.fn(async () => ({
 			process: {
@@ -93,6 +94,7 @@ function makeClient(
 		diagnosticsVersion: 0,
 		getDiagnostics: vi.fn(() => diags),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(() =>
 				stallWrite ? new Promise<void>(() => {}) : Promise.resolve(),
 			),
@@ -244,6 +246,7 @@ describe("#743 — per-server notify-write deadlines", () => {
 			diagnosticsVersion: 0,
 			getDiagnostics: vi.fn(() => []),
 			notify: {
+				announceCreated: () => undefined,
 				open: vi.fn(() =>
 					stall ? new Promise<void>(() => {}) : Promise.resolve(),
 				),

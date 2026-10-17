@@ -58,7 +58,7 @@ vi.mock("../../clients/lsp/config.js", () => ({
 	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
 
-vi.mock("../../clients/lsp/index.js", () => ({
+vi.mock("../../clients/lsp/capabilities.js", () => ({
 	getLSPService: vi.fn(() => makeLspServiceDouble()),
 }));
 
@@ -68,7 +68,7 @@ function makeDefaultRuntime() {
 		isCurrentSession: () => true,
 		markStartupScanInFlight: () => {},
 		clearStartupScanInFlight: () => {},
-		complexityBaselines: new Map(),
+		complexityBaselines: new Set(),
 		resetForSession: () => {},
 		projectRoot: "",
 		projectRulesScan: { hasCustomRules: false, rules: [] },

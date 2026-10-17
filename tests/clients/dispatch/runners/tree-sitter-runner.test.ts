@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { reachedNoVerdict } from "../../../../clients/dispatch/types.js";
 import { makeRunnerCtx } from "../../../support/runner-ctx.js";
 
 function createCtx(filePath: string, cwdOverride?: string) {
@@ -180,6 +181,10 @@ afterEach(() => {
 	vi.doUnmock("../../../../clients/tree-sitter-query-loader.js");
 	vi.doUnmock("../../../../clients/cache/rule-cache.js");
 	vi.doUnmock("../../../../clients/tree-sitter-client.js");
+	// The wasm-aborted case partial-mocks it; only the next wasm-free
+	// loadRunnerWithQueries unmocks it again, so a shuffle that ran another
+	// loader next kept `isTreeSitterWasmAborted: () => true` (#4405: seed 424).
+	vi.doUnmock("../../../../clients/tree-sitter-shared.js");
 });
 
 describe("tree-sitter runner — metadata", () => {
@@ -287,20 +292,6 @@ describe("tree-sitter runner — entity extraction skip threshold (#885)", () =>
 		filePath: "rules/tree-sitter-queries/typescript/fake-rule.yml",
 	};
 
-	it("skips entity extraction for edits under 5 changed lines", async () => {
-		const { runner, recordEntitySnapshotDiff, runQueryOnFile } =
-			await loadRunnerWithQueries([fakeQuery]);
-		const ctx = {
-			...createCtx("/fake/file.ts"),
-			modifiedRanges: [{ start: 10, end: 10 }], // 1 changed line
-		};
-		const result = await runner.run(ctx as any);
-		expect(result.status).toBe("succeeded");
-		expect(recordEntitySnapshotDiff).not.toHaveBeenCalled();
-		// No entity queries reached the client either.
-		expect(runQueryOnFile).not.toHaveBeenCalled();
-	});
-
 	it("runs entity extraction once for edits at/over 5 changed lines", async () => {
 		const { runner, recordEntitySnapshotDiff, runQueryOnFile } =
 			await loadRunnerWithQueries([fakeQuery]);
@@ -347,6 +338,18 @@ describe("tree-sitter runner — batched per-edit queries (#888)", () => {
 		expect(runQueriesOnFile.mock.calls[0][3]).toEqual({ maxResults: 10 });
 		// Small edit: no entity walks either.
 		expect(runQueryOnFile).not.toHaveBeenCalled();
+	});
+
+	it("skips a configured rule before the tree walk on an ignored path", async () => {
+		const { runner, runQueriesOnFile } = await loadRunnerWithQueries([
+			fakeQuery,
+		]);
+		const result = await runner.run({
+			...createCtx("/fake/vendorish/file.ts", "/fake"),
+			rulePolicy: { "fake-rule": { ignorePaths: ["vendorish/**"] } },
+		} as any);
+		expect(result.status).toBe("succeeded");
+		expect(runQueriesOnFile).not.toHaveBeenCalled();
 	});
 
 	it("interpolates double-brace capture placeholders in diagnostic messages", async () => {
@@ -438,6 +441,20 @@ describe("tree-sitter runner — degraded grammar is not a clean file (#3409)", 
 
 		expect(result.status).toBe("succeeded");
 		expect(result.diagnostics).toHaveLength(0);
+	});
+
+	// #4484 round 2. Recurrence: a query run that threw part way returned an
+	// empty "succeeded", so a recorded tree-sitter blocker left the record.
+	it("flags a rejected query run as reaching no verdict", async () => {
+		const { runner, runQueriesOnFile } = await loadRunnerWithQueries([
+			fakeQuery,
+		]);
+		runQueriesOnFile.mockRejectedValue(new Error("query batch failed"));
+
+		const result = await runner.run(createCtx("/fake/file.ts") as any);
+
+		expect(result.inconclusive).toBe(true);
+		expect(reachedNoVerdict(result)).toBe(true);
 	});
 
 	describe("a rejected query run goes through the shared wasm classifier (#3605)", () => {

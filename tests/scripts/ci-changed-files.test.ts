@@ -10,6 +10,8 @@ import {
 	parseArgs,
 	pathsFromPrFiles,
 	PR_FILES_API_CAP,
+	PR_SMOKE_PATHS,
+	ghPrFiles,
 	run,
 } from "../../scripts/ci-changed-files.mjs";
 
@@ -106,6 +108,113 @@ describe("classifyChangedFiles: the strict docs allowlist", () => {
 	});
 });
 
+// #4291: `smoke` decides install-smoke.yml's deep run (every pi-load cell and
+// the LSP handshake) on a pull request. Recurrence: #4409 passed its PR run on
+// one pnpm-global cell and broke the npm-global, bun-global and curl legs on
+// master. Doubt resolves to the deep run, like `code`.
+describe("classifyChangedFiles: the deep install smoke (#4291)", () => {
+	const smoke = (paths: string[]) => classifyChangedFiles(paths).smoke;
+
+	// Recurrence: a list entry the matcher cannot read, so the path it names
+	// never turns the deep smoke on. A `dir/**` entry is probed with a file
+	// under it.
+	it.each(PR_SMOKE_PATHS)("turns on for the listed path %s", (entry) => {
+		const file = entry.endsWith("/**") ? `${entry.slice(0, -2)}x/y.ts` : entry;
+		expect(smoke([file])).toBe(true);
+		expect(smoke(["docs/a.md", file])).toBe(true);
+	});
+
+	// Recurrence: an over-wide filter (index.ts alone is 37 of 690 merges in 30
+	// days) that makes the deep run the default instead of the exception.
+	it.each([
+		["index.ts"],
+		["clients/lsp/index.ts"],
+		["clients/lsp/client.ts"],
+		["clients/dispatch/runners/lsp.ts"],
+		["clients/installer-notes.ts"],
+		["tests/clients/foo.test.ts"],
+		["docs/a.md"],
+		["scripts/rpc-load-check.d.mts"],
+		["clients/installer/../index.ts"],
+		["clients/installer"],
+	])("stays off for %s", (file) => {
+		expect(smoke([file])).toBe(false);
+	});
+
+	// Recurrence: a rename that moves a listed file away reads as its new path
+	// only; `pathsFromPrFiles` carries the old path and the matcher reads it.
+	it("counts the old path of a rename out of a listed file", () => {
+		const paths = pathsFromPrFiles([
+			{
+				filename: "clients/project-trust-moved.ts",
+				previous_filename: "clients/project-trust.ts",
+			},
+		]);
+		expect(smoke(paths)).toBe(true);
+	});
+
+	// Recurrence: doubt must run the deep smoke (AGENTS.md shape 48), exactly as
+	// it runs the full suite for `code`.
+	it("turns on for an empty list and for a list at the API cap", () => {
+		expect(smoke([])).toBe(true);
+		const capped = Array.from(
+			{ length: PR_FILES_API_CAP },
+			(_, i) => `docs/f${i}.md`,
+		);
+		expect(smoke(capped)).toBe(true);
+		expect(smoke(capped.slice(0, PR_FILES_API_CAP - 1))).toBe(false);
+	});
+});
+
+// N2 (#3861): the per-line parse `ghPrFiles` wraps is the ONE place a
+// `pulls/{n}/files` body is read; a malformed `--jq` line must throw (the
+// full-suite direction) rather than read as an empty list. `exec` is the
+// process boundary, so the fake stands in for `gh`, not for the parse.
+describe("ghPrFiles: one JSON object per gh --jq line (#3861 N2)", () => {
+	it("parses every non-empty line and carries a rename's previous path", () => {
+		const exec = () =>
+			'{"filename":"clients/a.ts"}\n\n{"filename":"docs/b.md","previous_filename":"clients/c.ts"}\n';
+		expect(ghPrFiles("acme/repo", "1", exec)).toEqual([
+			"clients/a.ts",
+			"docs/b.md",
+			"clients/c.ts",
+		]);
+	});
+
+	it("throws on a malformed line, never reads it as an empty file list", () => {
+		const exec = () => '{"filename":"clients/a.ts"}\nnot json\n';
+		expect(() => ghPrFiles("acme/repo", "1", exec)).toThrow(
+			/malformed gh api --jq line/,
+		);
+	});
+
+	// #3861 A1: only a whitespace-only line is a blank `--jq` separator; the
+	// trim must catch tabs and a bare carriage return too, so none of them
+	// reaches `JSON.parse`.
+	it("skips whitespace-only and carriage-return-only lines", () => {
+		const exec = () =>
+			'{"filename":"clients/a.ts"}\n   \n\t\n\r\n{"filename":"docs/b.md"}\n';
+		expect(ghPrFiles("acme/repo", "1", exec)).toEqual([
+			"clients/a.ts",
+			"docs/b.md",
+		]);
+	});
+
+	// #3861 A2: the error excerpt is bounded to 200 characters; a longer
+	// malformed line must not carry its tail into the message.
+	it("caps the malformed-line excerpt at 200 characters", () => {
+		const exec = () => `${"Z".repeat(250)}TRAILING\n`;
+		let message = "";
+		try {
+			ghPrFiles("acme/repo", "1", exec);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toContain("malformed gh api --jq line");
+		expect(message.endsWith("Z".repeat(200))).toBe(true);
+	});
+});
+
 describe("run (the CLI the changes job calls)", () => {
 	function withOutput(
 		test: (files: { output: string; summary: string }) => void,
@@ -155,17 +264,21 @@ describe("run (the CLI the changes job calls)", () => {
 			});
 			expect(code).toBe(0);
 			expect(seen).toEqual([["apmantza/pi-lens", "3807"]]);
-			expect(outputs(files.output)).toEqual({ code: "false", formal: "false" });
+			expect(outputs(files.output)).toEqual({
+				code: "false",
+				formal: "false",
+				smoke: "false",
+			});
 			expect(fs.readFileSync(files.summary, "utf8")).toMatch(
-				/^changes: code=false formal=false -- docs-only diff/,
+				/^changes: code=false formal=false smoke=false -- docs-only diff/,
 			);
 		});
 	});
 
-	// Recurrence: master and merge-train replays losing the full suite. Only a
-	// pull_request is ever classified; every other event runs everything and
-	// never reads the API.
-	it.each(["push", "repository_dispatch", "merge_group", "workflow_dispatch"])(
+	// Recurrence: master losing the full suite when a non-PR event was read as
+	// docs-only. Only a pull_request is ever classified; every other event runs
+	// everything and never reads the API.
+	it.each(["push", "merge_group", "workflow_dispatch"])(
 		"runs everything for a %s event without reading the API",
 		(event) => {
 			withOutput((files) => {
@@ -177,7 +290,11 @@ describe("run (the CLI the changes job calls)", () => {
 					log: () => {},
 				});
 				expect(code).toBe(0);
-				expect(outputs(files.output)).toEqual({ code: "true", formal: "true" });
+				expect(outputs(files.output)).toEqual({
+					code: "true",
+					formal: "true",
+					smoke: "true",
+				});
 			});
 		},
 	);
@@ -194,7 +311,11 @@ describe("run (the CLI the changes job calls)", () => {
 				log: () => {},
 			});
 			expect(code).toBe(0);
-			expect(outputs(files.output)).toEqual({ code: "true", formal: "true" });
+			expect(outputs(files.output)).toEqual({
+				code: "true",
+				formal: "true",
+				smoke: "true",
+			});
 		});
 	});
 

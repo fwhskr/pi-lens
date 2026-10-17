@@ -3,6 +3,19 @@
 
 export const MAX_SELECTED_TESTS: number;
 
+export const DIST_IMPORTS: readonly [
+	{
+		readonly source: "clients/lsp/server-traits.ts";
+		readonly output: "dist/clients/lsp/server-traits.js";
+	},
+];
+
+export function findStaleDistFiles(root: string): Array<{
+	source: string;
+	output: string;
+	reason: "missing" | "stale" | "unreadable";
+}>;
+
 export const TREE_SCANNING_GOVERNANCE_TESTS: string[];
 
 /** Tests-tree scanners armed on any tests/ change (#3472 recurrence, #3492). */
@@ -18,24 +31,95 @@ export function resolveDiffRange(input?: string): string[] | null;
 
 export function changesProductionFile(file: string): boolean;
 
-export function changedFiles(range: string): string[] | null;
+export function changedFiles(
+	range: string,
+	options?: { diffFilter?: string; cwd?: string; env?: NodeJS.ProcessEnv },
+): string[] | null;
+
+/** Uncommitted tracked edits plus untracked, non-ignored files (#4047). */
+export function worktreeChangedFiles(): string[] | null;
 
 export function collectTestFiles(dir: string, out?: string[]): string[];
 
+/** `changed` and `mirror` are the change's own tests, never capped (#4489). */
+export type SelectionReason =
+	| "changed"
+	| "mirror"
+	| "import"
+	| "history"
+	| "governance";
+
 export interface TargetedTestSelection {
-	/** When `capped`, only the armed governance registries (#3492). */
+	/**
+	 * When `capped`: the change's own tests, the best `MAX_SELECTED_TESTS` import
+	 * matches (fewest importers first, ties by path), the armed governance
+	 * registries (#3492) and the history picks (#4489).
+	 */
 	selected: string[];
 	unmatched: string[];
 	capped: boolean;
 	totalBeforeCap: number;
 	/** CI-only suites removed from `selected` for the local pre-push caller. */
 	excludedCiOnly: string[];
+	/** Tests only the history pass added (#3215 lane 3). */
+	fromHistory: string[];
+	/** The reason each selected test entered the final selection (#4034). */
+	selectionReasons: Map<string, SelectionReason>;
 }
 
 export function selectTargetedTests(
 	changed: string[],
 	allTests: string[],
-	options?: { includeCiOnly?: boolean },
+	options?: { includeCiOnly?: boolean; historyPicks?: string[] },
 ): TargetedTestSelection;
+
+export interface PrePushRecord {
+	head: string;
+	base: string;
+	timestamp: string;
+	selected: Array<{
+		file: string;
+		reason: SelectionReason;
+	}>;
+	passed: number;
+	failed: number;
+	skipped: number;
+	vitestExitCode: number | null;
+	wallTimeMs: number;
+	outcome:
+		| "tests-not-started"
+		| "build-only"
+		| "build-failed"
+		| "self-scan-failed"
+		| "tests-complete"
+		| "tests-failed"
+		| "tests-lock-timeout"
+		| "tests-runner-failed";
+}
+
+export function readPrePushRecord(
+	commonDir: string,
+	head: string,
+): PrePushRecord | null;
+
+export function writePrePushRecord(input: {
+	commonDir: string;
+	head: string;
+	base: string;
+	at?: Date;
+	selected: PrePushRecord["selected"];
+	passed: number;
+	failed: number;
+	skipped: number;
+	vitestExitCode: number | null;
+	wallTimeMs: number;
+	outcome?: PrePushRecord["outcome"];
+}): PrePushRecord;
+
+export function parseVitestCounts(output: string): {
+	passed: number;
+	failed: number;
+	skipped: number;
+};
 
 export function main(): Promise<number>;

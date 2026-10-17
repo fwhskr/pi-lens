@@ -14,16 +14,13 @@
 // that already had one (#3774, #3768), against the one-fragment-per-change
 // rule the PR template states. `--base <ref>` supplies the PR base; when it
 // is absent the count rule is skipped and only the shape check runs.
-// `--merge-ref` says HEAD is CI's pull_request merge ref, which already
-// contains the base: the diff starts at the base itself, because that
-// checkout is depth 1 and has no merge-base (#3795 verify r3).
-//
-// Usage: node scripts/check-changelog-fragments.mjs [--base <ref> [--merge-ref]]
+// Usage: node scripts/check-changelog-fragments.mjs [--base <ref> [--head <ref>]]
 
-import { dirname, resolve } from "node:path";
+import fs from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
-import { validateChangelogEntries } from "./rollup-changelog.mjs";
+import { parseEntry, validateChangelogEntries } from "./rollup-changelog.mjs";
 
 const SCRIPT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -34,12 +31,39 @@ const SCRIPT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // runner with the same shape.
 const runGit = (args, options) => gitExecFileSync(args, options);
 
+const ISSUE_REFERENCE =
+	/\s*(?:\((?:refs?|closes?|fixes?|fixed)?\s*#\d+\)|(?:refs?|closes?|fixes?|fixed)\s+#\d+|#\d+)/gi;
+
+function userLeadError(file, { lead, length }) {
+	if (!lead)
+		return `Invalid changelog entry .changelog/${file}: user-facing fragments must open with a bold lead; plain lead length ${length}`;
+	return `Invalid changelog entry .changelog/${file}: bold lead must be at most 100 characters (refs excluded from the count); bold lead length ${length}`;
+}
+
+function validateAddedUserLeads({ fragments, cwd }) {
+	for (const fragment of fragments) {
+		const file = fragment.slice(".changelog/".length);
+		const text = fs.readFileSync(join(cwd, fragment), "utf8");
+		const entry = parseEntry(text, file);
+		if (entry.audience !== "user") continue;
+		const firstLine = entry.entry
+			.split(/\r?\n/)
+			.find((line) => /^[-*]\s+\S/.test(line));
+		const lead = firstLine?.match(/^[-*]\s+\*\*(.*?)\*\*/)?.[1];
+		const leadLength = lead
+			? lead.replace(ISSUE_REFERENCE, "").length
+			: (firstLine ?? "").replace(/^[-*]\s+/, "").replace(ISSUE_REFERENCE, "")
+					.length;
+		if (!lead || leadLength > 100)
+			throw new Error(userLeadError(file, { lead, length: leadLength }));
+	}
+}
+
 /**
  * The `.changelog/*.md` files the range adds between its start and the
- * working tree, or `null` when no base was supplied or Git could not answer (a
- * missing ref, a shallow checkout without `mergeRef`). The start is `base`
- * when `mergeRef` says HEAD already contains it, else `git merge-base HEAD
- * base`, so a local branch behind master does not count master's fragments.
+ * working tree, or `null` when no base was supplied or Git could not answer. A
+ * supplied PR `head` uses `git merge-base base head` as its start, so a local
+ * branch behind master does not count master's fragments.
  * The working tree is the end point, not HEAD, so a fragment a worker has
  * written but not committed is still counted before push; untracked files are
  * added for the same reason (`git diff` lists only tracked paths, so the two
@@ -47,14 +71,20 @@ const runGit = (args, options) => gitExecFileSync(args, options);
  */
 export function addedChangelogFragments({
 	base,
+	head,
 	cwd,
 	git = runGit,
-	mergeRef = false,
 } = {}) {
 	if (!base) return null;
 	try {
-		const from = mergeRef
-			? base
+		const from = head
+			? String(
+					git(["merge-base", base, head], {
+						cwd,
+						encoding: "utf8",
+						stdio: ["ignore", "pipe", "pipe"],
+					}),
+				).trim()
 			: String(
 					git(["merge-base", "HEAD", base], {
 						cwd,
@@ -62,10 +92,14 @@ export function addedChangelogFragments({
 						stdio: ["ignore", "pipe", "pipe"],
 					}),
 				).trim();
-		const diff = git(
-			["diff", "--diff-filter=A", "--name-only", from, "--", ".changelog/"],
-			{ cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-		);
+		const diffArgs = ["diff", "--diff-filter=A", "--name-only", from];
+		if (head) diffArgs.push(head);
+		diffArgs.push("--", ".changelog/");
+		const diff = git(diffArgs, {
+			cwd,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
 		const untracked = git(
 			["ls-files", "--others", "--exclude-standard", "--", ".changelog/"],
 			{ cwd, encoding: "utf8" },
@@ -93,9 +127,9 @@ export function checkChangelogFragments({
 	base,
 	cwd,
 	git = runGit,
-	mergeRef = false,
+	head,
 } = {}) {
-	const fragments = addedChangelogFragments({ base, cwd, git, mergeRef });
+	const fragments = addedChangelogFragments({ base, cwd, git, head });
 	if (base && fragments === null) {
 		return {
 			valid: false,
@@ -113,6 +147,7 @@ export function checkChangelogFragments({
 	let entries;
 	try {
 		entries = validateChangelogEntries({ rootDir: cwd });
+		if (fragments) validateAddedUserLeads({ fragments, cwd });
 	} catch (error) {
 		return {
 			valid: false,
@@ -133,20 +168,21 @@ if (
 ) {
 	const baseIndex = process.argv.indexOf("--base");
 	const cwdIndex = process.argv.indexOf("--cwd");
-	const mergeRef = process.argv.includes("--merge-ref");
 	const base = baseIndex === -1 ? undefined : process.argv[baseIndex + 1];
+	const headIndex = process.argv.indexOf("--head");
+	const head = headIndex === -1 ? undefined : process.argv[headIndex + 1];
 	const cwd = cwdIndex === -1 ? SCRIPT_ROOT : process.argv[cwdIndex + 1];
 	const invalidArgument =
 		(baseIndex !== -1 && (!base || base.startsWith("--"))) ||
-		(cwdIndex !== -1 && (!cwd || cwd.startsWith("--"))) ||
-		(mergeRef && baseIndex === -1);
+		(headIndex !== -1 && (!head || head.startsWith("--"))) ||
+		(cwdIndex !== -1 && (!cwd || cwd.startsWith("--")));
 	const result = invalidArgument
 		? {
 				valid: false,
 				message:
-					"usage: node scripts/check-changelog-fragments.mjs [--base <ref> [--merge-ref]] [--cwd <dir>]",
+					"usage: node scripts/check-changelog-fragments.mjs [--base <ref> [--head <ref>]] [--cwd <dir>]",
 			}
-		: checkChangelogFragments({ base, cwd, mergeRef });
+		: checkChangelogFragments({ base, cwd, head });
 	if (result.valid) {
 		console.log(result.message);
 	} else {

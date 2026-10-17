@@ -142,9 +142,13 @@ const POPULATION_FILES = [
  * `safeSpawnAsync(` again the file re-enters and its site is checked — and the
  * one cwd decision they used to make 23 times over is now made once, inside
  * `probeToolAsync`, where this file admits it by name.
+ *
+ * #4493: 133 -> 135, the `git rev-parse HEAD` in readGitHead (its fallback
+ * when the files git keeps cannot answer) and the `git diff` in
+ * listGitHeadDelta (opaque-mutation-scan.ts, already counted).
  */
 const EXPECTED_FILES = 79;
-const EXPECTED_DIRECT_SITES = 130;
+const EXPECTED_DIRECT_SITES = 135;
 /**
  * Every same-file spawn-routing wrapper call site the scan discovers. Pinned
  * as a LIST, not a count, because the list is the part round 2 got wrong: it
@@ -272,7 +276,7 @@ const NO_CWD_EXEMPTION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"Windows LSP tree cleanup targets a pid and does not resolve project configuration",
 	],
 	[
-		"clients/dead-code-client.ts#PythonDeadCodeClient.analyze:488c639e~e7e502d1",
+		"clients/dead-code-client.ts#PythonDeadCodeClient.analyze:a1223aae~edc51d69",
 		"the analysis root reaches runAnalyze as `key` (path.resolve(root)); the name carries no `cwd`, so the wrapper rule cannot see it — the spawn it reaches passes it as cwd. #2894 left it: `analyze(root)`'s input is already a DIRECTORY, and `resolveToolCwd` takes a FILE and starts from `path.dirname` of it, so handing it a root would walk from that root's PARENT",
 	],
 	[
@@ -376,16 +380,24 @@ const NO_CWD_EXEMPTION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"`brew --prefix ast-grep` — asks Homebrew where it installed the binary",
 	],
 	[
-		"clients/sg-runner.ts#SgRunner.execRaw:05d2e3a2",
-		"execRaw is the shared raw ast-grep invocation: the rule comes from the caller's `-p`/`--config` argument and every target is an explicit path in `args`, so nothing is discovered from the child's directory",
+		"clients/sg-runner.ts#SgRunner.execRaw:bf0b9885",
+		"execRaw is the shared raw ast-grep invocation: the rule comes from the caller's `-p`/`--config` argument and every target is an explicit path in `args`, so nothing is discovered from the child's directory. When the npx fallback won, `...this.sgSpawnOptions` adds the pi-lens-owned neutral cwd (#4193) the scan cannot follow through a class-field spread; without it the spread is empty and the child inherits the host cwd",
 	],
 	[
-		"clients/sg-runner.ts#SgRunner.exec:84a4a8a1",
-		"exec is the shared ast-grep invocation (optionally through bash on Windows): same explicit-argument contract as execRaw",
+		"clients/sg-runner.ts#SgRunner.exec:577cdec8",
+		"exec is the shared ast-grep invocation (optionally through bash on Windows): same explicit-argument contract as execRaw, and the same conditional pi-lens-owned neutral cwd when the npx fallback won",
 	],
 	[
-		"clients/sg-runner.ts#SgRunner.tempScanDetailedAsync:ee763d40",
-		"`ast-grep scan --config <temp rule file> --json … <dir>`: both the rule file and the scan root are absolute arguments prepared by prepareTempScan",
+		"clients/dispatch/runners/utils/runner-helpers.ts#probeAstGrepCommandAsync:5eda2591",
+		"the scoped cache-only `npx --package @ast-grep/cli` availability probe: `...getIsolatedNpxSpawnOptions()` runs it in the pi-lens-owned neutral tools dir so a hostile project `.npmrc` is never read, and the scan cannot follow a call spread",
+	],
+	[
+		"clients/sg-runner.ts#SgRunner.probeCommand:4b5ea917",
+		"the scoped cache-only `npx --package @ast-grep/cli -- ast-grep --version` candidate probe: same pi-lens-owned neutral cwd supplied by `...getIsolatedNpxSpawnOptions()`, which the scan cannot follow through a call spread",
+	],
+	[
+		"clients/sg-runner.ts#SgRunner.tempScanDetailedAsync:e70984d6",
+		"`ast-grep scan --config <temp rule file> --json … <dir>`: both the rule file and the scan root are absolute arguments on dispatch (#4233 V3-HIGH-01), and when the module-level command is npx the options spread supplies the pi-lens-owned neutral cwd (#4233 V3-HIGH-02) the scan cannot follow through a call spread",
 	],
 	[
 		"clients/sg-runner.ts#SgRunner.tempScanWithFixAsync:23665a2b",
@@ -414,7 +426,7 @@ const NO_CWD_EXEMPTION_ROWS: ReadonlyArray<readonly [string, string]> = [
 ];
 const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 	[
-		"clients/safe-spawn.ts#safeSpawn:ad6fe3ed~0cd6d898",
+		"clients/safe-spawn.ts#safeSpawn:ad6fe3ed~119c1ce6",
 		"the synchronous safe-spawn path derives its cwd from its own compatibility options, not the dispatch resolveToolCwd seam",
 	],
 	[
@@ -434,7 +446,7 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"launchLSP forwards its caller-provided cwd through trySpawn",
 	],
 	[
-		"clients/biome-client.ts#BiomeClient.spawnBiomeAsync:29a3826f~29a3826f",
+		"clients/biome-client.ts#BiomeClient.spawnBiomeAsync:710974ec~dbf27697",
 		"cwd is spawnBiomeAsync's own `cwd` parameter; the checked sites are its two call sites in this file",
 	],
 	[
@@ -446,7 +458,7 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"passes `projectRoot` = path.resolve(cwd || process.cwd()) from checkFile's own API argument; DependencyChecker is called from the pipeline, not from dispatch",
 	],
 	[
-		"clients/dependency-checker.ts#DependencyChecker.runMadgeSpawn:7a8cc482~218c0256",
+		"clients/dependency-checker.ts#DependencyChecker.runMadgeSpawn:a505f960~218c0256",
 		"cwd is runMadgeSpawn's own `projectRoot` parameter — madge resolves tsconfig/webpack config from the project root, not from the edited file",
 	],
 	[
@@ -458,7 +470,7 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"whole-project scan: passes the same `projectRoot` local into runScanProject",
 	],
 	[
-		"clients/dependency-checker.ts#DependencyChecker.runScanProject:c4180627~218c0256",
+		"clients/dependency-checker.ts#DependencyChecker.runScanProject:0fe846f1~218c0256",
 		"cwd is runScanProject's own `projectRoot` parameter",
 	],
 	[
@@ -618,8 +630,8 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"passes `targetDir` = path.resolve(cwd) from the scan API's own argument",
 	],
 	[
-		"clients/jscpd-client.ts#JscpdClient.runScan:441c892b~dbf27697",
-		"cwd is runScan's own `cwd` parameter, and `hasProjectJscpdConfig(cwd)` decides the flags from the same directory",
+		"clients/jscpd-client.ts#JscpdClient.runScan:b6c89033~dbf27697",
+		"cwd is runScan's own `cwd` parameter, and `readProjectJscpdConfig(cwd)` decides the flags from the same directory",
 	],
 	[
 		"clients/knip-client.ts#KnipClient.runAnalyze:b959739e~f5c0e305",
@@ -638,6 +650,14 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"cwd is resolveGitToplevel's own `root` parameter — `git rev-parse --show-toplevel` asks about exactly that directory; the answer IS the root, so resolving one first would be circular (#2894)",
 	],
 	[
+		"clients/opaque-mutation-scan.ts#listGitHeadDelta:50e01c44~c87eec21",
+		"cwd is listGitHeadDelta's own `root` parameter — `git diff --name-only` lists the delta of the checkout that directory is in, relative to its top, so the paths resolve against that checkout's top in the root's own spelling (#4493)",
+	],
+	[
+		"clients/opaque-mutation-scan.ts#readGitHead:bc5a0a36~edb3d44f",
+		"cwd is readGitHead's own `root` parameter — `git rev-parse HEAD` names the commit of the worktree at that directory, which is the query's subject (#4493)",
+	],
+	[
 		"clients/opaque-mutation-scan.ts#recoverOpaqueChangesViaGit:dad86fa7~1167a91f",
 		"cwd is recoverOpaqueChangesViaGit's own `root` parameter — `git status --porcelain` reports the worktree at that root, which is the query's subject, not a config-resolution start (#2894)",
 	],
@@ -646,7 +666,7 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"passes the realpath-canonicalized `targetDir` from the scan API's own argument",
 	],
 	[
-		"clients/opengrep-client.ts#OpengrepClient.runScan:93a73c72~353ea442",
+		"clients/opengrep-client.ts#OpengrepClient.runScan:6ed13398~353ea442",
 		"cwd is runScan's own `cwd` parameter, from which OpengrepClient.resolveConfig(cwd) already chose the rule config",
 	],
 	[
@@ -666,11 +686,11 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"runAutofix forwards its own `cwd` parameter into tryEslintFix",
 	],
 	[
-		"clients/pipeline.ts#analysePipeline:9c1e49f0~dbf27697",
-		"analysePipeline (runPipeline's body since #3506) forwards its own `cwd` parameter into runAutofix",
+		"clients/pipeline.ts#analysePipeline:128f8f18~dbf27697",
+		"analysePipeline forwards its language `cwd` into runAutofix and separately passes the authoritative session root for adopted-writer admission (#4309)",
 	],
 	[
-		"clients/safe-spawn.ts#safeSpawnAsync:f7eca8ca~446d128f",
+		"clients/safe-spawn.ts#safeSpawnAsync:f7eca8ca~b4dc9aa5",
 		"this IS the spawn seam: `spawnCwd` is the cwd its own caller passed in options, so the origin rule applies to the callers, not here",
 	],
 	[
@@ -682,7 +702,7 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"passes `targetDir` = path.resolve(cwd) from the scan API's own argument",
 	],
 	[
-		"clients/trivy-client.ts#TrivyClient.runScan:8715cda5~353ea442",
+		"clients/trivy-client.ts#TrivyClient.runScan:e9ed392e~353ea442",
 		"cwd is runScan's own `cwd` parameter, the directory `trivy fs` is pointed at",
 	],
 ];

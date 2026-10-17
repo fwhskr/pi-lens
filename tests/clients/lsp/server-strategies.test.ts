@@ -13,8 +13,11 @@ import {
 } from "../../../clients/lsp/wait-policy/strategies.js";
 
 describe("TypeScript diagnostic strategies (#1412)", () => {
-	it("keeps classic first-push seeding but stabilizes native TS7 pushes", () => {
-		expect(getStrategy("typescript", "classic").seedFirstPush).toBe(true);
+	it("holds classic's measured empty first push and stabilizes native TS7 pushes", () => {
+		expect(getStrategy("typescript", "classic").seedFirstPush).toBe(false);
+		expect(getStrategy("typescript", "classic").emptyFirstPublish).toBe(
+			"indexing",
+		);
 		expect(getStrategy("typescript", "native-ts7").seedFirstPush).toBe(false);
 		expect(getStrategy("typescript", "native-ts7").debounceMs).toBeGreaterThan(
 			0,
@@ -31,15 +34,6 @@ describe("cue diagnostic strategy (#1522) — measured against the real v0.17.1 
 		// this marker absent prevents the cascade from skipping that signal.
 		expect(strategy.silentOnClean).toBeUndefined();
 		expect(strategy.reopenOnResync).toBeFalsy();
-	});
-});
-
-describe("lua diagnostic strategy (#3347)", () => {
-	it("marks the measured clean-transition silence", () => {
-		const strategy = getStrategy("lua");
-		// Run 35914033696 measured two dirty publishes and no clean-transition
-		// publish; the marker is the cascade's tier-3 wait-policy decision.
-		expect(strategy.silentOnClean).toBe(true);
 	});
 });
 

@@ -9,16 +9,25 @@ import { evaluateGitGuard, isGitCommitOrPushAttempt } from "./git-guard.js";
 import { dropHashlineAnchorMemo } from "./hashline-anchor.js";
 import { evaluateSharedCheckoutGuard } from "./shared-checkout-guard.js";
 import { logLatency } from "./latency-logger.js";
-import { normalizeMapKey, toPosix } from "./path-utils.js";
+import { toPosix } from "./path-utils.js";
 import {
 	captureFileStats,
 	getOpaqueBaselineStore,
+	headRecordKey,
 	isGitWorktree,
+	opaqueBaselineSlot,
+	shouldRunOpaqueRecovery,
 	type PendingOpaqueBaseline,
 } from "./opaque-mutation-scan.js";
+import { bounded } from "./deadline-utils.js";
+import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
 import { normalizeForGuardMatch } from "./host-edit-normalize.js";
 import { retargetReplacementIndentation } from "./indent-retarget.js";
-import { noteAgentCallEnd, noteAgentCallStart } from "./fix-run-restore.js";
+import {
+	expectationFromToolInput,
+	noteAgentCallEnd,
+	noteAgentCallStart,
+} from "./fix-run-restore.js";
 import { LANGUAGE_POLICY } from "./language-policy.js";
 import { isComplexitySupportedFile } from "./tree-sitter-shared.js";
 import {
@@ -27,8 +36,9 @@ import {
 } from "./mutating-tool.js";
 import { isProvisionalLearnedAttribution } from "./mutation-attribution.js";
 import { armObservedMutation } from "./observed-mutation.js";
+import { extractWrittenPathsFromCommand } from "./bash-file-access.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
-import { getLSPService } from "./lsp/index.js";
+import { getLSPService } from "./lsp/capabilities.js";
 import {
 	findDocumentSymbolAtLine,
 	getOpenDocumentSymbols,
@@ -51,6 +61,7 @@ import {
 	EXPANSION_LIMIT_LINES,
 	tryExpandRead,
 } from "./read-expansion.js";
+import { scanFileLines } from "./read-guard.js";
 import {
 	boundedIndexesForCount,
 	createReadGuardEditBatchSummary,
@@ -58,7 +69,6 @@ import {
 	logReadGuardEvent,
 } from "./read-guard-logger.js";
 import {
-	countFileLines,
 	formatAlreadyAppliedNotes,
 	getTouchedLinesForGuard,
 	relocateEditRange,
@@ -66,9 +76,13 @@ import {
 	tryCorrectIndentationMismatchFromContent,
 } from "./read-guard-tool-lines.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
-import { handleToolResult } from "./runtime-tool-result.js";
-import { resolveToolCallCorrelationId } from "./tool-event.js";
+import { handleToolResult, resyncHeadMove } from "./runtime-tool-result.js";
+import {
+	resolveReadEvidenceCorrelationId,
+	resolveToolCallCorrelationId,
+} from "./tool-event.js";
 import { getSharedTreeSitterClient } from "./tree-sitter-shared.js";
+import { loadDispatchIntegration } from "./dispatch/lazy.js";
 
 const LSP_TOOLCALL_NAV_TOUCH_BUDGET_MS = Math.max(
 	0,
@@ -144,6 +158,55 @@ function getToolCallRawFilePath(
 }
 
 /**
+ * #4187 R4, folded in R5: `ast_grep_replace` is the one pi-lens-owned
+ * in-process writer the generic `tool_call` site below cannot see. It names its
+ * targets in a `paths` ARRAY, which `readMutationPathField` (a single-string
+ * reader) does not return, so the observational net's arm never runs for it and
+ * nothing else retires or licenses what it is about to rewrite. Every other
+ * owned writer (`lsp_navigation` rename/rename_file/executeCommand,
+ * `lens_diagnostic_mark`) names one `path`/`filePath`, which that arm already
+ * retires and licenses; a second site for them was a guard no mutation could
+ * red (R4-3, T3 and T4).
+ *
+ * The license is what makes the write's later advance sound (#4187 R4-1, the
+ * third recurrence of "named path vs written set" on this seam): an apply
+ * rewrites every matched file, which is a WIDER set than the one the call
+ * named when `paths` is a folder or is omitted for the project default. Only a
+ * path this call checked may be re-baselined; every other path the apply
+ * changed ends its authorship, which costs one read and never vouches for a
+ * byte the conversation did not see.
+ */
+function retireAstGrepApplyTargets(
+	toolName: string,
+	event: { input?: unknown },
+	runtime: ToolCallDeps["runtime"],
+	ctx: { cwd?: string },
+): void {
+	const input = (event.input ?? {}) as Record<string, unknown>;
+	if (toolName !== "ast_grep_replace" || input.apply !== true) return;
+	if (!Array.isArray(input.paths)) return;
+	const checked: string[] = [];
+	for (const rawPath of input.paths) {
+		if (typeof rawPath !== "string") continue;
+		const resolved = resolveToolCallFilePath(
+			rawPath,
+			ctx.cwd,
+			runtime.projectRoot,
+		)?.path;
+		if (!resolved) continue;
+		runtime.readGuard?.retireChangedAuthorship?.(resolved);
+		checked.push(resolved);
+	}
+	// A folder target resolves but authors nothing, so it licenses no file: the
+	// files the apply rewrites inside it are unlicensed and end their
+	// authorship. Omitted `paths` (the project default) returns above.
+	runtime.readGuard?.noteCheckedPaths?.(
+		resolveToolCallCorrelationId(event),
+		checked,
+	);
+}
+
+/**
  * Resolve a tool_call's raw path to the file pi will actually touch.
  *
  * The `cwd` basis is the host `ctx.cwd`, which for the pinned host IS the same
@@ -198,19 +261,6 @@ function getReadToolInput(
 ): ReadToolInput | undefined {
 	if (toolName !== "read") return undefined;
 	return input as ReadToolInput;
-}
-
-function getEffectiveReadLimit(
-	filePath: string | undefined,
-	readInput: ReadToolInput | undefined,
-): number | undefined {
-	if (!filePath || !readInput) return undefined;
-	const requestedOffset = Math.max(1, readInput.offset ?? 1);
-	const requestedLimit = readInput.limit;
-	return (
-		requestedLimit ??
-		Math.max(1, countFileLines(filePath) - requestedOffset + 1)
-	);
 }
 
 function isLspCapableFile(filePath: string): boolean {
@@ -321,6 +371,8 @@ interface ToolCallEvent {
 	 * (#1642).
 	 */
 	toolCallId?: string;
+	/** Parent codemode call carrying nested tool results on the transcript. */
+	parentToolCallId?: string;
 	input?: unknown;
 	details?: unknown;
 	provider?: string;
@@ -369,6 +421,12 @@ interface ToolCallDeps {
 	) => void;
 	resetLSPService: (options?: LSPShutdownOptions) => void;
 	getTreeSitterClient?: typeof getSharedTreeSitterClient;
+	/**
+	 * #3613: the stable session id of the session whose tool call this is, so
+	 * the post-edit pipeline a partial apply runs here records its per-turn
+	 * warnings in that session's partition.
+	 */
+	sessionId?: string;
 }
 
 export type ToolCallResult = { block: true; reason?: string } | void;
@@ -558,6 +616,33 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			},
 		});
 	if (!lensEnabled) return;
+	// #4493: before every tool, a HEAD move this session has not seen (made
+	// outside pi, or by a bash call still in its tool_result) resyncs the held
+	// documents it rewrote, and a look already running for this session is
+	// joined, so a parallel read or edit never runs against the stale primary
+	// (review r1 F1). A bash call's look also records the HEAD its command
+	// starts from, without which the first move of a session would read as a
+	// first sight at its tool_result. Reading HEAD is a file read; the bound
+	// ends the wait, and a cut look writes a `hook-await-exceeded` row.
+	const headRoot = ctx.cwd ?? runtime.projectRoot;
+	if (headRoot)
+		await bounded(
+			resyncHeadMove({
+				root: headRoot,
+				key: headRecordKey(
+					opaqueBaselineSlot(headRoot, runtime.sessionGeneration),
+					deps.sessionId,
+				),
+				trigger: "tool_call",
+				label: toolName,
+			}),
+			{
+				ms: HOOK_WALL_BUDGET_MS.tool_result_read_only,
+				signal: ctx.signal,
+				hook: "tool_call",
+				label: "head-move-resync",
+			},
+		);
 	// #2000 phase 2: opaque-command pre-snapshot. A bash command whose writes
 	// the extractor will not recognize gets a bounded stat snapshot of the
 	// project source universe BEFORE it runs; the tool_result side diffs it.
@@ -566,11 +651,24 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	// an already-second-scale bash path.
 	if (toolName === "bash") {
 		const commandInput = (event as { input?: { command?: unknown } }).input;
+		// #4131: a recognized bash write credits authorship without the bytes
+		// it wrote, so it may only advance an authorship whose bytes still
+		// hold. One another writer broke ends here, before the command rewrites
+		// around the other writer's bytes (the tool_result path's root).
+		if (typeof commandInput?.command === "string" && !getFlag("no-read-guard"))
+			for (const target of extractWrittenPathsFromCommand(
+				commandInput.command,
+				runtime.projectRoot || process.cwd(),
+			))
+				runtime.readGuard?.retireChangedAuthorship?.(target);
 		if (typeof commandInput?.command === "string" && commandInput.command) {
 			const scanRoot = ctx.cwd ?? runtime.projectRoot;
-			if (scanRoot) {
+			if (scanRoot && shouldRunOpaqueRecovery(toolName, scanRoot)) {
 				const started = Date.now();
-				const rootKey = `${normalizeMapKey(path.resolve(scanRoot))}:${runtime.sessionGeneration}`;
+				const baselineSlot = opaqueBaselineSlot(
+					scanRoot,
+					runtime.sessionGeneration,
+				);
 				let baseline: PendingOpaqueBaseline;
 				let resultNote: string;
 				if (await isGitWorktree(scanRoot)) {
@@ -596,10 +694,21 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					resultNote =
 						outcome.unknownReason ?? `scanned:${outcome.scannedCount}`;
 				}
-				// Session-stamped key: a concurrent-secondary session (#473)
-				// replacing this slot must yield a no-pending-snapshot UNKNOWN
-				// for us - never a diff against another session's baseline.
-				getOpaqueBaselineStore().record(rootKey, baseline);
+				// Session-stamped slot: a concurrent-secondary session (#473)
+				// replacing it must yield a no-pending-snapshot UNKNOWN for us -
+				// never a diff against another session's baseline. One entry per
+				// call (#4137): parallel bash calls all record before the first
+				// result. The turn lets the store retire the entry of a call that
+				// never gets a result (#3613 F2: this session's own turn).
+				getOpaqueBaselineStore().record(
+					baselineSlot,
+					resolveToolCallCorrelationId(event),
+					baseline,
+					{
+						key: runtime.turnKey(deps.sessionId),
+						isLive: (key) => runtime.isLiveTurnKey(key),
+					},
+				);
 				logLatency({
 					type: "phase",
 					phase: "opaque_mutation_prescan",
@@ -640,18 +749,39 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					?.path
 			: undefined;
 		if (observedPath) {
+			// #4131: as for a bash write (above), the replay of what this tool
+			// wrote credits authorship without the bytes, so a broken one ends
+			// before the tool rewrites around another writer's bytes: for the
+			// path it named and, for a directory, every file it may replay.
+			// #4187 R4-1: those same paths are this call's licensed set, so the
+			// settle's replay may advance exactly them — the universe IS the
+			// population the replay can report, and every path in it was checked
+			// here.
+			const observedCallId = resolveToolCallCorrelationId(event);
+			const retire = (target: string) => {
+				runtime.readGuard?.retireChangedAuthorship?.(target);
+			};
+			retire(observedPath);
+			runtime.readGuard?.noteCheckedPaths?.(observedCallId, [observedPath]);
 			await armObservedMutation({
-				toolCallId: resolveToolCallCorrelationId(event),
+				toolCallId: observedCallId,
 				toolName,
 				targetPath: observedPath,
 				cwd: ctx.cwd ?? runtime.projectRoot,
 				sessionGeneration: runtime.sessionGeneration,
-				turnIndex: runtime.turnIndex,
+				// #3613 F2: the budget of this session's own turn.
+				turnIndex: runtime.turnKey(deps.sessionId),
+				isLiveTurn: (key) => runtime.isLiveTurnKey(key),
+				onUniverse: (paths) => {
+					paths.forEach(retire);
+					runtime.readGuard?.noteCheckedPaths?.(observedCallId, paths);
+				},
 				signal: ctx.signal,
 				dbg,
 			});
 		}
 	}
+	retireAstGrepApplyTargets(toolName, event, runtime, ctx);
 
 	if (
 		getFlag("lens-guard") &&
@@ -720,8 +850,11 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		`tool_call fired for: ${filePath} (exists: ${nodeFs.existsSync(filePath)})`,
 	);
 	const toolCallId = resolveToolCallCorrelationId(event);
+	// #4138: a read is attributed too, so its tool_result resolves a relative
+	// path against the cwd this call ran under instead of failing closed at
+	// `path_attribution_missing` and never writing the delivered record.
 	const attributesMutationTarget =
-		toolCallId !== undefined && mutation !== undefined;
+		toolCallId !== undefined && (mutation !== undefined || toolName === "read");
 	const targetMissing = !nodeFs.existsSync(filePath);
 	// #1642 F1: a brand-new file's WRITE is never a "skip" — `tool_call`
 	// fires PRE-execution, so `existsSync` is false for every path a write
@@ -749,8 +882,15 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		});
 		// #3598: this mutation is now in flight, so a running whole-package fixer
 		// must not write an older capture over it. Cleared at its tool_result, or
-		// below when the call is blocked.
-		noteAgentCallStart(toolCallId, filePath);
+		// below when the call is blocked. A read changes no bytes, so it is never
+		// in flight here: an in-flight read would stop the restore of an agent
+		// edit the fixer overwrote (#4185 round 1, F2).
+		if (mutation !== undefined)
+			noteAgentCallStart(
+				toolCallId,
+				filePath,
+				expectationFromToolInput(event.input, mutation.kind),
+			);
 	}
 	if (targetMissing) {
 		// #1655 item 5: this early return used to be the whole story — pi-lens
@@ -878,7 +1018,30 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	const requestedReadOffset = Math.max(1, readInput?.offset ?? 1);
 	const requestedReadLimit = readInput?.limit;
 	let effectiveReadOffset = requestedReadOffset;
-	let effectiveReadLimit = getEffectiveReadLimit(filePath, readInput);
+	// #1649: one bounded pass serves every read-accounting consumer below: the
+	// effective limit, the expansion's line count, the read_pattern total and
+	// the provisional record's line hashes. None of them runs for an external
+	// or vendor file, so it pays nothing.
+	let readScan =
+		readInput && filePath && !isExternalOrVendor
+			? scanFileLines(
+					filePath,
+					[
+						{
+							offset: requestedReadOffset,
+							limit: requestedReadLimit ?? Number.POSITIVE_INFINITY,
+						},
+					],
+					{ count: true },
+				)
+			: undefined;
+	// An unreadable file counts one line, as countFileLines always answered.
+	const readTotalLines = readScan?.totalLines ?? 1;
+	let effectiveReadLimit =
+		readInput && filePath
+			? (requestedReadLimit ??
+				Math.max(1, readTotalLines - requestedReadOffset + 1))
+			: undefined;
 
 	// --- Opportunistic read expansion via tree-sitter ---
 	// For partial reads (small limit, not from line 1), find the enclosing
@@ -917,16 +1080,12 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		readInput &&
 		requestedReadLimit != null
 	) {
-		const totalLines =
-			effectiveReadLimit != null && requestedReadLimit == null
-				? effectiveReadLimit
-				: countFileLines(filePath);
 		try {
 			const expansion = await tryExpandRead(
 				filePath,
 				requestedReadOffset,
 				requestedReadLimit,
-				totalLines,
+				readTotalLines,
 				readExpansionClient,
 			);
 			if (expansion) {
@@ -1017,6 +1176,15 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		} catch {
 			// Best-effort only.
 		}
+		// The expansion awaited tree-sitter, so the record's evidence is read
+		// again now, over the range it settled on: the capture is taken after
+		// the await, next to the FileTime stamp, as it always was. Only the
+		// hashes are needed, so the pass stops after the range.
+		readScan = scanFileLines(
+			filePath,
+			[{ offset: effectiveReadOffset, limit: effectiveReadLimit ?? 1 }],
+			{ count: false },
+		);
 	}
 
 	// Register the host-resolved path at tool_call. This path is load-bearing for
@@ -1024,8 +1192,9 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	// --no-read-guard. The paired tool_result adds the authoritative delivered
 	// range after the host applies EOF and output-cap clipping (#2802 probe 3).
 	if (toolName === "read" && filePath && !isExternalOrVendor) {
-		const totalLines = countFileLines(filePath);
+		const totalLines = readTotalLines;
 		const deliveredLimit = effectiveReadLimit ?? 1;
+		const lineHashes = readScan?.hashes(effectiveReadOffset, deliveredLimit);
 		logToolReadGuardEvent({
 			event: "read_pattern",
 			sessionId: runtime.telemetrySessionId,
@@ -1046,22 +1215,32 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				expandedByTs: enclosingSymbol !== undefined,
 			},
 		});
-		runtime.readGuard.recordRead({
-			filePath,
-			requestedOffset: requestedReadOffset,
-			requestedLimit: requestedReadLimit ?? deliveredLimit,
-			effectiveOffset: effectiveReadOffset,
-			effectiveLimit: deliveredLimit,
-			expandedByLsp: enclosingSymbol !== undefined,
-			...(enclosingSymbol !== undefined && { enclosingSymbol }),
-			turnIndex: runtime.turnIndex,
-			writeIndex: runtime.peekWriteIndex(),
-			timestamp: Date.now(),
-			provisional: true,
-			...(resolveToolCallCorrelationId(event) !== undefined && {
-				source: `native-read:${resolveToolCallCorrelationId(event)}:provisional`,
-			}),
-		});
+		runtime.readGuard.recordRead(
+			{
+				filePath,
+				requestedOffset: requestedReadOffset,
+				requestedLimit: requestedReadLimit ?? deliveredLimit,
+				effectiveOffset: effectiveReadOffset,
+				effectiveLimit: deliveredLimit,
+				expandedByLsp: enclosingSymbol !== undefined,
+				...(enclosingSymbol !== undefined && { enclosingSymbol }),
+				turnIndex: runtime.turnIndex,
+				writeIndex: runtime.peekWriteIndex(),
+				timestamp: Date.now(),
+				provisional: true,
+				...(lineHashes && { lineHashes }),
+				// The call identity keys this capture for the tool_result that
+				// supersedes it (unique per call, nested or not). No `toolCallId`: the
+				// record showed the agent nothing yet, so no branch move may keep it.
+				// A read that errors leaves only this record, and with an identity it
+				// licensed an edit after /clone (#4185 round 1, F1).
+				...(toolCallId !== undefined && {
+					source: `native-read:${toolCallId}:provisional`,
+				}),
+			},
+			// The scan above is the disk capture; recordRead takes none of its own.
+			{ captureLineHashes: false },
+		);
 	}
 
 	// Record complexity baseline for historical tracking (booboo/tdi).
@@ -1114,7 +1293,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		)?.complexityClient;
 		const baseline = await complexityClient?.analyzeFile(filePath);
 		if (baseline) {
-			runtime.complexityBaselines.set(filePath, baseline);
+			runtime.complexityBaselines.add(filePath);
 			const { captureSnapshot } = await import("./metrics-history.js");
 			captureSnapshot(filePath, {
 				maintainabilityIndex: baseline.maintainabilityIndex,
@@ -1156,7 +1335,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			filePath,
 			runtime.turnIndex,
 			runtime.peekWriteIndex(),
-			toolCallId,
+			resolveReadEvidenceCorrelationId(event),
 		);
 	}
 
@@ -1446,6 +1625,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				runtime.telemetrySessionId,
 				readGuardCorrelationId,
 				runtime.partialApplyRecords,
+				readGuard.contentMatchesLastRead(filePath),
 			);
 			if (preflightError) {
 				if (partiallyApplicable && partiallyApplicable.length > 0) {
@@ -1495,6 +1675,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 									metricsClient,
 									resetLSPService,
 									readGuard: runtime.readGuard,
+									sessionId: deps.sessionId,
 									_ownWriteStamp: partialStamp,
 									agentBehaviorRecord: (toolName, analyzedPath) =>
 										agentBehaviorClient.recordToolCall(toolName, analyzedPath),
@@ -1699,4 +1880,111 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			}
 		}
 	}
+
+	// #4483: last, so only a call every pi-lens guard allowed pays for it.
+	if (isWriteOrEdit && !isExternalOrVendor) {
+		const started = Date.now();
+		const controller = new AbortController();
+		const signal = deps.ctx.signal
+			? AbortSignal.any([deps.ctx.signal, controller.signal])
+			: controller.signal;
+		const outcome = await bounded(capturePreEditSeed(filePath, deps, signal), {
+			ms: PRE_EDIT_CAPTURE_BUDGET_MS,
+			signal: deps.ctx.signal,
+			hook: "tool_call",
+			label: "pre-edit-linter-capture",
+		});
+		controller.abort();
+		if (!outcome || outcome.outcome === "failed")
+			recordDegradationOnce({
+				kind: "pre-edit-capture-incomplete",
+				subject: "pre-edit",
+				reason: outcome?.outcome ?? "abandoned",
+			});
+		recordPreEditCapture(filePath, outcome, Date.now() - started);
+	}
+}
+
+/**
+ * #4483: how long a `tool_call` waits for the pre-edit linter capture.
+ * `tool_call` has no wall budget of its own (clients/hook-budgets.ts); this
+ * is the per-await bound. Measured in PR #4483's body.
+ */
+export const PRE_EDIT_CAPTURE_BUDGET_MS = 500;
+
+type PreEditCaptureResult =
+	| Awaited<
+			ReturnType<
+				Awaited<
+					ReturnType<typeof loadDispatchIntegration>
+				>["capturePreEditLinterFindings"]
+			>
+	  >
+	| { outcome: "failed"; failure: string };
+
+/**
+ * #4483: before the host first replaces an existing file's bytes this
+ * session, run its linters over those bytes and seed the file's delta, so
+ * the write's dispatch reports their old errors as pre-existing instead of
+ * as blockers (`capturePreEditLinterFindings`). Never rejects.
+ */
+function capturePreEditSeed(
+	filePath: string,
+	deps: ToolCallDeps,
+	signal: AbortSignal,
+): Promise<PreEditCaptureResult> {
+	const session = deps.runtime.captureSessionGeneration();
+	const workspaceRoot = deps.runtime.projectRoot || process.cwd();
+	const pi = { getFlag: (flag: string) => deps.getFlag(flag) };
+	return loadDispatchIntegration()
+		.then(({ capturePreEditLinterFindings }) =>
+			capturePreEditLinterFindings(
+				filePath,
+				workspaceRoot,
+				pi,
+				session,
+				signal,
+			),
+		)
+		.catch((cause: unknown): PreEditCaptureResult => {
+			const failure = cause instanceof Error ? cause.message : String(cause);
+			return { outcome: "failed", failure: failure.slice(0, 200) };
+		});
+}
+
+/**
+ * #4483: one latency row per capture that ran (`undefined` = the bound gave
+ * up first, `abandoned`). A file already dispatched this session, a file
+ * whose abandoned capture is still running, or a session with `--no-delta`
+ * writes none, so a long session pays one row per file, not one per write.
+ */
+function recordPreEditCapture(
+	filePath: string,
+	outcome: PreEditCaptureResult | undefined,
+	durationMs: number,
+): void {
+	if (
+		outcome?.outcome === "skipped" &&
+		(outcome.reason === "already-dispatched" ||
+			outcome.reason === "no-delta" ||
+			outcome.reason === "in-flight")
+	)
+		return;
+	logLatency({
+		type: "phase",
+		phase: "pre_edit_capture",
+		filePath,
+		durationMs,
+		result: outcome?.outcome ?? "abandoned",
+		metadata: {
+			...(outcome?.outcome === "seeded" && {
+				seeded: outcome.seeded,
+				runners: outcome.runners.join(","),
+			}),
+			...((outcome?.outcome === "skipped" ||
+				outcome?.outcome === "discarded") && { reason: outcome.reason }),
+			...(outcome?.outcome === "failed" && { failure: outcome.failure }),
+			budgetMs: PRE_EDIT_CAPTURE_BUDGET_MS,
+		},
+	});
 }

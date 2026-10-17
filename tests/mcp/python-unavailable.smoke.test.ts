@@ -46,6 +46,8 @@ describe("lsp diagnostics with no Python analyzer (TASK-130)", () => {
 			(response.result as { content: { text: string }[] }).content[0]?.text,
 		);
 		expect(text).not.toContain("clean=1");
-		expect(text).toContain("unavailable=1");
+		// #4322 (upstream) reports the unanswered primary as unconfirmed.
+		expect(text).toContain("1 with no language server answer");
+		expect(text).toContain("0 files confirmed clean");
 	}, 120_000);
 });

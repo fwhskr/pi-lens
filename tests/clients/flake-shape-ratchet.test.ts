@@ -4,7 +4,7 @@
  * Three deflake PRs in two days (#2531 alone fixed three shared-slot races)
  * and nothing counted the contention surface those PRs kept fixing, so the
  * set only grew. This ratchet counts it: `tests/support/flake-shape-scan.ts`
- * runs five detectors over every `tests/**\/*.test.ts` file —
+ * runs seven detectors over every `tests/**\/*.test.ts` file —
  *
  * 1. `real-process-spawn` — a real child process (`child_process` import,
  *    `execFileSync`/`spawnSync`/`execSync`, a support spawn-helper call, or a
@@ -18,6 +18,20 @@
  *    fake-timer scope (#2885): only a real timer, often a production helper's
  *    budget the other detectors cannot read, ends an await on it. Minted with
  *    37 files / 73 hits.
+ * 6. `in-process-mock` — a `vi.mock`/`vi.doMock` of a module that is not a
+ *    process or host boundary (`PROCESS_BOUNDARY_MODULES`), keyed
+ *    `<file>::<module>` so the baseline pins which modules a file mocks, not
+ *    only how many (#4362). Minted with 480 files / 1,002 modules.
+ * 7. `service-double` — an object literal that hand-rolls a registered
+ *    in-process service (`SERVICE_SURFACES`: `LSPClientInfo`, `LSPService`),
+ *    keyed `<file>::<service>` (#4362). Minted with 83 files / 151 objects.
+ *
+ * Detectors 6 and 7 exist because #4344 round 3 (G5) added one method to
+ * `LSPClientInfo` and `LSPService` and then had to add it by hand to doubles
+ * in 40 test files: every in-process double is a copy of an interface that
+ * the next interface change must find. Their admission is the header and the
+ * `ADMITTED_AFTER_BASELINE` entry; a mock adds no contention, so they need no
+ * serialized lane (`MOCK_DETECTORS`).
  *
  * `FLAKE_SHAPE_BASELINE` (`tests/support/flake-shape-baseline.json`) is
  * today's population, content-keyed as `file → count` per detector — the
@@ -55,6 +69,7 @@
  * absent, so a future reader does not conclude the file was missed.
  */
 
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -66,13 +81,25 @@ import {
 	countsByDetector,
 	type DetectorName,
 	DETECTOR_NAMES,
+	declaredMembers,
 	DETECTORS,
+	hitKey,
+	IDENTITY_SEPARATOR,
+	MOCK_DETECTORS,
+	mockTarget,
+	NON_LITERAL_MOCK_TARGET,
+	PROCESS_BOUNDARY_MODULES,
 	repoRoot,
 	scanElapsedTimeAssertion,
+	scanInProcessMock,
 	scanNeverSettlingWait,
 	scanRawTimerWait,
 	scanRealProcessSpawn,
+	scanServiceDouble,
 	scanUngovernedWaitFor,
+	SERVICE_DOUBLE_MIN_MEMBERS,
+	SERVICE_SURFACES,
+	surfaceMembers,
 } from "../support/flake-shape-scan.js";
 import { testSourceFiles as allTestSourceFiles } from "../support/module-instance-scan.js";
 import { localImportTargets } from "../support/hook-await-scan.js";
@@ -89,6 +116,93 @@ const FLAKE_SHAPE_BASELINE: Baseline = JSON.parse(
 	),
 );
 
+// ── The frozen mint (#4383 review F1) ────────────────────────────────────
+//
+// Recurrence: a planted `vi.mock` plus ONLY its baseline row, or a planted
+// `execFileSync` plus only its real-process-spawn row, passed the ratchet
+// with no header and no ADMITTED_AFTER_BASELINE entry. The failure message
+// asked for both; nothing enforced them, because the live scan is compared
+// with the baseline and the baseline is plain data anyone can grow.
+//
+// `flake-shape-baseline-frozen.json` is the baseline as round 1 of #4383
+// shipped it, written once. A baseline row the mint does not cover (a new
+// key, or a count above the minted count) must have an ADMITTED entry, and
+// the existing admission test then demands its header (and, for a timing or
+// spawn detector, its serialized lane). The mint is digest-pinned so growing
+// it is a reviewed code change here, never a quiet data edit. CI's unit jobs
+// check out shallow, so the mint cannot be a git-history diff.
+
+const FROZEN_BASELINE_PATH = "tests/support/flake-shape-baseline-frozen.json";
+
+/** sha256 of the mint's canonical JSON (formatting and line endings do not count). */
+const FROZEN_BASELINE_DIGEST =
+	"db2450d7da2f0123a5bd4d366156598e709aea5a356073095ccc27ce0c9afbc2";
+
+const FROZEN_BASELINE_SOURCE = fs.readFileSync(
+	path.join(repoRoot, FROZEN_BASELINE_PATH),
+	"utf8",
+);
+
+const FROZEN_BASELINE: Baseline = JSON.parse(FROZEN_BASELINE_SOURCE);
+
+/** Problems with the mint's content against its pinned digest. */
+function frozenDigestProblems(
+	source: string,
+	digest: string = FROZEN_BASELINE_DIGEST,
+): string[] {
+	const actual = createHash("sha256")
+		.update(JSON.stringify(JSON.parse(source)))
+		.digest("hex");
+	if (actual === digest) return [];
+	return [
+		`${FROZEN_BASELINE_PATH} changed (sha256 ${actual}, pinned ${digest}). ` +
+			"The mint is write-once: admit a new row with an ADMITTED_AFTER_BASELINE " +
+			'entry and its "// flake-shape: <detector> — <reason>" header instead. ' +
+			"Only a deliberate re-mint (a renamed module behind hundreds of rows) " +
+			"edits the mint, and then FROZEN_BASELINE_DIGEST changes in the same PR " +
+			"with the reason in its description.",
+	];
+}
+
+/**
+ * Every baseline row the frozen mint does not cover needs an ADMITTED
+ * entry, and every ADMITTED entry needs a baseline row (a stale admission
+ * excuses nothing). The header and lane of each ADMITTED entry are the
+ * admission test's job (`validateAdmission`).
+ */
+function auditAgainstMint(
+	baseline: Readonly<Baseline> = FLAKE_SHAPE_BASELINE,
+	frozen: Readonly<Baseline> = FROZEN_BASELINE,
+	admitted: Readonly<
+		Record<string, { detector: DetectorName; reason: string }>
+	> = ADMITTED_AFTER_BASELINE,
+): string[] {
+	const problems: string[] = [];
+	for (const detector of DETECTOR_NAMES) {
+		for (const [key, count] of Object.entries(baseline[detector] ?? {})) {
+			const minted = frozen[detector]?.[key];
+			if (minted !== undefined && count <= minted) continue;
+			if (Object.hasOwn(admitted, `${detector}:${key}`)) continue;
+			problems.push(
+				`${detector}:${key}: baseline row ${count} is past the frozen mint ` +
+					`(${minted === undefined ? "absent" : `minted ${minted}`}) and has no ` +
+					"ADMITTED_AFTER_BASELINE entry; add the entry and its " +
+					`"// flake-shape: ${detector} — <reason>" header ` +
+					"(if the key only moved with a renamed file, re-mint the frozen file and its digest instead)",
+			);
+		}
+	}
+	for (const [admittedKey, entry] of Object.entries(admitted)) {
+		const key = admittedKey.slice(entry.detector.length + 1);
+		if (!Object.hasOwn(baseline[entry.detector] ?? {}, key)) {
+			problems.push(
+				`${admittedKey}: stale admission, no baseline row; remove the entry`,
+			);
+		}
+	}
+	return problems;
+}
+
 /**
  * Entries admitted to a detector's baseline AFTER it was minted — a merge-
  * window device, same shape and same cost profile as
@@ -97,6 +211,13 @@ const FLAKE_SHAPE_BASELINE: Baseline = JSON.parse(
 const ADMITTED_AFTER_BASELINE: Readonly<
 	Record<string, { detector: DetectorName; reason: string }>
 > = {
+	// 2026-10-08 (#4148): blank-heavy YAML language extraction is a synchronous
+	// event-loop path, so only a real-clock assertion sees its quadratic stall.
+	"elapsed-time-assertion:clients/ast-grep-rule-regex-budget.test.ts": {
+		detector: "elapsed-time-assertion",
+		reason:
+			"the defect is wall-clock only (super-linear ast-grep rule YAML language extraction); a fake clock measures nothing",
+	},
 	// 2026-09-11 (#2886 round 2): the /lens-perf occupancy row keeps one
 	// real-clock sampler assertion alongside its deterministic yield count —
 	// event-loop occupancy has no deterministic proxy; the yield count is
@@ -105,6 +226,13 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "elapsed-time-assertion",
 		reason:
 			"event-loop occupancy has no deterministic proxy; the sampler row guards per-chunk block size the yield count cannot see",
+	},
+	// 2026-10-08 (#4148): 100K blank lines expose the real event-loop stall in
+	// pytest traceback and go.mod regex parsing; a fake clock cannot measure it.
+	"elapsed-time-assertion:clients/pytest-gomod-regex-budget.test.ts": {
+		detector: "elapsed-time-assertion",
+		reason:
+			"the defect is wall-clock only (quadratic pytest traceback and go.mod regex backtracking); a fake clock measures nothing",
 	},
 	// 2026-09-08 (#2622): the defect is wall-clock only — 2^N regex
 	// backtracking in both glob compilers; a fake clock measures nothing.
@@ -118,6 +246,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"#3403 measures real scratch-tree filesystem latency; fake timers cannot observe cold CI disk work",
 	},
+	// 2026-10-08 (#3871 r2, moved to its own file in r3): depth-30 runner
+	// paths, 100K blank runs and 100K tokens are real event-loop occupancy
+	// witnesses for super-linear location-regex backtracking.
+	"elapsed-time-assertion:clients/test-runner-location-regex-budget.test.ts": {
+		detector: "elapsed-time-assertion",
+		reason:
+			"the defect is wall-clock only (super-linear runner-location regex backtracking); a fake clock measures nothing",
+	},
 	// 2026-09-06 (#2603, was #2591 review round 2, F1): the defect is 2^N regex
 	// backtracking through detectPythonEnvironment — the ANSWER was always
 	// right, only the time was wrong, so no non-clock assertion separates
@@ -128,6 +264,100 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 			reason:
 				"the defect is wall-clock only (2^N globstar backtracking); a fake clock measures nothing",
 		},
+	// 2026-10-15 (#1712/#4485): the cascade's live twin over a real classic
+	// TypeScript server. Installation is the external tool boundary: the stub
+	// hands the real wrapper and a classic compiler to the real launcher.
+	"in-process-mock:clients/cascade-classic-ts-live.test.ts::clients/installer/index":
+		{
+			detector: "in-process-mock",
+			reason:
+				"tool installation and discovery are the host boundary; the stub hands the real typescript-language-server wrapper and a classic compiler to the real launcher, service, client and cascade",
+		},
+	// 2026-10-16 (#4495 round 3): the cascade's pending gate runs the shared
+	// freshness gate quiet; whether its rows were written is only visible in
+	// the logLatency call, since turn_end overruns the five-phase ring.
+	"in-process-mock:clients/cascade-turn-merge.test.ts::clients/latency-logger":
+		{
+			detector: "in-process-mock",
+			reason:
+				"the freshness gate writes its rows through logLatency; turn_end logs more phases after the gate than the five the getRecentLoggedPhases ring keeps, and test mode skips the file sink, so a passed-through spy is the only reader",
+		},
+	// 2026-10-16 (#4493 r2): the auxiliary half of the default stack. A
+	// project lsp.json cannot declare an auxiliary (role is reserved and
+	// inert), so the catalog lookup adds one; the servers stay real children.
+	"in-process-mock:clients/head-move-resync-4493.test.ts::clients/lsp/config": {
+		detector: "in-process-mock",
+		reason:
+			"a project lsp.json cannot declare an auxiliary server, so the catalog lookup adds the auxiliary fake; every server is still a real child process",
+	},
+	// 2026-10-16 (#4476): the same fake auxiliary, seen from the role lookup
+	// the registry's dependency restart asks; getServerById knows only the
+	// built-in catalog, so the auxiliary added above answers there too.
+	"in-process-mock:clients/head-move-resync-4493.test.ts::clients/lsp/server": {
+		detector: "in-process-mock",
+		reason:
+			"getServerById reads only the built-in catalog, so the auxiliary fake the config lookup adds is answered there too; the restart then keeps it, and every server is still a real child process",
+	},
+	// 2026-10-15 (#4449): the registry's skip and respawn records go to
+	// logLatency. Its in-process ring drops the fields the test asserts, and
+	// test mode never reaches the file sink, so the captured call is the seam.
+	"in-process-mock:clients/lsp/client-registry-direct.test.ts::clients/latency-logger":
+		{
+			detector: "in-process-mock",
+			reason:
+				"the ring getRecentLoggedPhases reads keeps only phase and metadata, and test mode skips the file sink; the registry's filePath and durationMs fields are asserted from the captured call",
+		},
+	// 2026-10-15 (#4449): createLSPClient wraps the language-server child
+	// process; the extracted ClientRegistry's spawn bookkeeping is driven
+	// directly, so the client factory is the one boundary stood in for.
+	"in-process-mock:clients/lsp/client-registry-direct.test.ts::clients/lsp/client":
+		{
+			detector: "in-process-mock",
+			reason:
+				"createLSPClient wraps the language-server child process; the registry's spawn bookkeeping is the subject",
+		},
+	// 2026-10-14 (#4346): the ast-grep native addon's load is the host
+	// boundary, and `loadAstGrepNapiSync` is its only seam; no host lane
+	// lacks the addon, so the fail-closed record has no real driver.
+	"in-process-mock:clients/lsp/implicit-scope-napi-unavailable-4346.test.ts::clients/deps/ast-grep-napi":
+		{
+			detector: "in-process-mock",
+			reason:
+				"the native addon's load is the host boundary; its sync loader is the only seam to make it fail",
+		},
+	// 2026-10-16 (#4515): the fixture proves a trust-refused project-local
+	// candidate no longer ends the launch. The refusal, the installer and the
+	// candidate loop are real; only a store binary's launch is doubled.
+	"in-process-mock:clients/lsp/managed-fallback-after-trust-refusal-4515.test.ts::clients/lsp/launch":
+		{
+			detector: "in-process-mock",
+			reason:
+				"spawning the managed language server is the process boundary; the wrapper delegates every other command, the refused project-local candidate included, to the real launchLSP",
+		},
+	// 2026-10-16 (#4483): the first-write seed witness keeps every pi-lens
+	// module on the tool_call-to-turn-end chain real; only the language-server
+	// process behind the LSP capability adapter is stood in for, for the
+	// language-server guard cell (acceptance 5).
+	"in-process-mock:index-4483-first-write-seed-witness.test.ts::clients/lsp/capabilities":
+		{
+			detector: "in-process-mock",
+			reason:
+				"the language-server process is the boundary; the capability adapter is where every host witness stands in for it",
+		},
+	// 2026-10-15 (#4484): the host witness keeps every pi-lens module on the
+	// write-to-turn-end chain real; only the language-server process behind the
+	// LSP capability adapter is stood in for, answering from the bytes it gets.
+	"in-process-mock:index-4484-unfixed-blocker-witness.test.ts::clients/lsp/capabilities":
+		{
+			detector: "in-process-mock",
+			reason:
+				"the language-server process is the boundary; the capability adapter is where every host witness stands in for it",
+		},
+	"never-settling-wait:scripts/mutate-fixture.test.ts": {
+		detector: "never-settling-wait",
+		reason:
+			"the interrupt witness must hold a real child open until SIGINT; replacing the wait with a settled promise would erase the lifecycle under test",
+	},
 	// 2026-09-07 (#2703 review r1): an unhandled derived-promise rejection is
 	// only observable through Node's `unhandledRejection` event, which fires
 	// on a real macrotask; the file drains one real `setImmediate` tick.
@@ -185,6 +415,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"a real recursive fs.watch delivery is the subject; no fake clock delivers an inotify event and a stubbed watcher proves nothing",
 	},
+	"real-process-spawn:clients/analysis-root-writers.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"real git worktree metadata is written and registered by Git; an in-process double cannot prove linked-worktree ownership",
+	},
 	"real-process-spawn:clients/biome-config-decorator-metadata.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -211,10 +446,20 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"a real ast-grep child applies ignore rules through its own file matcher",
 	},
+	"real-process-spawn:clients/format-service-tab-width-real-biome.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real Biome binary's wrapping at the 80-column boundary is the subject; a mocked spawn can only restate the argv the fix chose",
+	},
 	"real-process-spawn:clients/git-tracked-ignore.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"real git children decide tracked-versus-ignored files from index state no stub reproduces",
+	},
+	"real-process-spawn:clients/head-move-resync-4493.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"a clean-tree HEAD move only exists in a real repository that git checks out, rebases or resets; a stubbed git cannot rewrite the files the server holds",
 	},
 	"real-process-spawn:clients/installer/pip-pep668.test.ts": {
 		detector: "real-process-spawn",
@@ -253,6 +498,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the reaper's evidence is a real pid's command line, kernel start time and inherited environment; a double would encode the very identity guess the fix removes",
 	},
+	// #4046 interim: six real Node writers rendezvous on an OS barrier and
+	// persist registrations through the production cross-process lock; an
+	// in-process double cannot reproduce the race, and serialization prevents
+	// it from overlapping the timing-sensitive occupancy sampler.
+	"real-process-spawn:clients/instance-registry-race.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"six real Node writers must rendezvous on an OS barrier and contend through the production cross-process lock; an in-process double cannot reproduce the race",
+	},
 	"real-process-spawn:clients/lsp/headless-tool-call-keepalive.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -262,6 +516,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"a real, live direct child is the only pid whose /proc PPid is this process, so the Linux ownership arm of the kill-by-pid predicate cannot be observed through any double",
+	},
+	"real-process-spawn:clients/lsp/lean-real-smoke.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"real Lean elaboration and diagnostic publication require Lake and elan across the child-process boundary; the serialized wall-clock lane isolates the handshake and diagnostic wait",
 	},
 	"real-process-spawn:clients/metrics-history-stderr.test.ts": {
 		detector: "real-process-spawn",
@@ -318,6 +577,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"real gitignore rules and index entries decide shadow files outside the test process",
 	},
+	"real-process-spawn:config/heavy-advisory-gate-workflow.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the subject is the real `Record Windows Vitest outcome` bash block under GitHub's bash flags (a fixture Node program at the population-script path runs under the real `node`, so no PATH, delimiter, or executable name is mocked) and the ref-deleted Git fetch form through the git-fixture-env seam",
+	},
 	"real-process-spawn:config/oxlint-advisory-rule-floor-gate.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -335,10 +599,32 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"observes the real npm pack lifecycle (prepack/postpack), and unpacks that real tarball to check what ships (#3219); no in-process double is faithful",
 	},
+	// #4169: the TypeScript-source entry (`pi -e index.ts`) is transpiled by the
+	// real host's jiti loader rather than native-imported, so /reload re-evaluates
+	// the pi-lens graph and only a real child reaches the orphaned module-scope
+	// runtime; no in-process double produces a fresh module instance.
+	"real-process-spawn:real-harness/bridge-reload-ts.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real pi host must transpile the TypeScript-source pi-lens entry, re-evaluate its module graph on /reload, and keep a third-party v1 bridge read connected to the live runtime (#4169)",
+	},
+	"real-process-spawn:real-harness/bridge-reload.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the shipped real pi host must reload the built extension and keep a third-party v1 bridge read connected to the live runtime across that lifecycle boundary (#4169)",
+	},
+	// 2026-10-07 (#4081): 1 -> 3. Whether teardown waits for, tree-kills and
+	// bounds a real child and its detached grandchildren, and whether removal
+	// outlasts a live writer, are only observable against real processes: an
+	// EventEmitter double has no pid, no reparenting and no files to write.
+	// 3 -> 7 in #4082 round 3: four child scripts build the process trees the
+	// tree kill and the kill guard are tested against (a self-exiting mid
+	// process, a root forking during the kill, a reparented orphan); the
+	// guard's verdict reads the kernel's PPid, which no double has.
 	"real-process-spawn:real-harness/child-exit.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"real pi child death is the process-boundary failure that must reject a governed waiter promptly",
+			"real pi child death is the process-boundary failure that must reject a governed waiter promptly; real child/grandchild processes are the only evidence that teardown reaps a process tree, that the kill guard admits exactly that tree, and that removal outlasts a live writer (#4081)",
 	},
 	// 2026-09-15 (#2154 AC1): 1 -> 3, then 3 -> 7 in #3060 round 2 (review F1 +
 	// F2). The reported defect needs TWO LIVE pi sessions over one project root
@@ -353,20 +639,54 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"two concurrent real pi children must share one project root and one PI_LENS_HOME; the cross-session stores are keyed by that pair",
 	},
+	// 2026-10-16 (#4513): 3 -> 4. pi 1.3 restores a resumed session's active tools
+	// from the transcript while pi-lens re-plans its lazy-tool set at
+	// session_start; which of the two decides, and whether the first request after
+	// a `--continue` restart advertises the same roster, is observable only on a
+	// real second pi process reading the first one's session file and sidecar.
+	"real-process-spawn:real-harness/lifecycle.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the first request after a real pi restart on a persisted session must advertise the lazy-tool roster pi restored and pi-lens planned; no in-process double runs the host's restore",
+	},
 	"real-process-spawn:real-harness/negative.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"real pi must surface provider exhaustion and malformed tool arguments across the process boundary",
+	},
+	"real-process-spawn:real-harness/outside-root.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real pi host must deliver the out-of-root advisory and degradation record through the process boundary, including the second edit and owned-path exemptions; #4292 also kills a real startup jscpd scan with caller TMPDIR overrides to prove scanner-root cleanup",
 	},
 	"real-process-spawn:real-harness/provider-compatibility.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"the installed pi host must load the built extension and expose its provider roster across the process boundary",
 	},
+	// 2026-10-08 (#4138, #3831, #4185 round 2): the branch a read record is
+	// admitted to is pi's own session branch after a real RPC clone rebinds the
+	// extension, and the nested ids (`c1/1`, parent `c1`) and the toolResult pi
+	// persists for a codemode call exist only in the real host. Round 4 adds
+	// four: pi's own agent loop decides that a call a later extension blocked
+	// gets tool_execution_end and no tool_result, in what order, top-level,
+	// parallel and nested. Round 5 adds one: a later extension's tool_result
+	// hook rewrites a failed read's isError after pi-lens saw it, which only
+	// pi's own hook chain produces.
+	"real-process-spawn:real-harness/read-guard-moves.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the read guard's branch admission after a real RPC clone, the nested-call ids pi mints, and the tool_execution_end pi's agent loop emits for a call a later extension blocked cannot be produced by an in-process double",
+	},
 	"real-process-spawn:real-harness/scenario-1.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"the real pi RPC host and extension lifecycle cannot be certified by an in-process double",
+	},
+	"real-process-spawn:real-harness/scenario-2.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the expired successor hand-off and activation roster must cross the real pi process boundary",
 	},
 	"real-process-spawn:real-harness/scenario-3.test.ts": {
 		detector: "real-process-spawn",
@@ -379,7 +699,7 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	"real-process-spawn:real-harness/tools-enabled.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"the provider wire roster is produced by a real pi host loading the built extension; an in-process double cannot certify tools.<name>.enabled",
+			"the provider wire roster and session-start log are produced by a real pi host loading the built extension; an in-process double cannot certify tools.<name>.enabled (#1416)",
 	},
 	// #3870: the detector tests drive the analyzer's real CLI entry point as a
 	// real node subprocess over redacted fixture logs; an in-process call could
@@ -411,12 +731,39 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	"real-process-spawn:scripts/check-pr-body.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"the exact local CLI, shallow checkout and `git check-ignore` (#2904) are the subjects; an in-process double cannot prove any of those command boundaries",
+			"the exact local CLI, shallow checkout, `git check-ignore` (#2904) and the gh label read behind `--lint-local` (#4288, PATH stub) are the subjects; an in-process double cannot prove any of those command boundaries",
+	},
+	// 2026-10-14 (#4397): the changed-test shuffle job's exit code is the contract;
+	// only a real vitest start reorders the cases of a fixture that shares state.
+	"real-process-spawn:scripts/ci-shuffle-changed-tests-spawn.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the job's exit code is the contract; an injected exec restates the flags the script builds instead of proving real vitest reorders and reds a file that shares state. Also one throwaway-repo case (#4456): the default diff and added lists are real `git diff --diff-filter=A` calls whose add/modify/rename meaning is git's, so a double would restate it",
+	},
+	// 2026-10-07 (#4072 review F2): the executable CLI's exit status is the
+	// contract; an in-process main() call cannot prove the entry-point boundary.
+	"real-process-spawn:scripts/ci-test-diff.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the executable CLI exit status is the contract; an in-process main call cannot prove the entry-point boundary",
 	},
 	"real-process-spawn:scripts/ci-verdict.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"#3883 F3: the final exit line and process status live at the real main() boundary; only a spawned CLI observes them",
+	},
+	"real-process-spawn:scripts/download-test-history-artifacts.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"a real gh child is required to prove transient API failure recovery, persistent failure, and a ZIP over the default spawn buffer at the process boundary",
+	},
+	// #4518: the evaluated-floor steps of grammar-health.yml, ci.yml and lint.yml
+	// are shell text; the exit-code mapping, `set +e`, a step output read by the
+	// next step and `| tee` under pipefail are observable only by running bash.
+	"real-process-spawn:scripts/floor-steps-executed.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the evaluated-floor steps are shell text from the workflows; only a real bash running the extracted run: shows that a swallowed status, a renamed step id or a pipe without pipefail reds or lies on the nightly",
 	},
 	"real-process-spawn:scripts/git-fixture-env.test.ts": {
 		detector: "real-process-spawn",
@@ -432,6 +779,18 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the hook's real stdin/exit-code/stderr contract is unobservable from an in-process call to the exported classify functions",
 	},
+	"real-process-spawn:scripts/guard-bash-probe.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real hook stdin/exit-code contract and head-to-head differential are unobservable through an in-process classifier call",
+	},
+	// #4291: the handshake and report steps of install-smoke.yml are shell text;
+	// pipefail and the crash line are observable only by running the real bash.
+	"real-process-spawn:scripts/install-smoke-handshake-steps.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the pipefail pipe into tee and the failing-row report are shell text from the workflow; only a real bash running the extracted run: shows that a red handshake exits non-zero and that a crash with no rows is not reported as clean",
+	},
 	// #2698: gitignore/tracked-vs-untracked resolution (git init/add/commit/
 	// ls-files against a throwaway fixture repo) is the exact mechanism
 	// scripts/lib/knip-sibling-purge.mjs depends on and this file tests.
@@ -439,6 +798,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"gitignore/tracked-vs-untracked resolution is the mechanism under test; no mock reproduces git's own resolution faithfully",
+	},
+	// #4047: the CLI's verdict and exit code are what a delegated lane acts on;
+	// they come from parsing the real selector, red-on-base and vitest
+	// transcripts over a real Git fixture, which an in-process stub restates.
+	"real-process-spawn:scripts/lane-check.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the CLI's verdict and exit code are parsed from the real selector, red-on-base and vitest transcripts over a real Git fixture; an in-process stub restates the transcript instead of proving the parse",
 	},
 	// 2026-09-07 (#2700): the gating/advisory subset test resolves oxlint's
 	// REAL `--print-config` for both npm scripts (never a hand-copied rule
@@ -455,10 +822,22 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the real pinned npm child is required to reproduce lockfile optional-binding rewrites; a process double cannot validate npm behavior",
 	},
+	// 2026-10-16 (#4510): the killed-runner witness ends its own vitest
+	// launcher from outside the worker (the kill guard refuses process.kill).
+	"real-process-spawn:scripts/mutate-fixture.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the fixture kills its parent vitest launcher through kill(1), because the kill guard refuses process.kill on a pid the file does not own; no in-process call ends the runner",
+	},
 	// 2026-09-26 (#3531): the CLI smoke test spawns a real node child to prove
 	// scripts/mutation-report.mjs's own argv parsing (--report/--out) and
 	// file I/O; an in-process call would just re-exercise the exported render
 	// function the other describe block already covers.
+	"real-process-spawn:scripts/mutate.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the mutation CLI's child Vitest process and signal path are the process boundary; an in-process call cannot prove restoration after SIGINT",
+	},
 	"real-process-spawn:scripts/mutation-report-render.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -503,7 +882,7 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	"real-process-spawn:scripts/pre-commit-hook.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"the real hook pipes git through xargs into the pinned oxfmt; the exit-123 refusal is a process-boundary fact",
+			"the real hook pipes git through xargs into the pinned oxfmt; the exit-123 refusal and handoff refusal are process-boundary facts",
 	},
 	"real-process-spawn:scripts/pre-push-targeted-tests.test.ts": {
 		detector: "real-process-spawn",
@@ -534,6 +913,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"the CLI's real exit code (2 vs. 4) and GITHUB_OUTPUT side effect are unobservable from an in-process stub",
+	},
+	// 2026-10-14 (#4401): the RPC session smoke's exit code is the contract; only
+	// a real child (a stand-in pi at the process boundary) can exit, or write a
+	// signal on stdout, and turn that code red.
+	"real-process-spawn:scripts/rpc-load-check-spawn.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the smoke's exit code is the contract; an in-process call of the classifier cannot prove that a pi child that exits, or a signal on its stdout, turns the exit code red",
 	},
 	// #3401: the seed script's default git argv (depth-2 fetch, refspec, blob
 	// specs) only means something against a real repo and a depth-1 clone.
@@ -568,11 +955,26 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	// early-exit call sites) only exists in the real module's own top-level
 	// execution order; a source-text assertion on the driver already passed
 	// under the crash, so only spawning the actual script against a real,
-	// throwaway git fixture reproduces it.
+	// throwaway git fixture reproduces it. The count moved 3 -> 4 with the
+	// #3853 lock test: whether the real driver waits behind a live exclusive
+	// holder (and refuses to fork vitest) is only observable by spawning the
+	// real script, since the lock lives in the driver's own top-level order.
+	// The count moved 4 -> 8 with #3856 F3: the heartbeat/refusal behind a live
+	// exclusive holder, the budget-signal abort, the absent and partial
+	// coverage reports, and the skipped/corrupt compiled source are each only
+	// observable by spawning the real driver against the throwaway fixture.
 	"real-process-spawn:scripts/stryker-diff.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"the defect is a temporal-dead-zone crash in the driver's own top-level execution order; no source-text or in-process substitute reproduces it",
+			"the defect is a temporal-dead-zone crash in the driver's own top-level execution order; the #3853 lock wait/refusal and the #3856 F3 stage dispositions (heartbeat/refusal behind a live holder, the budget-signal abort, the absent and partial coverage reports, the skipped/corrupt compiled source) are only observable by spawning the real script, and no source-text or in-process substitute reproduces them",
+	},
+	// 2026-10-07 (#4038 r5): run 37601788256's publish step crashed in the
+	// script's process-entry block, which only a real `node` process runs;
+	// the in-process `main()` tests never reached it.
+	"real-process-spawn:scripts/stryker-nightly.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the defect lived in the CLI entry block (`import.meta.url === argv[1]`), which only a real node process executes",
 	},
 	// 2026-09-06 (#2586 review F1): proves the actual delimiter
 	// supply-host-provided-deps.mjs prints in its own stdout bytes; an
@@ -619,9 +1021,50 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"#3617: the subject is Vitest's own fork teardown (the pool SIGTERMs the worker after the shared afterAll); no in-process double reproduces that kill or a hook timeout",
 	},
+	// 2026-10-15 (#4485): the cascade's silent-push wait, turn_end's registry
+	// peek and the expiry read each read a language-server client's publish
+	// state; a real server cannot be made to publish or stay silent on demand.
+	"service-double:clients/cascade-compute.test.ts::LSPClientInfo": {
+		detector: "service-double",
+		reason:
+			"a language-server client is a spawned process; the cascade's silent-push wait is driven by its per-file publish version and its wait, which a real server cannot be made to answer or leave silent on demand",
+	},
+	"service-double:clients/cascade-turn-merge.test.ts::LSPClientInfo": {
+		detector: "service-double",
+		reason:
+			"a language-server client is a spawned process; turn_end's registry peek is driven by what the client an outstanding touch holds has published",
+	},
+	"service-double:clients/lsp/cascade-tier-backlog.test.ts::LSPClientInfo": {
+		detector: "service-double",
+		reason:
+			"a language-server client is a spawned process; the expiry and peek reads are driven by what the client an outstanding touch holds has published",
+	},
+	// 2026-10-15 (#4449): the registry's capacity, lease and idle paths read a
+	// client's liveness and busy answers; a real language server cannot be made
+	// to give them on demand.
+	"service-double:clients/lsp/client-registry-direct.test.ts::LSPClientInfo": {
+		detector: "service-double",
+		reason:
+			"a language-server client is a spawned process; the registry's lease, capacity and idle paths are driven by its liveness and busy answers",
+	},
+	// 2026-10-15 (#4485): see the cascade entries above.
+	"service-double:clients/quiet-window-session-straddle.test.ts::LSPClientInfo":
+		{
+			detector: "service-double",
+			reason:
+				"a language-server client is a spawned process; the straddle needs it silent through the cascade's bounded wait so the touch is recorded outstanding",
+		},
 	// 2026-09-26 (#3511 review round 3): the quick-mode warmup witness must
 	// run the real warmup timer and background word-index save, which no
 	// test hook awaits.
+	// 2026-10-16 (#4528 r1 F3): the spawn-gate window of a dependency restart
+	// exists only between real server processes, and the tool_call hook bounds
+	// its look, so the restart finishes after the hook returns.
+	"ungoverned-wait-for:clients/head-move-resync-4493.test.ts": {
+		detector: "ungoverned-wait-for",
+		reason:
+			"the restart's spawn-gate window is between real server processes: one server's shutdown, the cache clock, and a restart that ends after the bounded tool_call hook returns expose no awaitable, so vi.waitFor joins them",
+	},
 	"ungoverned-wait-for:clients/word-index-lifecycle.test.ts": {
 		detector: "ungoverned-wait-for",
 		reason:
@@ -769,9 +1212,14 @@ function describeProblem(p: RatchetProblem): string {
 	const admitted = ADMITTED_AFTER_BASELINE[`${p.detector}:${p.file}`];
 	const admittedNote = admitted
 		? ` (admitted: ${admitted.reason})`
-		: " — admit it with a `// flake-shape: <detector> — <reason>` header " +
-			"and add the file to vitest.config.ts's wallClockBudgetInclude, or " +
-			"remove the real spawn / wall-clock assertion / raw timer wait";
+		: MOCK_DETECTORS.has(p.detector)
+			? " — mock only a process boundary (PROCESS_BOUNDARY_MODULES) or drive " +
+				"the real seam or the shared double factory; to admit it, add a " +
+				"`// flake-shape: <detector> — <reason>` header, an " +
+				"ADMITTED_AFTER_BASELINE entry and the baseline row"
+			: " — admit it with a `// flake-shape: <detector> — <reason>` header " +
+				"and add the file to vitest.config.ts's wallClockBudgetInclude, or " +
+				"remove the real spawn / wall-clock assertion / raw timer wait";
 	if (p.kind === "new-file") {
 		return `${p.detector}: NEW flagged file ${p.file} (${p.after} hit(s))${admittedNote}`;
 	}
@@ -785,22 +1233,23 @@ function describeProblem(p: RatchetProblem): string {
 }
 
 // #3514: `countsByDetector` already shares one walk + one parse per file
-// across all five detectors (`countsCache`, flake-shape-scan.ts) — the walk
+// across every detector (`countsPromise`, flake-shape-scan.ts) — the walk
 // itself is not redone. But that shared cost is only PAID on the first call,
 // and `it.each(DETECTOR_NAMES)` below calls it in DETECTOR_NAMES order, so
 // whichever detector is first (`real-process-spawn`) absorbed the FULL
-// five-detector cost inside its own 30s per-test budget, not just its own
+// all-detector cost inside its own 30s per-test budget, not just its own
 // share. Measured on this box (4 cores, load average ~27, run 2026-09-26):
 // real-process-spawn's own detector work is ~22s of a ~117s total — raw-
 // timer-wait's AST walk (`timerBindings` + its own call-site visit) is the
 // biggest single share at ~84s. Paying the whole thing once here, under its
 // own budget decoupled from any one detector's timeout, means no single
-// "detector %s" case is billed for work that belongs to all five.
+// "detector %s" case is billed for work that belongs to all of them (seven
+// since #4362; the two mock detectors added ~2.5 s to the shared walk).
 const WALK_TIMEOUT_MS = 180_000;
 
 describe("flake-shape ratchet (#2547)", () => {
-	beforeAll(() => {
-		for (const detector of DETECTOR_NAMES) countsByDetector(detector);
+	beforeAll(async () => {
+		for (const detector of DETECTOR_NAMES) await countsByDetector(detector);
 	}, WALK_TIMEOUT_MS);
 
 	it("keeps every admission map sorted", () => {
@@ -822,10 +1271,10 @@ describe("flake-shape ratchet (#2547)", () => {
 	});
 	it.each(DETECTOR_NAMES)(
 		"detector %s: no new files, no risen counts vs. the baseline",
-		(detector) => {
+		async (detector) => {
 			const problems = auditAgainstBaseline(
 				detector,
-				countsByDetector(detector),
+				await countsByDetector(detector),
 			);
 			expect(problems.map(describeProblem)).toEqual([]);
 		},
@@ -834,14 +1283,14 @@ describe("flake-shape ratchet (#2547)", () => {
 
 	// Whole-tree scan performs AST parsing and can exceed Vitest's default under
 	// CI contention (run 34195211598, head 5c0aa5a4).
-	it("the baseline names no file that has vanished from the live scan", () => {
+	it("the baseline names no file that has vanished from the live scan", async () => {
 		// Stated asymmetrically on purpose (see module doc): a count FALLING is
 		// not a failure above, but a baseline entry for a file the scan no
 		// longer touches AT ALL is dead weight worth flagging here, same as
 		// `auditRegistry`'s stale-exemption check one layer up.
 		const stale: string[] = [];
 		for (const detector of DETECTOR_NAMES) {
-			const live = countsByDetector(detector);
+			const live = await countsByDetector(detector);
 			for (const file of Object.keys(FLAKE_SHAPE_BASELINE[detector] ?? {})) {
 				if (!(file in live)) stale.push(`${detector}:${file}`);
 			}
@@ -970,6 +1419,8 @@ describe("flake-shape ratchet — the compare function", () => {
 			"raw-timer-wait": { [file]: 5 },
 			"ungoverned-wait-for": {},
 			"never-settling-wait": {},
+			"in-process-mock": {},
+			"service-double": {},
 		};
 
 		// Drops to 2 (an improvement — but the ceiling is now stale at 5).
@@ -1014,19 +1465,23 @@ function validateAdmission(
 	if (source === undefined) {
 		return [`${key}: file does not exist`];
 	}
-	const header = admissionHeader(source);
-	if (!header) {
+	// #4362: the header for THIS detector, so a file admitted under a spawn
+	// and a mock detector carries one header per detector.
+	const header = admissionHeader(source, entry.detector);
+	const otherHeader = header ? undefined : admissionHeader(source);
+	if (otherHeader) {
+		problems.push(
+			`${key}: header names detector "${otherHeader.detector}", expected "${entry.detector}"`,
+		);
+	} else if (!header) {
 		problems.push(
 			`${key}: missing "// flake-shape: <detector> — <reason>" header`,
-		);
-	} else if (header.detector !== entry.detector) {
-		problems.push(
-			`${key}: header names detector "${header.detector}", expected "${entry.detector}"`,
 		);
 	} else if (header.reason.length < 15) {
 		problems.push(`${key}: header reason too short to be real`);
 	}
 	const laneProof =
+		MOCK_DETECTORS.has(entry.detector) ||
 		serializedLaneIncluded.has(`tests/${relativeTestsPath}`) ||
 		(relativeTestsPath.startsWith("support/") &&
 			supportHelperHasLaneProof(relativeTestsPath, serializedLaneIncluded));
@@ -1063,7 +1518,9 @@ describe("flake-shape ratchet — admission gate", () => {
 		]);
 		const problems: string[] = [];
 		for (const [key, entry] of Object.entries(ADMITTED_AFTER_BASELINE)) {
-			const file = key.slice(entry.detector.length + 1);
+			const file = key
+				.slice(entry.detector.length + 1)
+				.split(IDENTITY_SEPARATOR)[0];
 			if (file.startsWith("support/") && !file.endsWith(".test.ts")) continue;
 			const absolute = path.join(repoRoot, "tests", file);
 			const source = fs.existsSync(absolute)
@@ -1226,6 +1683,117 @@ describe("flake-shape ratchet — admission gate", () => {
 				"clients/does-not-exist.test.ts",
 			),
 		).toEqual([expect.stringContaining("does not exist")]);
+	});
+});
+
+describe("flake-shape ratchet — frozen mint (#4383 review F1)", () => {
+	// Recurrence: a baseline row alone admitted a planted vi.mock or
+	// execFileSync with no header and no ADMITTED entry. Rows below follow
+	// the state table in PR #4383 ("F1 state table").
+	const file = "clients/__4383-mint-fixture.test.ts";
+	const mockKey = `${file}::clients/latency-logger`;
+	const baselineWith = (
+		detector: DetectorName,
+		rows: Record<string, number>,
+	): Baseline => {
+		const baseline = Object.fromEntries(
+			DETECTOR_NAMES.map((name) => [name, {}]),
+		) as Baseline;
+		baseline[detector] = rows;
+		return baseline;
+	};
+	const mint = {
+		mock: baselineWith("in-process-mock", { [mockKey]: 1 }),
+		spawn: baselineWith("real-process-spawn", { [file]: 2 }),
+	};
+	const none = {};
+	const admittedSpawn = {
+		[`real-process-spawn:${file}`]: {
+			detector: "real-process-spawn" as const,
+			reason: "the real CLI exit code is under test",
+		},
+	};
+	const admittedMock = {
+		[`in-process-mock:${mockKey}`]: {
+			detector: "in-process-mock" as const,
+			reason: "the logger's own flush order is under test",
+		},
+	};
+
+	it("passes the live baseline: every row past the mint is admitted, every admission has a row", () => {
+		expect(auditAgainstMint()).toEqual([]);
+	});
+
+	it("keeps the mint at its pinned digest, whatever its formatting", () => {
+		expect(frozenDigestProblems(FROZEN_BASELINE_SOURCE)).toEqual([]);
+		// Row 15: reformatting or CRLF is not an edit; a new row is.
+		expect(
+			frozenDigestProblems(
+				JSON.stringify(FROZEN_BASELINE, null, 2).replaceAll("\n", "\r\n"),
+			),
+		).toEqual([]);
+		const grown = structuredClone(FROZEN_BASELINE);
+		grown["in-process-mock"][mockKey] = 1;
+		expect(frozenDigestProblems(JSON.stringify(grown))).toEqual([
+			expect.stringContaining("write-once"),
+		]);
+	});
+
+	it("rows 1-2: a minted row at or below its minted count needs no admission", () => {
+		expect(auditAgainstMint(mint.spawn, mint.spawn, none)).toEqual([]);
+		expect(
+			auditAgainstMint(
+				baselineWith("real-process-spawn", { [file]: 1 }),
+				mint.spawn,
+				none,
+			),
+		).toEqual([]);
+	});
+
+	it("rows 3-4: ATTACK a minted row raised above the mint without an ADMITTED entry is refused", () => {
+		const raised = baselineWith("real-process-spawn", { [file]: 3 });
+		expect(auditAgainstMint(raised, mint.spawn, none)).toEqual([
+			expect.stringContaining(
+				`real-process-spawn:${file}: baseline row 3 is past the frozen mint (minted 2)`,
+			),
+		]);
+		// Row 6: the same raise with its admission passes here (the header and
+		// lane are validateAdmission's half).
+		expect(auditAgainstMint(raised, mint.spawn, admittedSpawn)).toEqual([]);
+	});
+
+	it("rows 9-10: ATTACK the reviewer's probes, a new row with no ADMITTED entry, are refused", () => {
+		const empty = baselineWith("in-process-mock", {});
+		// Probe A: a planted in-process vi.mock plus only its row.
+		expect(auditAgainstMint(mint.mock, empty, none)).toEqual([
+			expect.stringContaining(
+				`in-process-mock:${mockKey}: baseline row 1 is past the frozen mint (absent)`,
+			),
+		]);
+		// Probe B: a planted execFileSync plus only its spawn row.
+		expect(
+			auditAgainstMint(
+				mint.spawn,
+				baselineWith("real-process-spawn", {}),
+				none,
+			),
+		).toEqual([
+			expect.stringContaining(
+				"(absent) and has no ADMITTED_AFTER_BASELINE entry",
+			),
+		]);
+		// Row 12: admitted, the new row passes.
+		expect(auditAgainstMint(mint.mock, empty, admittedMock)).toEqual([]);
+	});
+
+	it("row 14: ATTACK an ADMITTED entry with no baseline row is a stale admission", () => {
+		expect(
+			auditAgainstMint(
+				baselineWith("in-process-mock", {}),
+				mint.mock,
+				admittedMock,
+			),
+		).toEqual([expect.stringContaining("stale admission")]);
 	});
 });
 
@@ -1398,6 +1966,15 @@ describe("flake-shape scan — elapsed-time-assertion", () => {
 });
 
 describe("flake-shape scan — raw-timer-wait", () => {
+	// #4397 (recurrence #3514, #4385): the two (#2563) cases below read the
+	// whole-tree scan. Only the `flake-shape ratchet (#2547)` describe warmed it,
+	// so run first (a shuffle, or `-t`) they billed the ~12 s cold scan to the 5 s
+	// default. This describe pays it once, under the walk's own budget.
+	beforeAll(async () => {
+		await countsByDetector("raw-timer-wait");
+		await countsByDetector("real-process-spawn");
+	}, WALK_TIMEOUT_MS);
+
 	it("ATTACK named spelling: raw setTimeout wait via a Promise", () => {
 		const source = [
 			'it("waits a bit", async () => {',
@@ -1455,26 +2032,23 @@ describe("flake-shape scan — raw-timer-wait", () => {
 		expect(scanRawTimerWait("interleaving-kit.ts", source)).toEqual([]);
 	});
 
-	it("(#2563) the live scan walks tests/support helpers: fault-injection.ts sits in the population", () => {
+	it("(#2563) the live scan walks tests/support helpers: fault-injection.ts sits in the population", async () => {
 		// Mutation-sensitive population proof: dropping the support walk from
 		// countsByDetector makes this red. fault-injection.ts is the one
 		// existing helper the extended scan flags (its sanctioned delayInside
 		// timer + teardown failsafe are baselined, not admitted).
-		expect(countsByDetector("raw-timer-wait")).toHaveProperty(
+		expect(await countsByDetector("raw-timer-wait")).toHaveProperty(
 			"support/fault-injection.ts",
 		);
 	});
 
-	it("(#2563) the spawn detector stays test-file-only: support helpers are the sanctioned spawn boundary", () => {
+	it("(#2563) the spawn detector stays test-file-only: support helpers are the sanctioned spawn boundary", async () => {
 		// git-fixture-env.ts / fake-child.ts / spawn-shapes.ts import
 		// node:child_process by design — they are the fixture boundary the
 		// test-side detector routes callers toward, not a flake shape.
-		expect(
-			countsByDetector("real-process-spawn")["support/git-fixture-env.ts"],
-		).toBeUndefined();
-		expect(
-			countsByDetector("real-process-spawn")["support/fake-child.ts"],
-		).toBeUndefined();
+		const spawnCounts = await countsByDetector("real-process-spawn");
+		expect(spawnCounts["support/git-fixture-env.ts"]).toBeUndefined();
+		expect(spawnCounts["support/fake-child.ts"]).toBeUndefined();
 	});
 
 	it("ATTACK (#2563): a raw timer inside a tests/support helper is a NEW flagged file", () => {
@@ -1630,6 +2204,9 @@ describe("flake-shape scan — mutation-proof self-test", () => {
 				"await vi.waitFor(() => expect(ready).toBe(true));\n",
 			"never-settling-wait":
 				"await expect(run(() => new Promise(() => {}))).rejects.toThrow();\n",
+			"in-process-mock": 'vi.mock("../clients/latency-logger.js");\n',
+			"service-double":
+				"const service = { touchFile: vi.fn(), hasLSP: vi.fn(), getStatus: vi.fn() };\n",
 		};
 		expect(Object.keys(canonicalFixtures).sort()).toEqual(
 			[...DETECTOR_NAMES].sort(),
@@ -1712,6 +2289,21 @@ describe("flake-shape scan — admission header parsing", () => {
 		expect(admissionHeader("execFileSync(cmd);\n")).toBeUndefined();
 	});
 
+	it("(#4362) finds the header for the asked detector when a file carries two", () => {
+		// Recurrence: a mock admission in a file that already admits a spawn.
+		// Read by first header only, the spawn header would answer for the
+		// mock detector and the admission could never validate.
+		const source =
+			"// flake-shape: real-process-spawn — the real CLI exit code is under test\n" +
+			"// flake-shape: in-process-mock — the module's own timer is the subject\n";
+		expect(admissionHeader(source)?.detector).toBe("real-process-spawn");
+		expect(admissionHeader(source, "in-process-mock")).toEqual({
+			detector: "in-process-mock",
+			reason: "the module's own timer is the subject",
+		});
+		expect(admissionHeader(source, "service-double")).toBeUndefined();
+	});
+
 	it("does not count a header-shaped string literal", () => {
 		expect(
 			admissionHeader('"// flake-shape: real-process-spawn — quoted";\n'),
@@ -1726,5 +2318,370 @@ describe("flake-shape scan — admission header parsing", () => {
 				"// flake-shape: real-process-spawn — a real comment reason\n",
 			)?.detector,
 		).toBe("real-process-spawn");
+	});
+});
+
+// ── In-process mocks and service doubles (#4362) ─────────────────────────
+//
+// Recurrence: #4344 round 3 (G5). One method added to `LSPClientInfo` and
+// `LSPService` had to be added by hand to doubles in 40 test files (34
+// client, 6 service), because nothing stopped in-process doubles from
+// multiplying. Every test below guards one way that population could grow
+// again without an admission.
+
+/** `tests/`-relative fixture name no baseline row will ever name. */
+const MOCK_FIXTURE = "clients/__4362-never-baselined.test.ts";
+
+function liveCounts(
+	file: string,
+	hits: ReturnType<typeof scanInProcessMock>,
+): Record<string, number> {
+	const live: Record<string, number> = {};
+	for (const hit of hits) {
+		const key = hitKey(file, hit);
+		live[key] = (live[key] ?? 0) + 1;
+	}
+	return live;
+}
+
+describe("flake-shape ratchet — in-process mocks and doubles (#4362)", () => {
+	it("ATTACK: a planted in-process vi.mock is a NEW flagged entry — RED", () => {
+		// The acceptance scenario through the real detector and the real
+		// baseline: an in-process module mocked in a file no row names.
+		const source = 'vi.mock("../../clients/latency-logger.js");\n';
+		const problems = auditAgainstBaseline(
+			"in-process-mock",
+			liveCounts(MOCK_FIXTURE, scanInProcessMock(MOCK_FIXTURE, source)),
+		);
+		expect(problems.map(describeProblem)).toEqual([
+			expect.stringContaining(
+				`NEW flagged file ${MOCK_FIXTURE}::clients/latency-logger`,
+			),
+		]);
+		expect(describeProblem(problems[0])).toContain("PROCESS_BOUNDARY_MODULES");
+	});
+
+	it("a process-boundary vi.mock passes — GREEN", () => {
+		// The other half of the acceptance: the same file mocking only
+		// boundaries produces no entry, so nothing reaches the baseline.
+		const source = [
+			'vi.mock("node:child_process", () => ({ spawn: vi.fn() }));',
+			'vi.mock("../../clients/safe-spawn.js");',
+			'vi.doMock("node:fs/promises");',
+		].join("\n");
+		const hits = scanInProcessMock(MOCK_FIXTURE, source);
+		expect(hits).toEqual([]);
+		expect(
+			auditAgainstBaseline("in-process-mock", liveCounts(MOCK_FIXTURE, hits)),
+		).toEqual([]);
+	});
+
+	it("ATTACK: swapping one mocked module for another in a pinned file is a NEW entry", () => {
+		// Shape 36 (count-based laundering): a file pinned at one mocked
+		// module that trades it for another keeps its count. The key carries
+		// the module, so the trade is a new entry, not a free pass.
+		const [pinnedKey] = Object.keys(FLAKE_SHAPE_BASELINE["in-process-mock"]);
+		const [file, target] = pinnedKey.split(IDENTITY_SEPARATOR);
+		const swapped = `${file}${IDENTITY_SEPARATOR}clients/__4362-swapped`;
+		expect(target).not.toBe("clients/__4362-swapped");
+		const problems = auditAgainstBaseline("in-process-mock", { [swapped]: 1 });
+		expect(problems).toEqual([
+			expect.objectContaining({ file: swapped, kind: "new-file" }),
+		]);
+	});
+
+	it("ATTACK: a pinned file whose hand-rolled double count rose is flagged", () => {
+		const [key, count] = Object.entries(
+			FLAKE_SHAPE_BASELINE["service-double"],
+		)[0];
+		const problems = auditAgainstBaseline("service-double", {
+			[key]: count + 1,
+		});
+		expect(problems).toEqual([
+			expect.objectContaining({ kind: "count-risen", before: count }),
+		]);
+	});
+
+	it("keys every mock and double baseline row as <file>::<identity>", () => {
+		// A row without the identity would pin a bare count again and let a
+		// swap through (the test above). Floors: the population minted with
+		// 1,002 mocked modules and 151 doubles; a scan that matched nothing
+		// would read as clean.
+		for (const detector of MOCK_DETECTORS) {
+			const keys = Object.keys(FLAKE_SHAPE_BASELINE[detector]);
+			expect(keys.length).toBeGreaterThan(50);
+			expect(
+				keys.filter((key) => key.split(IDENTITY_SEPARATOR).length !== 2),
+			).toEqual([]);
+		}
+	});
+
+	it("ATTACK: a mock admission needs its header but no serialized lane", () => {
+		const key = `in-process-mock:${MOCK_FIXTURE}::clients/latency-logger`;
+		const entry = {
+			detector: "in-process-mock" as const,
+			reason: "the logger's own flush order is the behaviour under test",
+		};
+		const header =
+			"// flake-shape: in-process-mock — the logger's own flush order is under test\n";
+		const body = 'vi.mock("../../clients/latency-logger.js");\n';
+		// Good header, no lane: admitted (a mock adds no contention).
+		expect(
+			validateAdmission(key, entry, header + body, new Set(), MOCK_FIXTURE),
+		).toEqual([]);
+		// No header: refused.
+		expect(
+			validateAdmission(key, entry, body, new Set(), MOCK_FIXTURE),
+		).toEqual([expect.stringContaining("missing")]);
+		// A header quoted in a comment of prose, or in a string, is no header.
+		expect(
+			validateAdmission(
+				key,
+				entry,
+				`const s = "${header.trim()}";\n${body}`,
+				new Set(),
+				MOCK_FIXTURE,
+			),
+		).toEqual([expect.stringContaining("missing")]);
+		// A spawn header first and the mock header second: both validate.
+		const twoHeaders =
+			"// flake-shape: real-process-spawn — the real CLI exit code is under test\n" +
+			header +
+			body;
+		expect(
+			validateAdmission(key, entry, twoHeaders, new Set(), MOCK_FIXTURE),
+		).toEqual([]);
+		// Only the spawn header: the mock entry names the wrong detector.
+		expect(
+			validateAdmission(
+				key,
+				entry,
+				"// flake-shape: real-process-spawn — the real CLI exit code is under test\n" +
+					body,
+				new Set(),
+				MOCK_FIXTURE,
+			),
+		).toEqual([expect.stringContaining('names detector "real-process-spawn"')]);
+	});
+});
+
+describe("flake-shape scan — in-process-mock (#4362)", () => {
+	const targetsIn = (source: string, file = MOCK_FIXTURE) =>
+		scanInProcessMock(file, source).map((hit) => hit.identity);
+
+	it("keys a relative specifier by its repo path, whatever the test file's depth", () => {
+		expect(targetsIn('vi.mock("../clients/x.js");\n', "top.test.ts")).toEqual([
+			"clients/x",
+		]);
+		expect(
+			targetsIn('vi.mock("../../../clients/x.js");\n', "clients/lsp/a.test.ts"),
+		).toEqual(["clients/x"]);
+		// Shape 34: the script extension is spelling, not identity. (The
+		// fixture module sits under tests/ so module-instance-coverage, which
+		// reads specifiers inside strings, sees no compiled-module .ts import.)
+		expect(
+			targetsIn(
+				'vi.mock("../x.ts");\nvi.doMock("../x");\nvi.doMock("../x.js");\n',
+			),
+		).toEqual(["tests/x"]);
+		expect(mockTarget("clients/a.test.ts", "fs")).toBe("node:fs");
+		expect(mockTarget("clients/a.test.ts", "node:path")).toBe("node:path");
+		expect(mockTarget("clients/a.test.ts", "@scope/pkg/sub")).toBe(
+			"@scope/pkg/sub",
+		);
+	});
+
+	it.each([
+		["vi.mock", 'vi.mock("../../clients/x.js", () => ({}));'],
+		["vi.doMock", 'vi.doMock("../../clients/x.js");'],
+		["bracket access", 'vi["mock"]("../../clients/x.js");'],
+		["spaced member access", 'vi . mock("../../clients/x.js");'],
+		["a template literal", "vi.mock(`../../clients/x.js`);"],
+		["vitest's typed import() form", 'vi.mock(import("../../clients/x.js"));'],
+	])("ATTACK spelling: flags %s", (_name, source) => {
+		// Shape 34: the call is read structurally, so an unlisted spelling
+		// of the same mock is the same entry.
+		expect(targetsIn(source)).toEqual(["clients/x"]);
+	});
+
+	it("counts each mocked module once, however many times it is mocked", () => {
+		const source = [
+			'vi.mock("../../clients/x.js");',
+			'it("a", () => { vi.doMock("../../clients/x.js"); });',
+			'it("b", () => { vi.doMock("../../clients/y.js"); });',
+		].join("\n");
+		expect(targetsIn(source)).toEqual(["clients/x", "clients/y"]);
+		// The entry points at the module's first mock, where a reader starts.
+		expect(scanInProcessMock(MOCK_FIXTURE, source)[0].line).toBe(1);
+	});
+
+	it("counts a specifier it cannot read as in-process (fails closed)", () => {
+		expect(targetsIn("const m = '../../clients/x.js';\nvi.mock(m);\n")).toEqual(
+			[NON_LITERAL_MOCK_TARGET],
+		);
+		expect(targetsIn("vi.mock(`../../clients/${name}.js`);\n")).toEqual([
+			NON_LITERAL_MOCK_TARGET,
+		]);
+	});
+
+	it("never counts or excuses vi.mock( quoted in a comment or a string", () => {
+		// Detector rule (AGENTS.md "Test requirements"): prose is not code.
+		const prose = [
+			'// vi.mock("../../clients/x.js")',
+			'/* vi.doMock("../../clients/y.js") */',
+			"const s = 'vi.mock(\"../../clients/z.js\")';",
+			'const t = `vi.mock("../../clients/w.js")`;',
+		].join("\n");
+		expect(targetsIn(prose)).toEqual([]);
+		// A comment naming a boundary module does not excuse a real call.
+		expect(
+			targetsIn(
+				'// vi.mock("node:child_process") — only a boundary here\nvi.mock("../../clients/x.js");\n',
+			),
+		).toEqual(["clients/x"]);
+	});
+
+	it("does not read vi.fn, vi.spyOn or vi.hoisted as a module mock", () => {
+		expect(
+			targetsIn(
+				'const f = vi.fn();\nvi.spyOn(obj, "m");\nconst h = vi.hoisted(() => ({}));\n',
+			),
+		).toEqual([]);
+	});
+
+	it("admits every PROCESS_BOUNDARY_MODULES entry, each with a real reason", () => {
+		// Shape 38: each allowlisted boundary is crossed by a fixture, and
+		// the list stays sorted and reasoned.
+		assertSortedRegistry(
+			"PROCESS_BOUNDARY_MODULES",
+			Object.keys(PROCESS_BOUNDARY_MODULES),
+		);
+		for (const [target, reason] of Object.entries(PROCESS_BOUNDARY_MODULES)) {
+			expect(reason.trim().length, target).toBeGreaterThanOrEqual(15);
+			const specifier = target.startsWith("clients/")
+				? `../../${target}`
+				: target;
+			expect(
+				scanInProcessMock(MOCK_FIXTURE, `vi.mock("${specifier}");\n`),
+				target,
+			).toEqual([]);
+		}
+		// A bare builtin is the same boundary as its node: spelling.
+		expect(targetsIn('vi.mock("child_process");\n')).toEqual([]);
+		// An in-process builtin is not a boundary.
+		expect(targetsIn('vi.mock("node:path");\n')).toEqual(["node:path"]);
+	});
+});
+
+describe("flake-shape scan — service-double (#4362)", () => {
+	const doubles = (source: string) =>
+		scanServiceDouble(MOCK_FIXTURE, source).map((hit) => hit.identity);
+
+	it("reads each surface's members from the production declaration", () => {
+		const service = surfaceMembers(
+			SERVICE_SURFACES.find((s) => s.name === "LSPService")!,
+		);
+		const client = surfaceMembers(
+			SERVICE_SURFACES.find((s) => s.name === "LSPClientInfo")!,
+		);
+		// The G5 methods, one per surface.
+		expect(service.has("announceCreatedFiles")).toBe(true);
+		expect(client.has("notify")).toBe(true);
+		// Declared after the first inline type import in the class body; the
+		// raw grammar closed the class early and dropped both.
+		expect(service.has("hasLSP")).toBe(true);
+		expect(service.has("getStatus")).toBe(true);
+		// Not the public surface: constructor and private methods.
+		expect(service.has("constructor")).toBe(false);
+		expect(service.has("noteAuxiliaryWait")).toBe(false);
+		expect(() =>
+			surfaceMembers({
+				name: "NoSuchService",
+				file: "clients/lsp/index.ts",
+				factories: [],
+			}),
+		).toThrow("is not declared");
+	});
+
+	it("reads past an inline type import, and refuses a declaration that does not parse", () => {
+		// Recurrence: tree-sitter misparses `import("…").T` in a type and
+		// closed `LSPService` 2,300 lines early, silently shrinking its
+		// vocabulary. A partial member list must red, never pass.
+		const withTypeImport = [
+			"class S {",
+			'\ta(): Promise<import("./c.js").T[]> { return f(); }',
+			"\tb(): void {}",
+			"}",
+		].join("\n");
+		expect([...declaredMembers(withTypeImport, "S", "fixture.ts")]).toEqual([
+			"a",
+			"b",
+		]);
+		expect(() =>
+			declaredMembers(
+				"class S {\n\ta() { return ) }\n\tb() {}\n}\n",
+				"S",
+				"fixture.ts",
+			),
+		).toThrow("does not parse cleanly");
+	});
+
+	it("ATTACK: flags the G5 client double in every key spelling", () => {
+		const source = [
+			"createLSPClient.mockResolvedValue({",
+			"\tisAlive: () => true,",
+			'\t"getDiagnostics": vi.fn(() => []),',
+			"\tshutdown() {},",
+			"\tnotify: { open: vi.fn() },",
+			"});",
+		].join("\n");
+		expect(doubles(source)).toEqual(["LSPClientInfo"]);
+	});
+
+	it("ATTACK: flags a hand-rolled service double handed over by injection", () => {
+		const source = [
+			"function makeService() {",
+			"\treturn {",
+			"\t\tannounceCreatedFiles: vi.fn(),",
+			"\t\ttouchFile: vi.fn(async () => ({ diags: [] })),",
+			"\t\tgetCapabilitySnapshots: vi.fn(async () => []),",
+			"\t};",
+			"}",
+		].join("\n");
+		expect(doubles(source)).toEqual(["LSPService"]);
+	});
+
+	it("does not flag objects seeded from the shared factory", () => {
+		const source = [
+			"makeLspServiceDouble({ touchFile: vi.fn(), hasLSP: vi.fn(), getDiagnostics: vi.fn() });",
+			"const s = { ...makeLspServiceDouble(), touchFile: vi.fn(), hasLSP: vi.fn(), getStatus: vi.fn() };",
+		].join("\n");
+		expect(doubles(source)).toEqual([]);
+	});
+
+	it("does not flag a data record that reuses the names", () => {
+		// A capability shape asserted with toMatchObject is not called by the
+		// code under test.
+		expect(
+			doubles(
+				"expect(support).toMatchObject({ definition: true, references: true, hover: false });\n",
+			),
+		).toEqual([]);
+	});
+
+	it(`does not flag an object below ${SERVICE_DOUBLE_MIN_MEMBERS} shared members`, () => {
+		expect(
+			doubles(
+				"const c = { isAlive: () => true, shutdown: vi.fn(), other: 1 };\n",
+			),
+		).toEqual([]);
+	});
+
+	it("never counts a double quoted in a comment or a string", () => {
+		const prose = [
+			"// { isAlive: () => true, shutdown() {}, getDiagnostics: vi.fn() }",
+			'const s = "{ isAlive: () => true, shutdown() {}, getDiagnostics: vi.fn() }";',
+		].join("\n");
+		expect(doubles(prose)).toEqual([]);
 	});
 });

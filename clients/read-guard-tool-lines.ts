@@ -22,6 +22,7 @@ import {
 	type EditBatchRejection,
 	type ReadGuardEditBatchSummary,
 } from "./read-guard-logger.js";
+import { scanFileLines } from "./read-guard.js";
 
 export interface GuardLineResult {
 	touchedLines: [number, number] | undefined;
@@ -183,14 +184,13 @@ function formatSimilarLines(
 	return `\n\nDid you mean one of these current lines?\n${rows.join("\n")}`;
 }
 
+/**
+ * `split(/\r?\n/).length` of the file's text, 1 when it cannot be read.
+ * #1649: one bounded pass ({@link scanFileLines}) that counts newlines and
+ * keeps no line, never a whole-file string and its split.
+ */
 export function countFileLines(filePath: string): number {
-	try {
-		const content = nodeFs.readFileSync(filePath, "utf-8");
-		if (content.length === 0) return 1;
-		return content.split(/\r?\n/).length;
-	} catch {
-		return 1;
-	}
+	return scanFileLines(filePath, [], { count: true })?.totalLines ?? 1;
 }
 
 // Match the host edit tool's fuzzy-match space (NFKC + smart quotes/dashes/
@@ -341,7 +341,6 @@ function exactOldTextForApply(
 		const start = rawContentLf.indexOf(candidate);
 		return { text: candidate, start, end: start + candidate.length };
 	}
-	if (candidate !== oldTextLf) return undefined;
 	const matchStart = normalizedContent.indexOf(candidate);
 	if (matchStart < 0) return undefined;
 	const rawLines = rawContentLf.split("\n");
@@ -385,7 +384,12 @@ function exactOldTextForApply(
 	const start = mapOffset(matchStart, false);
 	const end = mapOffset(matchStart + candidate.length, true);
 	const text = rawContentLf.slice(start, end);
-	return normalizeContent(text) === candidate
+	const rawMatchWithoutTrailingWhitespace = text
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.join("\n");
+	return normalizeContent(text) === candidate &&
+		normalizeContent(text).length === rawMatchWithoutTrailingWhitespace.length
 		? { text, start, end }
 		: undefined;
 }
@@ -396,6 +400,7 @@ function resolveOldTextEdits(
 	sessionId: string | undefined,
 	correlationId?: string,
 	partialApplyRecords?: PartialApplyRecordStore,
+	contentUnchangedSinceRead?: boolean,
 ): GuardLineResult {
 	const startedAt = Date.now();
 	const requestedIndexes: number[] = [];
@@ -565,6 +570,11 @@ function resolveOldTextEdits(
 							` but the surrounding content no longer matches. This is a content-drift failure,` +
 							` not an indentation issue (indentation autopatch already ran and did not fix it).` +
 							` Re-read ${offsetHint} and rebuild oldText verbatim from the current file.`;
+					} else if (contentUnchangedSinceRead === true) {
+						errorMsg +=
+							` The file is unchanged since your last read, so this oldText was not found as written.` +
+							` Check for character-level differences such as full-width or smart punctuation,` +
+							` em-dashes, or non-breaking spaces, then rebuild oldText verbatim.`;
 					} else {
 						errorMsg +=
 							` The first line of your oldText appears near line ${lineHint} but the rest doesn't match.` +
@@ -578,6 +588,11 @@ function resolveOldTextEdits(
 							` This is attempt #${failCount} — this text does not appear anywhere in the file,` +
 							` even ignoring whitespace differences. Do NOT retry from memory.` +
 							` Re-read the relevant section before rebuilding your edit.`;
+					} else if (contentUnchangedSinceRead === true) {
+						errorMsg +=
+							` This text does not appear anywhere in the file, even ignoring indentation differences.` +
+							` The file is unchanged since your last read, so the oldText was not found;` +
+							` check character-level differences before retrying.`;
 					} else {
 						errorMsg +=
 							` This text does not appear anywhere in the file, even ignoring indentation differences —` +
@@ -613,7 +628,7 @@ function resolveOldTextEdits(
 			// measurement that tells us whether the guard earns its keep (#257).
 			const hostMatch = hostWouldApplyOldText(rawContent, oldText);
 			logBatchEvent({
-				event: "oldtext_not_found",
+				event: "oldtext_not_found", // Existing bounded record for this decision.
 				sessionId,
 				filePath,
 				metadata: {
@@ -625,6 +640,9 @@ function resolveOldTextEdits(
 					hostWouldApply: hostMatch.wouldApply,
 					hostOccurrences: hostMatch.occurrences,
 					hostUsedFuzzyMatch: hostMatch.usedFuzzyMatch,
+					...(contentUnchangedSinceRead !== undefined && {
+						contentUnchangedSinceRead,
+					}),
 				},
 			});
 		} else if (occurrenceLines.length === 1) {
@@ -1367,6 +1385,7 @@ export function getTouchedLinesForGuard(
 	sessionId?: string,
 	correlationId?: string,
 	partialApplyRecords?: PartialApplyRecordStore,
+	contentUnchangedSinceRead?: boolean,
 ): GuardLineResult {
 	// #2423: the seam decides whether this event mutates a file, and which shape
 	// adapter (if any) already resolved its ranges. A tool named `replace` or
@@ -1459,6 +1478,7 @@ export function getTouchedLinesForGuard(
 						sessionId,
 						correlationId,
 						partialApplyRecords,
+						contentUnchangedSinceRead,
 					);
 				}
 				return { touchedLines: undefined };
@@ -1472,6 +1492,7 @@ export function getTouchedLinesForGuard(
 					sessionId,
 					correlationId,
 					partialApplyRecords,
+					contentUnchangedSinceRead,
 				);
 				if (resolved.preflightError) {
 					// A mixed range/oldText request is one host operation. If any

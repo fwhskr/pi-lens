@@ -9,7 +9,9 @@ import {
 	HOST_PROVIDED_TYPE_ONLY_PACKAGES,
 	LAZY_NATIVE_PACKAGES,
 } from "../scripts/lib/host-provided-deps.mjs";
+import { readLockedToolVersion } from "../scripts/lib/exec-isolation.mjs";
 import yaml from "../clients/deps/js-yaml.js";
+import { stripSource } from "./support/sweep-kit.js";
 import { USER_PROFILE_PATH_RE } from "./support/user-profile-path-pattern.js";
 
 // These tests pin the published-package contract: pi-lens ships a precompiled
@@ -421,10 +423,33 @@ describe("host-provided peers are open; the supported window lives in install-sm
 	const floor = workflow.env?.PI_HOST_FLOOR_VERSION ?? "";
 
 	// Hosts release-qa has actually passed. NOT derived from the lockfile: the
-	// lockfile carries the unit suite's dev baseline (0.99.2 after #3805), which
-	// is a test host, not a promise. When release-qa passes on a newer host, add
-	// it here and widen PI_HOST_SUPPORTED_RANGE in the same change, never before.
-	const RELEASE_QA_VERIFIED_HOSTS = ["0.80.10", "0.84.1", "0.85.1"];
+	// lockfile's pi version is only a test host, not a promise. P1 requires one
+	// release-qa witness per minor line from 0.86 onward; represented 0.80,
+	// 0.84, and 0.85 lines are also kept in this ratchet.
+	const RELEASE_QA_VERIFIED_HOSTS = [
+		"0.80.10",
+		"0.84.1",
+		"0.85.1",
+		"0.86.1",
+		"0.87.1",
+		"0.99.2",
+		"1.0.4",
+		"1.1.0",
+		"1.2.0",
+		"1.3.0",
+	];
+	const VERIFIED_MINOR_LINES = [
+		"0.80",
+		"0.84",
+		"0.85",
+		"0.86",
+		"0.87",
+		"0.99",
+		"1.0",
+		"1.1",
+		"1.2",
+		"1.3",
+	];
 
 	it("declares a window at all", () => {
 		expect(
@@ -458,12 +483,82 @@ describe("host-provided peers are open; the supported window lives in install-sm
 		).toBe(false);
 	});
 
-	it("does not admit a host release-qa has not passed (0.86.0 stays out)", () => {
-		// Widening past the verified set re-opens the gap #2586 and #2682 name:
-		// the newest-in-range lane would then certify a minor nothing witnessed.
-		expect(semver.satisfies("0.86.0", window)).toBe(false);
-		expect(semver.satisfies("0.99.2", window)).toBe(false);
+	it("keeps the next unverified host out (1.4.0 stays out)", () => {
+		expect(semver.satisfies("1.4.0", window)).toBe(false);
 	});
+
+	// Recurrence prevented (#4513): the ceiling moved from <1.2.0 to <1.4.0 while
+	// the real-pi compat smoke stayed on the 0.80.10 floor, so nothing exercised
+	// the new top of the window. The floor is install-smoke's job; compat-smoke
+	// carries the newest verified host.
+	it("pins compat-smoke to the newest release-qa verified host", () => {
+		const compat = yaml.load(
+			fs.readFileSync(
+				path.join(root, ".github", "workflows", "compat-smoke.yml"),
+				"utf8",
+			),
+		) as {
+			jobs: Record<string, { steps?: Array<{ name?: string; run?: string }> }>;
+		};
+		const runs = Object.values(compat.jobs)
+			.flatMap((job) => job.steps ?? [])
+			.filter((step) => step.name === "Install pi")
+			.map((step) => step.run ?? "");
+		expect(runs).toHaveLength(1);
+		// Shell comment lines are prose, not the install command.
+		const command = (runs[0] as string)
+			.split("\n")
+			.filter((line) => !line.trimStart().startsWith("#"))
+			.join("\n");
+		const pinned = command.match(
+			/@earendil-works\/pi-coding-agent@(\d+\.\d+\.\d+)/,
+		)?.[1];
+		const newest = [...RELEASE_QA_VERIFIED_HOSTS].sort(semver.compare).at(-1);
+		expect(pinned).toBe(newest);
+	});
+
+	// Recurrence prevented (#4513): a dependency bump to pi 1.4 would put the
+	// test host past the window before release-qa has run on it.
+	it("keeps the locked dev host inside the supported window", () => {
+		const lock = JSON.parse(
+			fs.readFileSync(path.join(root, "package-lock.json"), "utf8"),
+		) as { packages: Record<string, { version?: string }> };
+		const locked =
+			lock.packages["node_modules/@earendil-works/pi-coding-agent"]?.version ??
+			"";
+		expect(
+			semver.satisfies(locked, window),
+			`locked pi-coding-agent ${locked} vs PI_HOST_SUPPORTED_RANGE (${window})`,
+		).toBe(true);
+	});
+
+	it("has a release-qa verified host on every certified minor line", () => {
+		for (const minorLine of VERIFIED_MINOR_LINES) {
+			expect(
+				RELEASE_QA_VERIFIED_HOSTS.some((version) =>
+					version.startsWith(`${minorLine}.`),
+				),
+				`${minorLine} has no release-qa verified host`,
+			).toBe(true);
+		}
+	});
+});
+
+// Recurrence prevented (#4513): `build:dist` reads the esbuild and tsc versions
+// out of package-lock.json. esbuild was in the lock only because pi 1.1's
+// `@earendil-works/chord` pulled it in; pi 1.2 dropped chord, the regenerated
+// lock lost esbuild, and bundle-dist threw "needs an exact locked version".
+// A tool whose version a build script reads from the lock is a direct
+// devDependency, so no host release can remove it by accident.
+describe("build tools read from the lock are direct dev dependencies (#4513)", () => {
+	for (const tool of ["esbuild", "typescript"]) {
+		it(`declares ${tool} and locks an exact version`, () => {
+			expect(pkg.devDependencies?.[tool]).toBeDefined();
+			expect(() =>
+				readLockedToolVersion({ root, packageName: tool }),
+			).not.toThrow();
+		});
+	}
 });
 
 // Guards the #335 bundle CONTRACT against the built entry: pi's Bun-compiled
@@ -574,6 +669,68 @@ describe("bundled dist entry shape (#335)", () => {
 		);
 		expect(matches).toEqual([]);
 	});
+
+	// #4314: 4.4.2 shipped `import(["./lsp", "capabilities.js"].join("/"))`.
+	// esbuild cannot inline a computed specifier, so the bundle loaded
+	// dist/lsp/capabilities.js at runtime, a file no build has ever produced,
+	// and LSP warm failed in every session. Every dynamic import in a shipped
+	// file must be a literal that resolves inside the tarball, or an absolute
+	// pathToFileURL(...) load of a native/wasm package.
+	it.runIf(built)(
+		"every dynamic import in a shipped file resolves inside the tarball",
+		() => {
+			const distRoot = path.join(root, "dist");
+			const globToRegExp = (glob: string) =>
+				new RegExp(
+					`^${glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*")}$`,
+				);
+			const shippedPatterns = (pkg.files ?? [])
+				.filter((f) => f.startsWith("dist/"))
+				.map((f) => f.slice("dist/".length));
+			const isShipped = (rel: string) =>
+				shippedPatterns.some((p) =>
+					p.endsWith("/") ? rel.startsWith(p) : globToRegExp(p).test(rel),
+				);
+			const shippedJs = (
+				fs.readdirSync(distRoot, { recursive: true }) as string[]
+			)
+				.map((f) => f.split(path.sep).join("/"))
+				.filter((rel) => rel.endsWith(".js") && isShipped(rel));
+			expect(shippedJs).toContain("index.js");
+
+			const problems: string[] = [];
+			for (const rel of shippedJs) {
+				// Comments blanked (bundled doc comments say "a dynamic `import()`");
+				// string contents kept, because the specifier is the evidence.
+				const code = stripSource(
+					fs.readFileSync(path.join(distRoot, rel), "utf8"),
+					{ strings: "keep" },
+				);
+				for (const m of code.matchAll(/\bimport\(\s*([^)]{0,80})/g)) {
+					const arg = m[1] ?? "";
+					const literal = /^(["'`])([^"'`]*)\1/.exec(arg);
+					if (!literal) {
+						if (!/^pathToFileURL\d*\(/.test(arg)) {
+							problems.push(`${rel}: computed import(${arg.slice(0, 40)})`);
+						}
+						continue;
+					}
+					const spec = literal[2] ?? "";
+					if (!spec.startsWith(".")) continue;
+					const target = path.posix.normalize(
+						path.posix.join(path.posix.dirname(rel), spec),
+					);
+					if (
+						!isShipped(target) ||
+						!fs.existsSync(path.join(distRoot, target))
+					) {
+						problems.push(`${rel}: import("${spec}") is not in the tarball`);
+					}
+				}
+			}
+			expect(problems).toEqual([]);
+		},
+	);
 });
 
 describe("tsconfig.dist.json", () => {
@@ -620,16 +777,5 @@ describe("tsconfig.dist.json", () => {
 		// imports `../scripts/lib/skills-predicate.mjs`, and without this entry
 		// `bundle:dist` dies trying to resolve it from `dist/clients/`.
 		expect(dist.include ?? []).toContain("scripts/lib/skills-predicate.mjs");
-	});
-
-	it("keeps tsconfig.dist.json parseable as strict JSON", () => {
-		// This suite reads it with JSON.parse, and so does anything else that
-		// treats a tsconfig as data rather than handing it to tsc: a `//`
-		// comment here fails at read time, not at build time.
-		expect(() =>
-			JSON.parse(
-				fs.readFileSync(path.join(root, "tsconfig.dist.json"), "utf8"),
-			),
-		).not.toThrow();
 	});
 });

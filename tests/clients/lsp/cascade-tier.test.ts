@@ -9,6 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { normalizeMapKey } from "../../../clients/path-utils.js";
+import { getStrategy } from "../../../clients/lsp/wait-policy/strategies.js";
 
 const getServersForFileWithConfig = vi.fn();
 const registerQuietWindowTask = vi.fn();
@@ -87,11 +88,58 @@ describe("classifyCascadeWaitTier", () => {
 		expect(tier).toBe("tier3-silent");
 	});
 
+	it("keeps TypeScript's empty-first hold and silent-clean cascade markers together", () => {
+		getServersForFileWithConfig.mockReturnValue([server("typescript")]);
+		const strategy = getStrategy("typescript", "classic");
+		expect(strategy.emptyFirstPublish).toBe("indexing");
+		expect(
+			mod.classifyServerWaitTier("typescript", {
+				serverId: "typescript",
+				root: "C:/repo",
+				operationSupport: {} as any,
+				workspaceDiagnosticsSupport: { mode: "push-only" as const },
+				advertisedCommands: [],
+				rawCapabilityKeys: [],
+				launchVariant: "classic" as const,
+			} as any),
+		).toBe("tier3-silent");
+	});
+
 	// #524/#529/#541/#558: "typescript" can be either the classic
 	// typescript-language-server or TS7's native `tsc --lsp --stdio` (PR #526).
 	// Classic is confirmed silentOnClean (re-measured 2026-07-12, unaffected by
 	// the native-ts7 drift below) — the classifier's `launchVariant` branch
 	// keeps the classic/unmarked path exactly as before, pinned unchanged.
+	// Recurrence (#4485): classic tsserver neighbours were deferred to the
+	// quiet window (77% of real outcomes), which mostly never came, while the
+	// #707 sync confirm that answers them in ~320 ms sat unused in the
+	// in-lane touch.
+	it("classifies a silent classic typescript server that advertises typescript.tsserverRequest as command-pull", () => {
+		getServersForFileWithConfig.mockReturnValue([server("typescript")]);
+		const snapshot = (advertisedCommands: string[]) => [
+			{
+				serverId: "typescript",
+				root: "C:/repo",
+				operationSupport: {} as any,
+				workspaceDiagnosticsSupport: { mode: "push-only" as const },
+				launchVariant: "classic",
+				advertisedCommands,
+				rawCapabilityKeys: [],
+			},
+		];
+		expect(
+			mod.classifyCascadeWaitTier(
+				{} as any,
+				FILE,
+				snapshot(["typescript.tsserverRequest"]) as any,
+			),
+		).toBe("command-pull");
+		// Without the command there is nothing to pull with: still silent.
+		expect(
+			mod.classifyCascadeWaitTier({} as any, FILE, snapshot([]) as any),
+		).toBe("tier3-silent");
+	});
+
 	it("classifies a classic-variant typescript snapshot with silentOnClean as tier3-silent (pinned, unchanged)", () => {
 		getServersForFileWithConfig.mockReturnValue([server("typescript")]);
 		const snapshots = [

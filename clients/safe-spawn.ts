@@ -14,6 +14,7 @@
  * - To: await safeSpawnAsync(cmd, args, opts)
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	type ChildProcess,
 	type SpawnOptions,
@@ -50,6 +51,7 @@ export type SpawnFailureType =
 	| "cwd-unresolvable"
 	| "permission-denied"
 	| "spawn-failed"
+	| "trust-refused"
 	| "timeout"
 	| "killed";
 
@@ -344,6 +346,16 @@ export interface SafeSpawnOptions {
 	deadlineAt?: number;
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
+	/**
+	 * Drop every inherited `npm_config_*` variable (case-insensitive) from the
+	 * child environment AFTER the ambient merge (#4268). An `env` override
+	 * alone cannot remove a variable, because {@link getSpawnEnvironment}
+	 * merges `process.env` underneath it; this flag is the deletion the
+	 * override cannot express. Used by the cache-only package-runner seam so a
+	 * project's `.npmrc` and the shell's npm config never reach `npx`/`bunx`.
+	 * Never mutates `process.env`.
+	 */
+	stripNpmConfig?: boolean;
 	signal?: AbortSignal;
 	/**
 	 * Opt out of the ambient turn abort signal (which is otherwise the default).
@@ -510,7 +522,8 @@ function sweepHeldOwnPids(): void {
 	}
 	// No hand-rolled "drop the oldest" block (#2442 / #3091 round 4): the
 	// last-resort eviction, for the case where every held group is still alive
-	// at the ceiling, is `BoundedSet.add`'s own FIFO overflow.
+	// at the ceiling, is `BoundedSet.add`'s own FIFO overflow; the caller
+	// records it (#3096).
 }
 
 /**
@@ -535,7 +548,15 @@ export function holdOwnChildPid(
 	// and its release mutation-inert — the FIFO copy would answer for them.
 	verifiedOwnPids.delete(pid);
 	sweepHeldOwnPids();
-	heldOwnPids.add(pid);
+	const evicted = heldOwnPids.add(pid);
+	if (evicted.length > 0) {
+		incrementDegradationCount({
+			kind: "held-own-pid-evicted",
+			subject: site,
+			reason: `held-pid set full of live groups at ${HELD_OWN_PID_SWEEP_AT}; dropped oldest pid ${evicted.join(",")}, a group kill after its leader dies is refused`,
+			metadata: { evicted: evicted.length },
+		});
+	}
 	return true;
 }
 
@@ -1292,10 +1313,22 @@ function resolveWindowsCommand(
 
 function getSpawnEnvironment(
 	overrides: NodeJS.ProcessEnv | undefined,
+	stripNpmConfig: boolean | undefined,
 ): NodeJS.ProcessEnv {
-	return process.platform === "win32"
-		? mergeWindowsEnvironment(process.env, overrides)
-		: { ...process.env, ...overrides };
+	const merged =
+		process.platform === "win32"
+			? mergeWindowsEnvironment(process.env, overrides)
+			: { ...process.env, ...overrides };
+	if (!stripNpmConfig) return merged;
+	// A copy loop rather than `Object.fromEntries(…filter(…))`: `filter` is a
+	// retired glossary identifier and a new use would move the census. This runs
+	// only on the flagged cache-only package-runner spawns, never the hot
+	// default path.
+	const stripped: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(merged)) {
+		if (!/^npm_config_/i.test(key)) stripped[key] = value;
+	}
+	return stripped;
 }
 
 /**
@@ -1415,6 +1448,9 @@ const SPAWN_SAMPLER_TEARDOWN_GRACE_MS = 5_000;
 // ASYNC VERSION (Recommended - Non-blocking)
 // ============================================================================
 
+/** Capture-local cancellation; async context prevents interference with concurrent dispatch. */
+export const spawnAbortScope = new AsyncLocalStorage<AbortSignal>();
+
 /**
  * Async spawn with timeout and proper process cleanup.
  *
@@ -1470,9 +1506,14 @@ export async function safeSpawnAsync(
 	// Fall back to the current turn's ambient signal (set from ctx.signal) so an
 	// Esc/abort mid-turn cancels dispatches that didn't thread a signal of their
 	// own — unless the caller opts out (installs, which must run to completion).
-	const abortSignal =
+	const callerSignal =
 		options?.signal ??
 		(options?.ignoreAmbientSignal ? undefined : ambientAbortSignal);
+	const scopedSignal = spawnAbortScope.getStore();
+	const abortSignal =
+		scopedSignal && callerSignal
+			? AbortSignal.any([scopedSignal, callerSignal])
+			: (scopedSignal ?? callerSignal);
 
 	return new Promise((resolve) => {
 		// Check for early abort
@@ -1717,7 +1758,7 @@ export async function safeSpawnAsync(
 		//   - unresolvable → synthesize an ENOENT-shaped error instead of
 		//     letting cmd.exe report "not recognized" from inside a shell.
 		const isWindows = process.platform === "win32";
-		const spawnEnv = getSpawnEnvironment(options?.env);
+		const spawnEnv = getSpawnEnvironment(options?.env, options?.stripNpmConfig);
 		// The cwd handed to the CHILD process doesn't need OUR validation —
 		// Windows resolves it natively, exactly as it did before #817 ever
 		// touched this file. A drive-relative cwd (`D:work`) without a
@@ -2565,8 +2606,8 @@ export async function findCommandAsync(
 
 	if (result.status !== 0 || result.error) return null;
 
-	// Take first line (first match)
-	return result.stdout.trim().split("\n")[0] || null;
+	// Take the first line (first match). `where` ends lines with CRLF.
+	return result.stdout.trim().split(/\r?\n/)[0] || null;
 }
 
 // ============================================================================
@@ -2598,7 +2639,7 @@ export function safeSpawn(
 	args: string[],
 	options?: SafeSpawnOptions,
 ): SpawnResult {
-	const spawnEnv = getSpawnEnvironment(options?.env);
+	const spawnEnv = getSpawnEnvironment(options?.env, options?.stripNpmConfig);
 	if (process.platform === "win32") {
 		// See the matching comment in safeSpawnAsync: the child's cwd doesn't
 		// need OUR validation (Windows resolves it natively), so an unprovable
@@ -2739,5 +2780,5 @@ export function findCommand(command: string): string | null {
 
 	if (result.status !== 0) return null;
 
-	return result.stdout.trim().split("\n")[0] || null;
+	return result.stdout.trim().split(/\r?\n/)[0] || null;
 }

@@ -30,11 +30,69 @@ export declare function lintPrBody(
 		ref?: string;
 		headFiles?: Map<string, string>;
 		testCorpus?: { paths: Set<string>; titles: Set<string> };
+		proseMode?: "block" | "warn";
+		bugClosing?: boolean;
+		existsOnBase?: (path: string) => boolean | null;
+		shapeCatalog?: () => Map<number, string> | null;
+		/** PR title; a `refactor(...)` title requires "## Behavior equivalence". */
+		title?: string;
 	},
 ): {
 	valid: boolean;
 	errors: string[];
 };
+export declare function lintClassSweep(
+	body?: string,
+	options?: { diff?: string },
+): string[];
+export declare const DETECTION_LAYERS: readonly string[];
+export declare const DETECTION_MESSAGE: string;
+export declare const DETECTION_UNKNOWN_MESSAGE: string;
+export declare function lintDetectionSection(
+	body?: string,
+	options?: {
+		ignoreUnfilled?: boolean;
+		requireShape?: boolean;
+		existsOnBase?: (path: string) => boolean | null;
+		shapeCatalog?: () => Map<number, string> | null;
+	},
+): string[];
+export declare const detectionExistsNotOnBaseMessage: (path: string) => string;
+export declare const DETECTION_EXISTS_BASE_UNRESOLVED_MESSAGE: string;
+export declare const DETECTION_SHAPE_CATALOG_UNRESOLVED_MESSAGE: string;
+export declare const detectionUnknownShapeMessage: (number: number) => string;
+export declare const detectionEnforcerNotOnBaseMessage: (
+	path: string,
+) => string;
+export declare const detectionEnforcerNotInCatalogMessage: (
+	path: string,
+	number: number,
+) => string;
+export declare function shapeCatalogReader(
+	cwd?: string,
+	git?: (args: string[], options?: Record<string, unknown>) => string,
+): () => Map<number, string> | null;
+export declare function resolvePrBase(
+	cwd?: string,
+	git?: (args: string[], options?: Record<string, unknown>) => string,
+): string | null;
+export declare function baseFileReader(
+	cwd?: string,
+	git?: (args: string[], options?: Record<string, unknown>) => string,
+): (path: string) => boolean | null;
+export declare function resolveBugClosing(
+	body: string,
+	fetchImpl?: typeof fetch,
+): Promise<boolean | null>;
+export declare function resolveBugClosingViaGh(
+	body: string,
+	cwd?: string,
+	exec?: (
+		file: string,
+		args: string[],
+		options: Record<string, unknown>,
+	) => string,
+): Promise<boolean | null>;
 export declare function testCorpus(options?: {
 	cwd?: string;
 	workingTree?: boolean;
@@ -48,12 +106,38 @@ export declare function lintLocalPrBody(
 	body: string,
 	cwd?: string,
 	git?: (args: string[], options?: Record<string, unknown>) => string,
-	options?: { title?: string; ref?: string },
+	options?: {
+		title?: string;
+		ref?: string;
+		headFiles?: Map<string, string>;
+		proseMode?: "block" | "warn";
+		bugClosing?: boolean | null;
+		resolveBugClosing?: (body: string) => boolean | null;
+	},
 ): { valid: boolean; errors: string[] };
+export declare function parseRuntimeHunks(diff: string): Array<{
+	pre: string;
+	post: string;
+	postBlob: string | null;
+	postLine: number;
+	added: Map<number, string>;
+	deletedAfter: Set<number>;
+	removed: string[];
+}>;
 export declare function lintTlaCoverage(
 	body?: string,
-	options?: { diff?: string; cwd?: string },
+	options?: {
+		diff?: string;
+		cwd?: string;
+		sourceCwd?: string;
+		headFiles?: Map<string, string>;
+		git?: (args: string[], options?: Record<string, unknown>) => string;
+	},
 ): { errors: string[]; advisories: string[] };
+export declare function lintWorkflowRunEvidence(
+	body?: string,
+	options?: { diff?: string; cwd?: string },
+): string[];
 export declare function fetchLivePrBody(
 	payloadPr: { number: number; body?: string | null },
 	fetchImpl: typeof fetch,
@@ -69,6 +153,7 @@ export declare function resolveTouchesTests(
 export declare function lintPullRequestEvent(
 	fetchImpl?: typeof fetch,
 	event?: { pull_request?: { number: number; body?: string | null } },
+	diffImpl?: () => string,
 ): Promise<{ valid: boolean; repaired: boolean }>;
 export declare function localDiff(
 	cwd?: string,

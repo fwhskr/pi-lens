@@ -1,5 +1,193 @@
 # HISTORY
 
+## 2026-10-16 — one signal wired consumer by consumer (shape 71)
+
+A read-only audit (#4535) found five push detectors for disk changes pi-lens
+did not author: opaque bash recovery, the HEAD look, the #4528 out-of-band
+look, the settled sweep and the LSP drift heartbeat. Each wired its own
+consumers. After a HEAD move, LSP resynced while the review graph, symbol
+search and project snapshot served the old content. Every fixer had written a
+consolidation verdict, and each searched only its own seam's call names. #4528
+searched `notifyExternalFileChange\(` and concluded that no seam stamped
+installs, while `clients/` held six freshness modules. Reviewers re-ran the
+same query. The orchestrator grouped issues by consumer and filed eleven
+gaps (#4532) before asking why. Fixes: the fixer and reviewer search by
+primitive (#4536), shape 71, the three-issue audit rule, and the publisher
+with a consumer census (#4535).
+
+## 2026-10-16 retro
+
+Run by the orchestrator over the 2026-10-16 session. Where each finding landed:
+
+- **Sibling search by call name (judgement, built).** See shape 71 above.
+- **Script imported `dist/` before any build (mechanical, built in #4531).**
+  #4525 shipped `scripts/assert-evaluated.mjs` importing `dist/` through
+  `lib/clean-signal.mjs`. `tool-smoke-prs` runs it on an unbuilt checkout, so
+  every refresh PR would hold on `ERR_MODULE_NOT_FOUND`. The #4518 fixer found
+  it from a `git archive`. #4531 adds an import-walk test whose dynamic-import,
+  side-effect and `createRequire` plants red.
+- **Workflow step shell pinned as text (mechanical, folded into #4531 r2).**
+  Four mutations of the Swift, APFS and handshake shell survived because tests
+  only matched the step text. Deleting `set +e` would turn the intended
+  "still crashes" outcome red.
+- **An inconclusive answer read as cleared (shape 7, folded into #4533 r2).**
+  The born-after-start witness accepted "check timed out - NOT the same as 0
+  diagnostics" as cleared.
+- **Line-only match across rules (judgement, folded into #4529 r2).** The new
+  dispatcher drop keyed a server finding to napi's blocker by line only, so a
+  different rule's warning on that line read as clean.
+- **Orchestrator tooling (mechanical, built outside this repo).** The
+  post-land tree prune deleted a live reviewer tree whose merge was not
+  committed. It now skips trees with local changes or a running process.
+  The hand-back router now resolves resumed agents and reads the round from
+  the ledger.
+
+## 2026-10-15 — population-deriving scanners fail closed
+
+`AGENTS.md` "Test requirements" gained the fail-closed rule. Issue #4429:
+#4411 review F3 found five spellings its route derivation skipped, and of
+seven `*ratchet*.test.ts` files only two (`flake-shape-ratchet`,
+`worker-message-boundary-ratchet`) redded on a spelling their scanner could
+not read. The single-flight, run-outcome, project-trust seam,
+delivery-surface and strictness scanners now report an unclassified spelling
+with its file and line. Making them fail closed surfaced three mis-scoped
+populations on master, none a bypass: `index.ts` strictness errors fell into
+an unratcheted bucket (4 and 23), two delivery exemptions were held only by
+a marker in a doc comment, and `clients/mutating-tool.ts` spelled its marker
+`\u{1F534}` (registered, but invisible to the raw-character needle).
+
+## 2026-10-14 retro (contract rules and shape backfill)
+
+Run over the 2026-10-14 orchestration session by the retro writer lane
+(#4426). Eight findings, two contract rules, no refutation. Where each landed:
+
+- **Dist precondition (mechanical, filed).** At least 5 lanes (#4417, #4418,
+  the #4422 verify, the #4410 r1 review, the #4423 review F5) ruled out the
+  same 3 census reds that need `npm run build:dist`. Filed as #4436; `CLAUDE.md`
+  build bullet names the command meanwhile. Mistake row in
+  `docs/pi-lens-merge-policy.md`.
+- **Fixed 3000 ms wait budget (mechanical, filed).** `interleaving-kit`
+  `waitFor` ran out under CI load (run 38618401454,
+  `tests/clients/fix-run-restore.test.ts:378`); the file passed alone and under 3 seeds.
+  Filed as #4437. Mistake row.
+- **Brief asked a worker to wait for an answer (judgement).** "Report the size
+  first" before a large migration; the #4432 fixer did the migration anyway.
+  `AGENTS.md` "Orchestration and delegated work" and a mistake row.
+- **Brief named a file by basename (judgement).** "index.ts" meant
+  `clients/lsp/index.ts`; a Haiku pass searched the root `index.ts` and
+  reported the #2052 comment missing. Same bullet group and a mistake row.
+- **Haiku on a design lane (judgement).** #4342 rounds 1 and 2 left a
+  wall-clock bound, a wrong offline premise and a 13-vs-20 population; a fresh
+  Opus round with a state table passed verify first time (#4410 round 3).
+  Haiku folds with a prescribed remedy (#4340, #4341, #4345, #4356, #4368,
+  #4372, #4374, #4417) landed first try. `docs/pi-lens-merge-policy.md` already
+  said Haiku takes mechanical lanes and never detectors or lifecycle seams; the
+  missing half, a lane that must find its own failure space, is one sentence in
+  the `AGENTS.md` routing bullet. Mistake row.
+- **Blast radius missed a caller (judgement, rule already present).** #4411
+  round 3 changed `touchFile`'s result and the body left out the cascade
+  neighbour caller (`clients/dispatch/integration.ts:2139`), which then printed an uncaused
+  "inconclusive" line every turn (review N2). `AGENTS.md` already requires
+  `module_report` with `blastRadius: true` before and after, and the reviewer
+  contract already reads every caller; no new line, a mistake row only.
+- **Stale ledger rows on refs to closes (mechanical, orchestrator tooling).**
+  The closes-check refused two lands (#4422, #4409). Not a repo rule or check;
+  mistake row names it for the orchestrator's land tooling.
+- **PR body linted only at hand-back (judgement).** #4423's advisory `PR body`
+  check went red on 5 consecutive pushes in round 2 with the same findings.
+  `docs/pi-lens-subagent.md` already lints before `gh pr create` and
+  `gh pr edit`, `docs/pi-lens-fixer.md` before hand-back; the gap was the push
+  that edits no body. One line in the fixer's "Fix rounds" and a mistake row.
+  A hook would need the network and the PR number, so it stays judgement.
+
+Contract rules added the same day:
+
+- **User-facing assertion** (`AGENTS.md` "Test requirements"). #4411 review F1:
+  the route matrix read the runner row while the write path printed "✓ JSON
+  clean" for an unconfirmed file. A test that pins user-facing behaviour
+  asserts the user-facing text or effect, not only an internal status field.
+  A close relative of shape 7 (vacuous test); one instance, so a rule and not
+  a catalog shape.
+- **Timing contention model** (same section). #4426: the loop-block CPU-spin
+  case failed at 79% CPU on a loaded runner (run 38604587190). An admitted
+  timing test states its contention model: it measures how long the OS paused
+  the worker, or asserts on CPU time rather than wall time. One instance;
+  `tests/clients/flake-shape-ratchet.test.ts` already admits timing tests but
+  cannot judge the model, so the rule stays judgement.
+- **Detection lesson names the shape and its enforcer** (`docs/pi-lens-fixer.md`
+  and `docs/pi-lens-merge-policy.md` "Detection retrospective on every merged
+  bug fix"). Merges #4390, #4391 and #4377 each closed their gap with a
+  one-bug test, and #4409 said "this layer" before its class went red on
+  master (install-smoke run 38610594076). The lint half is #4439.
+
+Catalog decisions: no new shape. The uncontained worker message listener
+(#4400) is already shape 53 (commit 2e9e44c45). Test-order dependence found by
+shuffling (#4405) is the case the "A case never reads state a sibling case or
+file wrote" screen and the `Targeted tests (advisory)` shuffle lane already
+cover; the repo-wide census is #4405 itself. Shapes 4, 6, 7, 9, 10, 13, 17, 21,
+22 and 25 now cite their live sweep tests (2026-10-14 shape triage: 68 shapes,
+9 fully and 13 partially enforced); each partial names its gap, and none of
+those paths was missing from `git ls-files`.
+
+Steering audit: no line in `AGENTS.md`, the role contracts or the skills had
+session evidence of changing no decision, so no line was deleted.
+
+## 2026-10-15 — enumerated detector (shape 69)
+
+Shape 69 entered the `AGENTS.md` catalog with a fixer contract bullet: a
+detector PR plants three spellings its author did not design for and quotes
+each result. Incident: three detector PRs in one day passed their own plants
+and missed the reviewer's. On #4457 (refs #4429) the vi-mock resolver let a
+helper parameter, a re-export alias and object members through in r2, the
+third round on that seam. On #4459 (refs #1634) the delivery census missed an
+aliased import, a missing store and `sendUserMessage`. The remedy in both was
+to key the needle on the seam, not on the spellings. Enforcer: the contract
+bullet; an advisory survivor list is #4467.
+
+## 2026-10-15 — joined single flight (shape 70)
+
+Shape 70 entered the catalog on its second instance. #4154 settled J1 as
+deliver-and-carry for a joined scan. The first fix for #4166 (contributor PR
+#4462) withheld the joined knip answer instead. The #4462 review showed a
+foreign row write between the join and the next scan dropped the finding,
+which master delivered. Its fix round uses J1's rule.
+
+## 2026-10-14 — sink read before drain (shape 67)
+
+Shape 67 entered the `AGENTS.md` catalog with `tests/config/sink-read-drain-sweep.test.ts`
+as its enforcer. Incident: master run 38515888889 (ba42937f8, a docs-only
+merge) went red in `tests/clients/config-resolved-phase.test.ts` "re-arms
+nothing and publishes no config-resolution line of its own" (expected 0 lines,
+got 2). `loadLSPConfig` publishes its row synchronously while `logSessionStart`
+only enqueues, so the test took its byte offset at `:622` with bytes from the
+load still queued and counted them. Earlier members of the same shape: #3682
+(PR #3720), #3721 (PR #3892), #3193. Issue #4381; fix and sweep PR #4384
+(`629d68661`, catalog `c61d81584`). Only one hit in 169 failed runs since
+09-30, which is why a sweep and not a retry.
+
+## 2026-10-14 — model switch drift (shape 68)
+
+Shape 68 entered the `AGENTS.md` catalog with `tests/config/tla-switch-pins.test.ts`
+over `formal/switch-pins.json` as its enforcer. Incident: #4235 (55fa5210c)
+removed the injected whole-file read on the zero-read allow; the read-guard TLA+
+model kept modelling that read, and TLC proved the old design green, so two
+read-guard defects stayed invisible until the external report #4387 (a
+top-level `write` then `edit` retired authorship as a bridge write and blocked
+a later edit with "File modified since your write"). The TLA+ coverage rule
+(#3802) checks that a PR touching a modelled file mentions the model, not that
+the model still matches the code; a `TLA+ unaffected` line cleared the drift.
+Fix #4392 added the switches `ZeroReadInjects` and `OldTextRetires`; PR #4395
+made an unaffected line never cover an as-built constant and added the shape;
+PRs #4399 and #4432 pin the switches (read-guard fully; dispatch and format).
+Open: #4393 (the other families' code choices stay `deferred` with a reason).
+
+## 2026-10-10 — project-trust test doubles (#4281)
+
+Four recent regressions showed that whole-module in-process doubles and hand-built
+client doubles can hide new exports or gates: extension-log (#4264), ReadGuard
+(#4266), project-trust (#4233), and the rust trust fixture (#4279). The live
+catalog rule is in `AGENTS.md`; this incident record stays here.
+
 Completed arcs and dissolved sections moved out of `AGENTS.md` by the
 2026-08-25 reorganization. Nothing here changes a future decision; the live
 guidance those sections carried stayed in `AGENTS.md`.
@@ -117,6 +305,86 @@ hygiene section, #3178 r3); no full in-place Stryker runs in a shared
 worktree, `--dryRunOnly` for reproductions (fixer and reviewer Probe hygiene
 sections, #3180); and the release-bump PR title format (release-qa skill's
 pre-bump dry-roll step, the 4.2.0 retitle).
+
+## 2026-10-10 — v4.4.2 train retro (merge-policy rows of 2026-10-10)
+
+The day shipped v4.4.2 (#4305) and merged the trust work (#4299, #4300 via #4304, #4285) and both taken-over external PRs (#4233, #4122). It also fixed the shard-5 jscpd leak (#4292) and a master red on ratchet memory (#4310). Seven orchestration mistakes became merge-policy rows:
+- #3405 was dispatched on a stale premise.
+- Sandbox git-guard reds hid real reds (#4308 R1, the release dry roll).
+- A folded remedy missed a second test that encoded the old default (#4299).
+- A filtered push failed silently and the land chain pinned the wrong head (#4307).
+- `pgrep -f` wait loops matched themselves and stalled three pushes for an hour.
+- Scripts were edited while running.
+- The jscpd leak took four fix rounds before a CI trace (#4298) named the producer.
+
+Mechanisms built the same day:
+- The settlement hook runs the governance suite on unpublished worker trees.
+- pr-watch reports a conflicting head.
+- land.sh takes `EXPECT_HEAD` and approves held fork runs.
+- The daily sweep deletes merged branches and kills orphaned test processes.
+- gov-check builds `dist`.
+
+## 2026-10-10 — jscpd temp-dir leak retro (merge-policy row "causal premise from a hand-back")
+
+`JscpdClient.runScan` removes its `pi-lens-jscpd-*` report directory in a
+`finally`. A process killed before that point leaks the directory, and
+`tmp-fixture-hygiene` then reds unrelated PRs (#4122, #4285). #4133 found the
+leak through the real-pi harness. #4136's first round added a scan-setup guard
+(bee5dd747). Its second round reverted that guard as unrelated (12c3a0449) and
+isolated only the real-pi child's `TMPDIR`. Its class sweep read `none:`, so
+two members stayed open: the MCP harness child, which inherits the runner
+`TMPDIR` (reproduced), and the startup jscpd scan that real-bootstrap tests
+never drain (the leading CI suspect). #4292 was first framed as restoring a
+guard "a later merge dropped". The guard never reached master, and the
+investigation had refuted it as the CI cause. The premise came from a hand-back
+and nobody bisected it. Detection gaps went to #2912 (the hygiene owner names
+the filename prefix, not the creating test) and into #4292 (a census of
+child-spawning test harnesses).
+
+## 2026-10-10 — review intake names the defect shape (AGENTS.md "Orchestration and delegated work")
+
+Why it exists: three findings in one session were routed as instances when
+they were members of a class.
+
+1. PR #4233's review found that the ast-grep npx fallback ignored pi's trust
+   state and ran in the project cwd, where a project `.npmrc` can steer the
+   registry. It was routed as that PR's bug. Only the maintainer's question
+   ("are we GENERALLY checking pi's trust gate?") turned it into #4268:
+   dispatch runners, formatters, the test runner and other npx fallbacks all
+   execute project-local binaries without consulting trust.
+2. PR #4262 adopted pi's trust answer in the smoke harness's handshake mode;
+   the sibling `--lsp-gate` mode had the same gap and went red one round later.
+3. #2372 slice 2 (PR #4248) wrote its class sweep as "the changed population
+   is …", the files it touched, not a grep for the shape across the tree. The
+   sweep could not have found item 1's members.
+
+The rule makes the shape verdict an intake step owned by the orchestrator, and
+`plegma-delegate-guard` refuses a fix-round brief that carries a HIGH/MEDIUM
+finding without a `Shape:` line.
+
+## 2026-10-08 — merge train to v4.4.0
+
+312 changelog fragments (Added 23 / Changed 56 / Fixed 230 / Removed 2 /
+Security 1; 171 user-facing / 141 internal) shipped as v4.4.0 from bump PR
+#4175, tagged at 12:48Z. Release-QA shipped on pi 0.80.10, 0.86.1, 0.87.1,
+0.99.2, 1.0.4 and 1.1.0; the certified host range is `>=0.80.10 <1.2.0`,
+and git-install-loads passed on every host.
+
+The train's main product arc was making session and turn state explicit and
+bounded: per-session scope and hand-off records now explain what survives a
+reload, fork, resume or replacement, while turn-end delivery holds late
+findings instead of losing them. Late dead-code scans stay with the session
+that started them, drain fences preserve work across the turn boundary, and
+the parallel bash and codemode paths keep each writer's blockers and
+correlation separate. The read guard now follows authorship rather than mtime
+accidents (#4000, external contributor AngriestBird), and extensions have a
+single unified file-I/O lifecycle bridge (#4145, external contributor Rianico).
+
+The release also certified pi 1.x hosts, added codemode coverage and a
+parallel-bash baseline, and advanced the formal coverage with the TLA+ M1/M2
+models for session and late-scan behavior. CI flake fixes, the SonarCloud A
+cleanup, and the remaining release-QA and governance work made the train's
+internal quality theme explicit rather than leaving it in the test logs.
 
 ## 2026-09-25 — merge train to v4.3.0
 
@@ -4041,7 +4309,7 @@ A 2026 audit against `@earendil-works/pi-coding-agent` confirmed a few places wh
 
 - **LSP server preference via project config** — the `lsp` namespace supports `disabledServers` and custom server entries, but there is no way to express a *preference* between built-in candidates (e.g. prefer `basedpyright` over `pyright` when both are installed). `PythonServer.spawn()` uses first-found-wins ordering: project-environment and Node-local `pyright-langserver`, then `basedpyright-langserver`, then project-environment or PATH `ty server` (#717), then pyright's managed-install tier. A future `preferredServer` key in `LSPConfig` should let projects override this ordering; the server policy layer (`clients/lsp/server-policy.ts`) is the right place to apply the preference before candidate resolution.
 
-- **Python project environments apply without shell activation (#717, closes #2407, refs #1513, #2580)** — `clients/python-environment.ts` resolves a project's interpreter without invoking a package manager, in this fixed candidate order: `UV_PROJECT_ENVIRONMENT`, an explicit uv workspace `.venv`, `VIRTUAL_ENV`, `CONDA_PREFIX`, then `<root>/.venv` and `<root>/venv`; a candidate whose interpreter file is missing falls through to the next. **The two uv candidates exist only when the passed root IS a uv project root** — its NEAREST `pyproject.toml` is the directory itself (`findUvWorkspace`'s `isStartDir`). A `pyproject.toml` merely sitting somewhere ABOVE the root makes that directory a subdirectory of a project, not a project, and **nothing below a project root inherits anything from it**: not the project's `UV_PROJECT_ENVIRONMENT`, not an ancestor `.venv`, not a workspace `.venv`. Gating on "a pyproject at or above the root" instead is the exact defect rounds 2 and 3 of #2580 each shipped once: uv's documented CI/Docker recipe exports `UV_PROJECT_ENVIRONMENT` process-wide, and `PythonServer`'s `NearestRoot` detector hands this resolver `<mono>/frontend` off a `requirements.txt` while the `pyproject.toml` sits at `<mono>`, so the loose gate lets one image-level variable capture every subdirectory on the box that happens to sit under some Python project. A relative `UV_PROJECT_ENVIRONMENT` is anchored at the member's workspace root, else at the project root — which, given the gate, is the passed root itself; never the cwd. An explicit workspace's `.venv` is inherited ONLY by its declared, non-excluded members. `isUvWorkspaceMember` must NOT short-circuit on `projectRoot === workspace.root`: the workspace root is a member of its own workspace only in its capacity as a PROJECT, it already gets uv's settings through `isStartDir`, and its own `<ws>/.venv` is reached by the ordinary project candidate at the same path — the shortcut instead promoted every non-project subdirectory of the workspace root to a member, `exclude` included (#2580 round 3, S2). The walk stops at the injected `homeDir` via `isAtOrAboveHomeDir` (#625), so an unrelated `[tool.uv.workspace]` in `/tmp` or `$HOME` cannot claim the projects beneath it. Membership globs follow uv's dialect, pinned to `crates/uv-workspace/src/workspace.rs` at uv `3c979abda4530fe9bf3d92e9bcf5c5575e3b3126`: patterns are normalized (a leading `./` is not part of the pattern) and matched case-SENSITIVELY with `*`/`?` confined to one path component but matching a leading dot — minimatch's defaults plus `dot: true`, so no `nocase` flag, which would diverge from uv on Windows rather than match it. The full state space (root position x `UV_PROJECT_ENVIRONMENT` x `VIRTUAL_ENV` x own-`.venv`, 72 cells) is enumerated and driven cell-by-cell in `tests/clients/test-runner-python-environment.test.ts`; extend that grid rather than adding a one-off case. It supplies a child-only `PATH` and `VIRTUAL_ENV` to Python LSP, standalone Pyright, and pytest processes; never mutate `process.env`, because different roots can select different environments. `PythonServer.spawn()` prefers project-environment pyright/basedpyright/ty binaries before broader candidates. `TestRunnerClient` runs pytest through the detected project interpreter itself and uses generic `python -m pytest` only when no project environment exists. PEP 723 script environments remain outside this resolver because uv stores them in a content-keyed cache without a stable path marker. ty stays opt-in: it is not in the installer registry, and its `resolveAndLaunch` call keeps `allowInstall:false`, so managed pyright remains the default when the project and PATH provide no Python LSP. No `initializationOptions` are sent to ty because it has no stable `pythonPath` equivalent (astral-sh/ty#2032); its child environment and cwd drive interpreter discovery.
+- **Python project environments apply without shell activation (#717, closes #2407, refs #1513, #2580)** — `clients/python-environment.ts` resolves a project's interpreter without invoking a package manager, in this fixed candidate order: `UV_PROJECT_ENVIRONMENT`, an explicit uv workspace `.venv`, `VIRTUAL_ENV`, `CONDA_PREFIX`, then `<root>/.venv` and `<root>/venv`; a candidate whose interpreter file is missing falls through to the next. With `allowAmbient:false`, absolute `UV_PROJECT_ENVIRONMENT`, `VIRTUAL_ENV`, and `CONDA_PREFIX` candidates must remain inside the passed root. **The two uv candidates exist only when the passed root IS a uv project root** — its NEAREST `pyproject.toml` is the directory itself (`findUvWorkspace`'s `isStartDir`). A `pyproject.toml` merely sitting somewhere ABOVE the root makes that directory a subdirectory of a project, not a project, and **nothing below a project root inherits anything from it**: not the project's `UV_PROJECT_ENVIRONMENT`, not an ancestor `.venv`, not a workspace `.venv`. Gating on "a pyproject at or above the root" instead is the exact defect rounds 2 and 3 of #2580 each shipped once: uv's documented CI/Docker recipe exports `UV_PROJECT_ENVIRONMENT` process-wide, and `PythonServer`'s `NearestRoot` detector hands this resolver `<mono>/frontend` off a `requirements.txt` while the `pyproject.toml` sits at `<mono>`, so the loose gate lets one image-level variable capture every subdirectory on the box that happens to sit under some Python project. A relative `UV_PROJECT_ENVIRONMENT` is anchored at the member's workspace root, else at the project root — which, given the gate, is the passed root itself; never the cwd. An explicit workspace's `.venv` is inherited ONLY by its declared, non-excluded members. `isUvWorkspaceMember` must NOT short-circuit on `projectRoot === workspace.root`: the workspace root is a member of its own workspace only in its capacity as a PROJECT, it already gets uv's settings through `isStartDir`, and its own `<ws>/.venv` is reached by the ordinary project candidate at the same path — the shortcut instead promoted every non-project subdirectory of the workspace root to a member, `exclude` included (#2580 round 3, S2). The walk stops at the injected `homeDir` via `isAtOrAboveHomeDir` (#625), so an unrelated `[tool.uv.workspace]` in `/tmp` or `$HOME` cannot claim the projects beneath it. Membership globs follow uv's dialect, pinned to `crates/uv-workspace/src/workspace.rs` at uv `3c979abda4530fe9bf3d92e9bcf5c5575e3b3126`: patterns are normalized (a leading `./` is not part of the pattern) and matched case-SENSITIVELY with `*`/`?` confined to one path component but matching a leading dot — minimatch's defaults plus `dot: true`, so no `nocase` flag, which would diverge from uv on Windows rather than match it. The full state space (root position x `UV_PROJECT_ENVIRONMENT` x `VIRTUAL_ENV` x own-`.venv`, plus the own-install ambient-containment axis) is enumerated and driven cell-by-cell in `tests/clients/test-runner-python-environment.test.ts`; extend that grid rather than adding a one-off case. It supplies a child-only `PATH` and `VIRTUAL_ENV` to Python LSP, standalone Pyright, and pytest processes; never mutate `process.env`, because different roots can select different environments. `PythonServer.spawn()` prefers project-environment pyright/basedpyright/ty binaries before broader candidates. `TestRunnerClient` runs pytest through the detected project interpreter itself and uses generic `python -m pytest` only when no project environment exists. PEP 723 script environments remain outside this resolver because uv stores them in a content-keyed cache without a stable path marker. ty stays opt-in: it is not in the installer registry, and its `resolveAndLaunch` call keeps `allowInstall:false`, so managed pyright remains the default when the project and PATH provide no Python LSP. No `initializationOptions` are sent to ty because it has no stable `pythonPath` equivalent (astral-sh/ty#2032); its child environment and cwd drive interpreter discovery.
 
 - **Toolchain-gated LSP auto-install (#241, partially shipped)** — `ensureTool` only covers servers in the installer registry (npm/pip/gem + single-binary github/maven/archive). `allowInstall:false` / `PI_LENS_DISABLE_LSP_INSTALL=1` means **discovery-only, not no-discovery**: `ensureTool(id, { allowInstall:false })` must still probe PATH/npm-global/managed-bin and skip only the install step; `forceReinstall` must not bypass that gate, and in-flight ensures are keyed by install policy so discovery-only callers never inherit a concurrent install. LSP spawn `undefined` while installs are disabled is an expected unavailable state, not a broken server signal — cool it down briefly, but don't count it toward permanent session disablement. Root-detector glob markers are supported (`*.csproj`, `*.sln`, `*.cabal`, etc.); use globs for real project-file names rather than pseudo-extension markers like `.csproj`. Heavy workspace servers must not use `FileDirRoot` fallback just to keep spawning: C# (`csharp-ls`/OmniSharp) now resolves `*.sln`/`*.csproj` and skips standalone `.cs` files, matching Rust's no-manifest skip (#201); F# (`fsautocomplete`) does the same for `*.sln`/`*.fsproj`. The verifiable slice is DONE (`clients/lsp/server.ts`): **fsautocomplete** now installs via `dotnet tool install` (`runtimeInstall` hook + `dotnetToolCandidates` discovery, mirroring csharp-ls), and **gopls / rust-analyzer** gained canonical-bin discovery — `goBinCandidates`/`cargoBinCandidates` add `$GOPATH/bin` (or `~/go/bin`) and `$CARGO_HOME/bin` (or `~/.cargo/bin`) as candidates so a runtime-managed binary resolves (and gopls's post-`go install` retry lands) even when those dirs aren't on PATH. Because `shouldAllowInstall` defaults on, the smoke spawn drives `runtimeInstall` directly — these are live-smoke-able (`scripts/smoke-tools.mjs --lsp fsharp go rust`) and unit-smoked deterministically (`tests/clients/lsp/runtime-install-discovery.test.ts` — reject-all candidate capture, `allowInstall:false` so no real installs fire). STILL on the PATH-only `createInteractiveServer` path (deferred, unverifiable on the Win dev box): ocamllsp (opam), nixd (nix), haskell-language-server (ghcup version-matching), sourcekit-lsp (Swift toolchain, discovery-only). Archive-tree servers (jdtls, kotlin-language-server, clangd, lua-language-server, elixir-ls) needed a platform-matched archive strategy — the GENERIC archive-TREE-bundle shape EXISTS (#278): `ArchiveSpec` supports `stripComponents`/optional `launcher`/`treeMarker`, `installArchiveTool` keeps the whole extracted tree and resolves to the extract dir. **Two launch shapes now ride on it:** (A) *runtime + bootstrap script* via `resolveAndLaunchBundle` (a runtime on PATH drives a script inside the tree, graceful-skip when runtime/bundle absent) — first consumer **PowerShellServer** (PSES = `pwsh Start-EditorServices.ps1 -Stdio`); (B) *self-contained bin-in-tree* via `resolveAndLaunchTreeBinary` (PATH candidates first, else the managed bundle, then launch `<bundle>/bin/<exe>[.exe]` directly — no external runtime) — first consumer **clangd** (#241, `CppServer`, id "cpp"; `stripComponents:1` drops the `clangd_<ver>/` wrapper, `treeMarker:"bin"`). clangd also added the **platform-matched archive URL**: `ArchiveSpec.url` accepts a `(platform, arch) => url | undefined` resolver (`resolveArchiveUrl` drives `installArchiveTool`, degrading to "unavailable" where no build exists; plain string still works) — the reusable bit lua-language-server (next; also exercises per-*arch*) / kotlin / elixir-ls consume. Shape (C) *launcher-script-in-tree needing an ambient JVM/BEAM toolchain* (kotlin/elixir-ls) is still TODO. (clojure-lsp + gleam ARE registered too — single native binaries.)
 

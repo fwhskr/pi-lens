@@ -364,16 +364,23 @@ are part of the contract, so the predicate is named here** (`refusalMatches` in
    each token. The declared key matches when its tokens equal the ignored key's
    tokens joined (`Path`, `PATH` for `path`; `Server_Scope` for `serverScope`),
    or are the **trailing** tokens of the ignored key, its head noun (`filePath`
-   and `file_path` for `path`; `paths` and `path` for each other). A folded-equal
-   match decides alone. If the call sent any matching key (`path` or `paths`),
-   nothing is refused.
+   and `file_path` for `path`; `paths` and `path` for each other). A head-noun
+   match is dropped when the leading tokens change what the key names: they are
+   themselves a declared key of the tool (`cwdPath` is `cwd`, not `path`, where
+   `cwd` is declared), or one of them is `max`, `min`, `num`, `count`, `total`,
+   `include`, `exclude`, `out` or `output` (`maxFiles`, `includeFiles` and
+   `outFile` are not `file`). The word list is finite: `newFile` and `hasFile`
+   still refuse as `file`. A folded-equal match decides alone. If the call sent
+   any matching key (`path` or `paths`), nothing is refused.
 
 Everything else stays a warning and the tool runs, exactly as it did before: a
 misspelled mode name, an abbreviation (`max`), a substring or reverse containment
 (`files` for `maxLspFiles`, `file` for `path`), a leading or middle word
-(`sourcePath` is not `source`). Such keys still get the `did you mean` hint, which
-is a separate, looser scorer and is advice only; retuning it cannot change
-which calls run. Changing the predicate above flips calls between running and
+(`sourcePath` is not `source`), a key whose qualifier retargets the head noun
+(`maxFiles`). Such keys still get the `did you mean` hint, except that a
+retargeted head noun is never the hint (`maxFiles` gets none, `cwdPath` gets
+`cwd`). The hint is a separate, looser scorer and is advice only; retuning it
+cannot change which calls run. Changing the predicate above flips calls between running and
 refusing and is a change to this contract.
 
 Only top-level keys are checked: keys inside a nested object argument
@@ -383,6 +390,13 @@ JSON-RPC `-32602` error; `arguments` absent, `null` or `[]` means no arguments.
 **Rejecting every unknown key outright is deliberately not done:** callers that
 pass extra keys today would break, so it needs a major, through the removal
 checklist in section 4.
+
+## 6. File I/O Lifecycle Bridge (v2)
+
+`PiLensIOBridge` is public API from day one ([RFC 3654](rfcs/3654-unified-io-bridge-v2.md)).
+Producers access the bridge via `Symbol.for("pi-lens:io-bridge")` carrying `readonly version: 2`.
+The compatibility policy and migration path from legacy v1 symbols are documented in
+[Migration Guide: File I/O Lifecycle Bridge v1 → v2](io-bridge-v2-migration.md).
 
 ## Where each policy point is enforced
 

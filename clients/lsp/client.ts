@@ -10,7 +10,7 @@
 
 import { spawn as nodeSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { access, lstat, readFile } from "node:fs/promises";
+import { access, lstat, readFile, stat } from "node:fs/promises";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { emitBounded } from "../bounded-telemetry.js";
@@ -32,7 +32,10 @@ import {
 } from "../deps/vscode-jsonrpc.js";
 import { logExtension } from "../extension-log.js";
 import { recordLspChild, removeLspChild } from "../instance-registry.js";
-import { workspaceDiagnosticsCacheSessionStart } from "./workspace-diagnostics-session.js";
+import {
+	noteWorkspaceFileCreated,
+	workspaceDiagnosticsCacheSessionStart,
+} from "./workspace-diagnostics-session.js";
 import { logLatency } from "../latency-logger.js";
 import {
 	type LspMutationContext,
@@ -70,7 +73,15 @@ import {
 import { exceedsLspSyncLimits } from "./content-limits.js";
 import { probeTsserverProjectIdentity } from "./tsserver-sync.js";
 import { getStrategy } from "./wait-policy/index.js";
-import { WatchedFilesQueue } from "./watch-queue.js";
+import {
+	FILE_CHANGED,
+	FILE_CREATED,
+	FILE_DELETED,
+	WatchedFilesQueue,
+	watchedTypeForOpen,
+} from "./watch-queue.js";
+import { type BirthStat, pathBirthtimeMs } from "../path-birth.js";
+import { BoundedSet } from "../bounded-cache.js";
 import {
 	clearAllWorkspaceDiagnosticsCaches,
 	clearWorkspaceDiagnosticsCacheAtAndAbove,
@@ -351,6 +362,17 @@ export interface LSPClientInfo {
 		): Promise<boolean | void>;
 		change(filePath: string, content: string): Promise<boolean | void>;
 		/**
+		 * #3405: send `textDocument/didSave` for the bytes this client last sent
+		 * for `filePath`, with no content push. For a touch whose push the
+		 * service debounced (the server already holds these bytes) but whose
+		 * caller declared a save the earlier push did not carry. Queued per path
+		 * behind any unsent push, which then carries the save instead; gated like
+		 * every save (`save` declared, document open). Resolves `false` when
+		 * nothing left for this entry. Optional so client doubles need not
+		 * implement it.
+		 */
+		save?(filePath: string): Promise<boolean>;
+		/**
 		 * #1668: queue a `workspace/didChangeWatchedFiles` entry for a disk
 		 * change this client did not learn about through didOpen/didChange —
 		 * an external bash write/delete outside the open-document sync path.
@@ -359,6 +381,20 @@ export interface LSPClientInfo {
 		 * a burst of external changes still flushes as one notification.
 		 */
 		watchedFileChange(filePath: string, type: number): void;
+		/**
+		 * #4476: send the queued watched-files changes now, so a check that
+		 * follows is answered by a server that has re-read the files. Optional
+		 * for test doubles.
+		 */
+		flushWatched?(): void;
+		/**
+		 * #4320: queue Created for each existing path that is new to this server
+		 * and not yet announced to it, then send any waiting Created now. A read
+		 * that follows is then answered by a server that has heard of the path.
+		 */
+		announceCreated(
+			entries: ReadonlyArray<{ filePath: string; stat: BirthStat }>,
+		): void;
 	};
 	getDiagnostics(filePath: string): LSPDiagnostic[];
 	/**
@@ -1274,6 +1310,14 @@ export interface LSPClientState {
 	 * the state literal, like `workspaceDiagnosticsSupport`.
 	 */
 	watchQueue: WatchedFilesQueue;
+	/**
+	 * #4320: paths this client has sent Created for while they existed on disk.
+	 * The server has heard of them, so a later announcement is Changed. A
+	 * Deleted removes the path. Bounded: an evicted path may be announced as
+	 * Created once more, which a server treats as a refresh. Optional for mock
+	 * states; absent means every new path is announced as Created.
+	 */
+	readonly createdAnnounced?: BoundedSet<string>;
 }
 
 /** #2065: bound both the path count and UTF-16 heap represented by retained
@@ -2140,7 +2184,8 @@ interface SentContentScan {
  * `lsp_document_send` line count, and a `.split(/\r\n|\r|\n/)` in
  * `buildContentChanges` that materialized one substring per line to read the
  * last one. The #1095 sha256 is a third walk and stays; it is native, and it
- * is load-bearing.
+ * is load-bearing. A document with no `\r` is walked natively (`indexOf`)
+ * instead of per character (#2066).
  *
  * The two counts here are deliberately NOT the same number and must not be
  * collapsed into one. `lfNewlineCount` counts `\n` only, because its consumer
@@ -2152,6 +2197,24 @@ interface SentContentScan {
  * terminators went uncounted computes a range ending mid-document.
  */
 function scanSentContent(content: string): SentContentScan {
+	// A document with no `\r` (the common case) has exactly one terminator
+	// kind, so `\n` count == terminator count and the last line starts after
+	// the last `\n`. `indexOf` is native and walks ~10x faster than the
+	// per-character loop below (0.30 vs 3.0 ms on a 1.96 MB document). Any `\r`
+	// falls through to the loop, which owns the `\r\n`/lone-`\r` rules.
+	if (content.indexOf("\r") === -1) {
+		let lfNewlineCount = 0;
+		let start = 0;
+		for (
+			let i = content.indexOf("\n");
+			i !== -1;
+			i = content.indexOf("\n", i + 1)
+		) {
+			lfNewlineCount++;
+			start = i + 1;
+		}
+		return { lfNewlineCount, lastLine: { index: lfNewlineCount, start } };
+	}
 	let lfNewlineCount = 0;
 	let index = 0;
 	let start = 0;
@@ -4245,7 +4308,69 @@ export function handleNotifyExternalChange(
 	const normalizedPath = normalizeMapKey(filePath);
 	const uri =
 		state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
+	enqueueWatchedChange(state, normalizedPath, uri, type);
+}
+
+/**
+ * #4320: queue a watched-files change and keep the client's Created memory in
+ * step: an on-disk Created is remembered, a Deleted forgets the path.
+ */
+function enqueueWatchedChange(
+	state: LSPClientState,
+	normalizedPath: string,
+	uri: string,
+	type: number,
+	onDisk = true,
+): void {
+	if (type === FILE_CREATED && onDisk)
+		state.createdAnnounced?.add(normalizedPath);
+	else if (type === FILE_DELETED)
+		state.createdAnnounced?.delete(normalizedPath);
 	state.watchQueue.enqueue(uri, type);
+}
+
+/**
+ * #4320: the change type for a path that exists on disk. Created only when
+ * the path is newer than this client (`watchedTypeForOpen` over its path
+ * birth) and this client has not announced it before; Changed otherwise,
+ * including when the path's birth is unknown.
+ */
+function watchedTypeForExisting(
+	state: LSPClientState,
+	normalizedPath: string,
+	info: BirthStat,
+): number {
+	// #4368 r1 row 13: the path, so a module moved into place (old inode)
+	// answers with when pi-lens first saw it present.
+	const birth = pathBirthtimeMs(info, normalizedPath);
+	if (birth === undefined) return FILE_CHANGED;
+	if (watchedTypeForOpen(birth, state.startedAtMs) !== FILE_CREATED) {
+		return FILE_CHANGED;
+	}
+	return state.createdAnnounced?.has(normalizedPath)
+		? FILE_CHANGED
+		: FILE_CREATED;
+}
+
+function handleAnnounceCreated(
+	state: LSPClientState,
+	entries: ReadonlyArray<{ filePath: string; stat: BirthStat }>,
+): void {
+	if (!isClientAlive(state)) return;
+	for (const { filePath, stat: info } of entries) {
+		const normalizedPath = normalizeMapKey(filePath);
+		if (watchedTypeForExisting(state, normalizedPath, info) !== FILE_CREATED) {
+			continue;
+		}
+		enqueueWatchedChange(
+			state,
+			normalizedPath,
+			state.openDocumentUris?.get(normalizedPath) ??
+				pathToFileURL(filePath).href,
+			FILE_CREATED,
+		);
+	}
+	state.watchQueue.flushIfCreated();
 }
 
 /** #3482: a didSave to a `rescansOnSave` server (opengrep) brings one more
@@ -4330,18 +4455,21 @@ async function sendDidSave(
 async function sendDidSaveForHeldDocument(
 	state: LSPClientState,
 	normalizedPath: string,
-): Promise<void> {
-	if (!state.saveOptions || !isClientAlive(state)) return;
-	if (!state.openDocuments.has(normalizedPath)) return;
+): Promise<boolean> {
+	if (!state.saveOptions || !isClientAlive(state)) return false;
+	if (!state.openDocuments.has(normalizedPath)) return false;
 	const uri = state.openDocumentUris?.get(normalizedPath);
-	if (uri === undefined) return;
+	if (uri === undefined) return false;
 	expectSaveRescan(state, normalizedPath);
 	try {
-		await safeSendNotification(state.connection, "textDocument/didSave", {
-			textDocument: { uri },
-		});
+		return await safeSendNotification(
+			state.connection,
+			"textDocument/didSave",
+			{ textDocument: { uri } },
+		);
 	} catch {
 		// A failed save notify must not stop the queue runner.
+		return false;
 	}
 }
 
@@ -4465,22 +4593,28 @@ async function handleNotifyOpenOnce(
 	// not reporting a real filesystem change. Avoids N project-wide
 	// rechecks on push-diagnostics LSPs (TypeScript, Python) per CR-1.
 	if (!silent) {
-		// Async existence probe (was a synchronous existsSync on the document-open
-		// path — a stat that blocks the loop during first-read/warm). The notify
-		// type is unchanged: 2 (Changed) when the file exists on disk, else 1
-		// (Created). access() rejects when absent.
-		let fileExists = true;
+		// Async stat (was a synchronous existsSync on the document-open path — a
+		// stat that blocks the loop during first-read/warm). Absent → 1 (Created).
+		// #4320: a file that exists is Created when it is new to this server and
+		// not yet announced to it (`watchedTypeForExisting`), Changed otherwise.
+		// The old existence-only rule reported every file pi had just written as
+		// Changed, and Pyrefly keeps a failed `import new_module` lookup until it
+		// hears Created.
+		let watchedType = FILE_CREATED;
+		let onDisk = false;
 		try {
-			await access(filePath);
+			const info = await stat(filePath);
+			onDisk = true;
+			watchedType = watchedTypeForExisting(state, normalizedPath, info);
 		} catch {
-			fileExists = false;
+			// absent: Created
 		}
 		// #271: enqueue instead of sending now — the per-client queue coalesces a
 		// turn's file opens into a single notification, so push-diagnostics servers
 		// re-analyze the project once per burst rather than once per file. didOpen
 		// (below) still carries this file's content immediately, so the open
 		// document is analyzed without waiting on the batched watcher notify.
-		state.watchQueue.enqueue(uri, fileExists ? 2 : 1);
+		enqueueWatchedChange(state, normalizedPath, uri, watchedType, onDisk);
 	}
 
 	if (!isClientAlive(state)) return false;
@@ -4537,6 +4671,13 @@ function enqueueDocumentNotify(
 	saved = false,
 	readStamp?: number,
 	close = false,
+	/**
+	 * #3405: a save with no content (`handleNotifySave`). It never replaces a
+	 * pending entry: it hands that entry its save and keeps the entry's run,
+	 * stamp and count, as a stale read does, so the bytes the server ends with
+	 * cannot change.
+	 */
+	saveOnly = false,
 ): Promise<boolean> {
 	let queue = state.notifyChangeQueues.get(normalizedPath);
 	if (!queue) {
@@ -4569,7 +4710,9 @@ function enqueueDocumentNotify(
 			a !== undefined && b !== undefined && a < b;
 		const stale =
 			previous !== undefined &&
-			(before(readStamp, previous.readStamp) || before(readStamp, lastSent));
+			(saveOnly ||
+				before(readStamp, previous.readStamp) ||
+				before(readStamp, lastSent));
 		// #3544: a pending stamp older than the last send belongs to bytes the
 		// runner drops; an unstamped replacement must not inherit it.
 		const heldStamp = before(previous?.readStamp, lastSent)
@@ -4579,7 +4722,9 @@ function enqueueDocumentNotify(
 		queue!.pending = {
 			run: stale ? previous!.run : run,
 			waiters,
-			coalescedCount: (previous?.coalescedCount ?? 0) + (previous ? 1 : 0),
+			// A save-only entry coalesces no content send.
+			coalescedCount:
+				(previous?.coalescedCount ?? 0) + (previous && !saveOnly ? 1 : 0),
 			saved: saved || previous?.saved === true,
 			// An unstamped replacement cannot say how old its bytes are; keeping the
 			// pending stamp keeps an older read arriving next out (#3481 round 1).
@@ -4650,6 +4795,28 @@ function cancelDocumentNotifyQueues(state: LSPClientState): void {
 		queue.pending = undefined;
 	}
 	state.notifyChangeQueues.clear();
+}
+
+/**
+ * #3405: `notify.save` — a didSave for the document this client holds, with no
+ * content push (see the interface doc). Text never rides along: by the time
+ * the entry runs, a push queued before it may have replaced the bytes the
+ * caller read, and `text` is optional in `DidSaveTextDocumentParams`.
+ */
+export function handleNotifySave(
+	state: LSPClientState,
+	filePath: string,
+): Promise<boolean> {
+	const normalizedPath = normalizeMapKey(filePath);
+	return enqueueDocumentNotify(
+		state,
+		normalizedPath,
+		() => sendDidSaveForHeldDocument(state, normalizedPath),
+		true,
+		undefined,
+		false,
+		true,
+	);
 }
 
 export function handleNotifyOpen(
@@ -5969,6 +6136,7 @@ export async function createLSPClient(options: {
 		isConnected: true,
 		isDestroyed: false,
 		startedAtMs: Date.now(),
+		createdAnnounced: new BoundedSet<string>(4096),
 		shutdownRequested: false,
 		shutdownPromise: undefined,
 		shutdownOptions: undefined,
@@ -6036,14 +6204,22 @@ export async function createLSPClient(options: {
 
 	// #271: batch per-file workspace/didChangeWatchedFiles into one notification
 	// per debounce window, so an N-file turn re-indexes the server once, not N×.
-	state.watchQueue = new WatchedFilesQueue((changes) => {
-		if (!isClientAlive(state)) return;
-		void safeSendNotification(
-			state.connection,
-			"workspace/didChangeWatchedFiles",
-			{ changes },
-		);
-	});
+	state.watchQueue = new WatchedFilesQueue(
+		(changes) => {
+			if (!isClientAlive(state)) return;
+			void safeSendNotification(
+				state.connection,
+				"workspace/didChangeWatchedFiles",
+				{ changes },
+			);
+		},
+		undefined,
+		// #4320: a creation can answer an import a cached finding reported missing.
+		// #4346: the paths go with it, so only entries whose dependency scope
+		// holds one are refused.
+		(uris) =>
+			noteWorkspaceFileCreated(state.serverId, state.root, uris.map(uriToPath)),
+	);
 
 	setupIncomingHandlers(state, initialization, onDiagnosticsPublished);
 	connection.listen();
@@ -6263,8 +6439,17 @@ export async function createLSPClient(options: {
 			async change(filePath, content) {
 				return handleNotifyChange(state, filePath, content);
 			},
+			save(filePath) {
+				return handleNotifySave(state, filePath);
+			},
 			watchedFileChange(filePath, type) {
 				handleNotifyExternalChange(state, filePath, type);
+			},
+			flushWatched() {
+				if (isClientAlive(state)) state.watchQueue.flush();
+			},
+			announceCreated(entries) {
+				handleAnnounceCreated(state, entries);
 			},
 		},
 

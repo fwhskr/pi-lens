@@ -21,8 +21,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { getDegradationSummary } from "../../clients/degradation-ledger.js";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+	resetProjectTrust,
+	setProjectTrustState,
+} from "../../clients/project-trust.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import {
 	cleanupTestEnvironmentsDrained,
 	setupTestEnvironment,
@@ -114,6 +121,9 @@ describe("#3750 an empty result under a server-root fallback", () => {
 	let service: { shutdown: () => Promise<void> } | undefined;
 
 	beforeAll(async () => {
+		// Host-boundary stub: this fixture exercises the real LSP service and
+		// admits its project-code servers as a trusted project.
+		setProjectTrustState("trusted");
 		for (const name of [
 			"rust-analyzer",
 			"csharp-ls",
@@ -127,7 +137,15 @@ describe("#3750 an empty result under a server-root fallback", () => {
 		service = lsp.getLSPService();
 	});
 
+	// #4397: the ledger keeps the first ENTRIES_PER_KIND rows of a kind. Every
+	// sibling case records a `tool-cwd-resolution` row, so the case reading the
+	// row for its own file saw it dropped once enough siblings had run first.
+	beforeEach(() => {
+		resetDegradationLedger();
+	});
+
 	afterAll(async () => {
+		resetProjectTrust();
 		process.env.PATH = originalPath;
 		delete process.env.FAKE_LSP_RESPOND_PULL_WITH;
 		await cleanupTestEnvironmentsDrained("pi-lens-3750-", {

@@ -42,7 +42,7 @@ async function setupLspStatusRepaint(
 	options: { flags?: Record<string, boolean> } = {},
 ) {
 	const { resetLSPService, service } = aliveServerHolder();
-	vi.doMock("../clients/lsp/index.js", () => ({
+	vi.doMock("../clients/lsp/capabilities.js", () => ({
 		getLSPService: service,
 		resetLSPService,
 	}));
@@ -70,7 +70,7 @@ async function setupLspStatusRepaint(
 	return { turnEnd, ui, lspStatuses, resetLSPService };
 }
 
-vi.mock("../clients/read-guard.js", () => {
+const MockReadGuard = vi.hoisted(() => {
 	class MockReadGuard {
 		isNewFile() {
 			return false;
@@ -80,6 +80,9 @@ vi.mock("../clients/read-guard.js", () => {
 		}
 		recordRead() {}
 		recordWritten() {}
+		contentMatchesLastRead() {
+			return undefined;
+		}
 		noteCreatedFile() {}
 		getReadHistory() {
 			return [];
@@ -99,11 +102,14 @@ vi.mock("../clients/read-guard.js", () => {
 		}
 	}
 
-	return {
-		ReadGuard: MockReadGuard,
-		createReadGuard: () => new MockReadGuard(),
-	};
+	return MockReadGuard;
 });
+
+vi.mock("../clients/read-guard.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../clients/read-guard.js")>()),
+	ReadGuard: MockReadGuard,
+	createReadGuard: () => new MockReadGuard(),
+}));
 
 describe("index.ts LSP idle reset", () => {
 	let tmpDir: string;
@@ -119,7 +125,7 @@ describe("index.ts LSP idle reset", () => {
 		vi.unstubAllEnvs();
 		vi.restoreAllMocks();
 		// resetModules does not clear the mock registry (#2883).
-		vi.doUnmock("../clients/lsp/index.js");
+		vi.doUnmock("../clients/lsp/capabilities.js");
 		vi.doUnmock("../clients/bootstrap.js");
 	});
 

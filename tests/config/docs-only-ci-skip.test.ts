@@ -8,7 +8,7 @@ import { run as runChangedFiles } from "../../scripts/ci-changed-files.mjs";
 const byCodeUnit = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 // #3801: a docs-only pull request does not start the HEAVY ADVISORY jobs
-// (mutation, the Windows run) but runs every test job, a single non-docs file
+// (CodeQL, the Windows run) but runs every test job, a single non-docs file
 // runs everything, and no REQUIRED check can be absent or skipped. This
 // evaluates the real ci.yml: each job's `needs` and `if`, each gated step's
 // `if`, under the outputs the real classifier script produced for a diff.
@@ -40,7 +40,7 @@ const asList = (needs: Job["needs"]) =>
 
 type Ctx = {
 	event: string;
-	changes: { code: string; formal: string };
+	changes: { code: string; formal: string; smoke?: string };
 	results: Record<string, string>;
 	outputs: Record<string, Record<string, string>>;
 	matrixOs?: string;
@@ -149,10 +149,10 @@ function simulate(
 							.split("\n")
 							.map((l) => l.split("=")),
 					)
-		) as { code: string; formal: string };
-		const results: Record<string, string> = {
-			...(changesFails ? { changes: "failure" } : {}),
-		};
+		) as { code: string; formal: string; smoke?: string };
+		const results: Record<string, string> = changesFails
+			? { changes: "failure" }
+			: {};
 		const outputs: Record<string, Record<string, string>> = {
 			changes,
 			"heavy-gate": { ready: gateReady },
@@ -231,12 +231,7 @@ const DOCS_ONLY = [
 	".changelog/3801-x.md",
 ];
 // The jobs behind `heavy-gate`: advisory, and the only jobs a docs-only diff skips.
-const HEAVY_ADVISORY = [
-	"heavy-gate",
-	"unit-tests-windows",
-	"mutation",
-	"codeql",
-];
+const HEAVY_ADVISORY = ["heavy-gate", "unit-tests-windows", "codeql"];
 // Every test-running job: a docs edit can red these (review r1 F2), so a
 // docs-only diff runs ALL of them.
 const TEST_JOBS = [
@@ -253,9 +248,8 @@ const TEST_JOBS = [
 describe("#3801 docs-only pull requests skip only the heavy advisory jobs", () => {
 	it("skips the heavy advisory jobs for a docs-only diff and runs every test job", () => {
 		const { changes, results } = simulate("pull_request", DOCS_ONLY);
-		expect(changes).toEqual({ code: "false", formal: "false" });
+		expect(changes).toEqual({ code: "false", formal: "false", smoke: "false" });
 		for (const id of HEAVY_ADVISORY) expect(results[id], id).toBe("skipped");
-		expect(results["mutation-comment"]).toBe("skipped");
 		for (const id of [
 			"changes",
 			"dependency-boundaries",
@@ -307,7 +301,7 @@ describe("#3801 docs-only pull requests skip only the heavy advisory jobs", () =
 			docs.changes,
 			docs.results,
 		);
-		expect(docsSteps["ubuntu-latest"]).toHaveLength(total - 1); // the macOS-only APFS step
+		expect(docsSteps["ubuntu-latest"]).toHaveLength(total - 2); // the macOS-only APFS step and its evaluated floor (#4518)
 		expect(docsSteps["macos-latest"]).toHaveLength(total);
 	});
 
@@ -325,16 +319,15 @@ describe("#3801 docs-only pull requests skip only the heavy advisory jobs", () =
 		expect(changes.code).toBe("true");
 		for (const id of [...HEAVY_ADVISORY, ...TEST_JOBS])
 			expect(results[id], id).toBe("success");
-		expect(results["mutation-comment"]).toBe("success");
 	});
 
-	// Recurrence: master, merge-train replays and (later) merge_group losing the
-	// full suite to the classifier.
+	// Recurrence: master and (later) merge_group losing the full suite to the
+	// classifier.
 	it.each(["push", "merge_group"])(
 		"runs the full suite for a %s event even for a docs-only file list",
 		(event) => {
 			const { changes, results } = simulate(event, DOCS_ONLY);
-			expect(changes).toEqual({ code: "true", formal: "true" });
+			expect(changes).toEqual({ code: "true", formal: "true", smoke: "true" });
 			for (const id of [
 				...TEST_JOBS.filter((id) => id !== "targeted-tests-advisory"),
 				"heavy-gate",
@@ -342,9 +335,8 @@ describe("#3801 docs-only pull requests skip only the heavy advisory jobs", () =
 			]) {
 				expect(results[id], id).toBe("success");
 			}
-			// mutation, targeted tests and the changelog fast-fail are pull_request jobs
+			// CodeQL, targeted tests and the changelog fast-fail are pull_request jobs
 			for (const id of [
-				"mutation",
 				"codeql",
 				"targeted-tests-advisory",
 				"changelog-fragment-fastfail",

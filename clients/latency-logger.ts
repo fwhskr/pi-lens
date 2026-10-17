@@ -65,7 +65,15 @@ export const RECENT_PHASE_CAP = 5;
  * it, while staying O(1) per call and fixed-size in memory. Tracked before the
  * test-mode guard so it is deterministic and unit-testable.
  */
-let recentPhases: Array<{ phase: string; ts: string }> = [];
+let recentPhases: Array<{
+	phase: string;
+	ts: string;
+	// The tool that logged the phase, when it named one: a block breadcrumb
+	// says which tool's phase ran, and a test can see which tool a shared
+	// helper's record was stamped for (#4459 review F5).
+	toolName?: string;
+	metadata?: Record<string, unknown>;
+}> = [];
 
 /**
  * Phases excluded from `lastPhase` attribution alongside `loop_block`.
@@ -147,6 +155,15 @@ let recentPhases: Array<{ phase: string; ts: string }> = [];
  * #2044: `test_runner_failed_target_state` is a zero-duration decision after a
  * bounded filesystem probe. The surrounding turn-end test-selection phase owns
  * any real work, so this row must not replace it in stall attribution.
+ *
+ * #3873: `session_handoff_slot`, `session_handoff_adopt`,
+ * `session_store_action` and `session_end_fence_rollup` are zero-duration
+ * decision and rollup rows written inside the session transition that owns any
+ * real stall. `format_late_resync_chained` marks a formatter give-up and its
+ * `durationMs` is the formatter's age at the give-up, not work of its own.
+ *
+ * #4368 r1 F3: `lsp_created_import_scan_rollup` is a zero-duration session-end
+ * rollup of the created-module producer.
  */
 const LAST_PHASE_EXCLUDED = new Set([
 	"loop_block",
@@ -158,6 +175,7 @@ const LAST_PHASE_EXCLUDED = new Set([
 	"session_end_bus_rollup",
 	"cache_usage_summary",
 	"test_runner_failed_target_state",
+	"turn_end_test_selection",
 	"lsp_aux_wait_outcome",
 	"tool_set_mutation",
 	"availability_decision",
@@ -177,6 +195,12 @@ const LAST_PHASE_EXCLUDED = new Set([
 	"lsp_rules_refreshed",
 	"read_guard_conversation_read",
 	"read_widening_note",
+	"session_handoff_slot",
+	"session_handoff_adopt",
+	"session_store_action",
+	"session_end_fence_rollup",
+	"format_late_resync_chained",
+	"lsp_created_import_scan_rollup",
 ]);
 
 /**
@@ -198,9 +222,12 @@ export function getLastLoggedPhase():
  * request an unbounded ring. Same staleness caveat as `getLastLoggedPhase`:
  * these are breadcrumbs from whatever ran most recently, not proof of cause.
  */
-export function getRecentLoggedPhases(
-	limit = RECENT_PHASE_CAP,
-): Array<{ phase: string; ts: string; metadata?: Record<string, unknown> }> {
+export function getRecentLoggedPhases(limit = RECENT_PHASE_CAP): Array<{
+	phase: string;
+	ts: string;
+	toolName?: string;
+	metadata?: Record<string, unknown>;
+}> {
 	return recentPhases.slice(0, Math.min(limit, RECENT_PHASE_CAP));
 }
 
@@ -822,7 +849,12 @@ export function logLatency(entry: LatencyEntry): void {
 		!LAST_PHASE_EXCLUDED.has(entry.phase)
 	) {
 		recentPhases = [
-			{ phase: entry.phase, ts, metadata: entry.metadata },
+			{
+				phase: entry.phase,
+				ts,
+				...(entry.toolName !== undefined && { toolName: entry.toolName }),
+				...(entry.metadata !== undefined && { metadata: entry.metadata }),
+			},
 			...recentPhases,
 		].slice(0, RECENT_PHASE_CAP);
 	}

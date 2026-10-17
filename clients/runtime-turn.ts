@@ -12,12 +12,15 @@ import { logActionableWarningsEvent } from "./actionable-warnings-logger.js";
 import {
 	appendCodeQualityWarningsHistory,
 	buildCodeQualityWarningsReport,
-	type CodeQualityWarningRecord,
 	formatCodeQualityWarningsAdvisory,
 	writeCodeQualityWarningsReport,
 } from "./code-quality-warnings.js";
 import type { CacheEntry, CacheManager } from "./cache-manager.js";
-import type { CascadeSkipReason } from "./cascade-types.js";
+import type {
+	CascadeResult,
+	CascadeRun,
+	CascadeSkipReason,
+} from "./cascade-types.js";
 import {
 	clearGitGuardTestFailure,
 	mergeGitGuardTestFailure,
@@ -27,8 +30,15 @@ import {
 } from "./git-guard.js";
 import { cascadeSettleWaitMs } from "./cascade-budget.js";
 import { logCascade } from "./cascade-logger.js";
-import { normalizeMapKey } from "./path-utils.js";
+import { isUnderDir, normalizeMapKey } from "./path-utils.js";
+import {
+	boundDeferredTargets,
+	mergeDeferredTargets,
+	TEST_RUNNER_MAX_PERSISTED_TARGETS,
+} from "./deferred-test-targets.js";
 import { compareOrdinal } from "./string-utils.js";
+
+export { TEST_RUNNER_MAX_PERSISTED_TARGETS };
 import type {
 	DependencyChecker,
 	MadgeBatchStats,
@@ -38,7 +48,10 @@ import {
 	toRunnerDisplayPath,
 } from "./dispatch/runner-context.js";
 import { getKnipIgnorePatterns } from "./file-utils.js";
-import { formatCacheAgeLabel } from "./finding-delivery-gate.js";
+import {
+	admitsProjectWideFindings,
+	formatCacheAgeLabel,
+} from "./finding-delivery-gate.js";
 import {
 	getFullScanWallClockMs,
 	isWorkspaceSweepActive,
@@ -54,6 +67,7 @@ import {
 	type ComposedPart,
 	type DeliveryHold,
 	planDeliveryHolds,
+	stillReportedParked,
 } from "./turn-end/delivery-holds.js";
 import type { TurnEndLaneContext } from "./turn-end/lane.js";
 import { isHardFailureSummary } from "./hard-failure-summary.js";
@@ -62,14 +76,20 @@ import {
 	MAX_KNIP_ROOTS_PER_TURN,
 	resolveKnipScanRoots,
 } from "./knip-scan-roots.js";
-import type { DeadCodeClient, DeadCodeResult } from "./dead-code-client.js";
+import type {
+	DeadCodeClient,
+	DeadCodeIssue,
+	DeadCodeResult,
+} from "./dead-code-client.js";
 import {
+	DEAD_CODE_DELTA_MAX_SHOWN,
 	deadCodeIssueKey,
 	deadCodeIssues,
 	formatDeadCodeDelta,
 	stableFindingKey,
 } from "./dead-code-client.js";
 import { logDeadCodeScan } from "./dead-code-logger.js";
+import { type SessionScope, scopeCell } from "./session-scope.js";
 import {
 	PROJECT_DIAGNOSTICS_CACHE_VERSION,
 	writeProjectDiagnosticsDeltaReport,
@@ -78,6 +98,7 @@ import { deadCodeIssueToProjectDiagnostic } from "./project-diagnostics/runner-a
 import { trivyFindingToProjectDiagnostic } from "./project-diagnostics/runner-adapters/trivy.js";
 import { knipIssuesToProjectDiagnostics } from "./project-diagnostics/runner-adapters/knip.js";
 import type { ProjectDiagnostic } from "./project-diagnostics/types.js";
+import { hasAmbientPythonEnvironment } from "./python-environment.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	getLspBudgetIdleTimeoutMs,
@@ -113,7 +134,7 @@ import {
 } from "./blocker-freshness.js";
 import { sweepInlineBlockerPastEof } from "./blocker-past-eof.js";
 // #2001/#2002: collect-later delivery for slow auxiliary LSP servers.
-import { getLSPService } from "./lsp/index.js";
+import { getLSPService } from "./lsp/capabilities.js";
 import {
 	drainPendingAuxCapEvictedCount,
 	drainPendingAuxiliaryCoverage,
@@ -127,16 +148,34 @@ import {
 import type { LSPDiagnostic } from "./lsp/client.js";
 import { convertLspDiagnostics } from "./dispatch/utils/lsp-diagnostics.js";
 import { retagAuxiliaryDiagnostics } from "./dispatch/auxiliary-lsp.js";
+import { findingsResult, hasUsableResult } from "./dispatch/types.js";
 import {
 	type PersistentReverifyResult,
 	runPersistentReverify,
 } from "./persistent-reverify.js";
-import { cascadeCarrySuffix } from "./cascade-format.js";
+import {
+	cascadeCarrySuffix,
+	cascadeStillPresentSince,
+	composeCascadeSection,
+	forgetCascadePendingNeighbor,
+	formatCascadeNeighborDiagnostics,
+	listCascadePendingNeighbors,
+	markCascadeUnansweredPrimariesDelivered,
+	recordDeliveredCascadeNeighbor,
+	renderCascadeResult,
+} from "./cascade-format.js";
+import { peekOutstandingCascadeTouches } from "./lsp/cascade-tier.js";
 import {
 	applyPushedFindingPolicy,
+	applyPushedFindingPolicyByFile,
 	filterFindingsByDisposition,
 } from "./dispatch/finding-policy.js";
 import { detectFileRole } from "./file-role.js";
+import {
+	judgeDeferredRunnerFindings,
+	recordDeferredRunnerBlockers,
+	retireSettledRunnerBlockers,
+} from "./deferred-runner-blockers.js";
 import {
 	applyInlineBlockerPolicy,
 	type InlineBlockerPolicyTallyEntry,
@@ -229,6 +268,8 @@ const LATE_AUX_COVERAGE_GAP_DETAIL_CAP_PER_TURN = 20;
  */
 export const TEST_RUNNER_BATCH_CONCURRENCY = 4;
 export const TEST_RUNNER_MAX_TARGETS = 12;
+/** #3871: owning-checkout rows one `turn_end_test_selection` record carries; the rest are counted in `rootsOmitted`. */
+const TURN_END_SELECTION_ROOT_ROWS = 8;
 export const TEST_RUNNER_BATCH_BUDGET_MS = 20_000;
 /**
  * How many consecutive turn-end batches a target may be cut out of before it
@@ -244,51 +285,6 @@ export const TEST_RUNNER_BATCH_BUDGET_MS = 20_000;
  * occurrence and dropped, so the turn stops paying 20 s for it.
  */
 export const TEST_RUNNER_MAX_DEFERRALS = 2;
-
-/**
- * Ceiling on how many entries either persisted target list may carry.
- *
- * #2522 review round 4, I1: a write may no longer destroy another session's
- * entries, so nothing in the write path prunes them any more — each session
- * that ever cut or retired a target in this project leaves its rows behind, on
- * a record read at every single turn_end. The bound is applied at the one
- * writer, on the whole list, and sheds FOREIGN rows first (the writer orders
- * this session's entries last), so it can never evict the entries this turn
- * depends on. Generous on purpose: it is a backstop against unbounded growth,
- * not a scheduling policy.
- */
-export const TEST_RUNNER_MAX_PERSISTED_TARGETS = 64;
-
-/**
- * Union two deferral sets by target identity, keeping the HIGHER attempt count
- * (#2522 review round 3, F3). Two overlapping batches can both be cut on the
- * same target; taking the lower count would let a target trade an attempt for
- * every overlap and never converge on `TEST_RUNNER_MAX_DEFERRALS`.
- *
- * Identity is (session, path), not path alone (#2522 review round 4, I1): two
- * sessions can each owe a run of the same file, and collapsing those into one
- * row makes the surviving row's `sessionId` decide whose deferral is honoured
- * and whose is silently dropped. The path half is keyed through
- * `normalizeMapKey` so `/`- and `\`-separated spellings are one entry
- * (AGENTS.md cross-form-path screen).
- */
-function deferralEntryKey(entry: DeferredTestTarget): string {
-	return `${entry.sessionId ?? ""}\u0000${normalizeMapKey(path.resolve(entry.testFile))}`;
-}
-
-function mergeDeferredTargets(
-	existing: readonly DeferredTestTarget[],
-	incoming: readonly DeferredTestTarget[],
-): DeferredTestTarget[] {
-	const byKey = new Map<string, DeferredTestTarget>();
-	for (const entry of [...existing, ...incoming]) {
-		const key = deferralEntryKey(entry);
-		const prior = byKey.get(key);
-		if (prior && (prior.attempts ?? 0) >= (entry.attempts ?? 0)) continue;
-		byKey.set(key, entry);
-	}
-	return [...byKey.values()];
-}
 
 export interface BoundedTestBatchOutcome<R, T> {
 	/** One entry per target that was dispatched AND settled before the close. */
@@ -476,6 +472,13 @@ interface TurnEndDeps {
 	}) => void;
 	/** Stable session identity from the event ctx that fired this turn_end. */
 	sessionId?: string;
+	/**
+	 * #4154: the session scope of the activation whose turn this is: the
+	 * coordinator's for the primary, its own for a concurrent secondary (which
+	 * shares the coordinator). A late dead-code scan belongs to it. Absent on
+	 * the MCP route and in harnesses: the coordinator's scope.
+	 */
+	sessionScope?: SessionScope;
 	/** Abort signal from the event ctx that fired this turn_end. */
 	signal?: AbortSignal;
 	/** Delivery adapter whose tool names appear in agent-facing advisories. */
@@ -495,6 +498,225 @@ function wouldPoisonCache(
 	next: { success: boolean },
 ): boolean {
 	return !next.success && prev?.data.success === true;
+}
+
+/**
+ * A dead-code scan that missed the turn_end budget and is still running, or
+ * has finished since (#4117). `bounded()` abandons the await, not the process,
+ * and vulture keeps no disk cache, so what the abandoned scan computes is
+ * written and delivered by the entry below instead of being thrown away: the
+ * scan lands its baseline row where it settles, and the next turn_end that
+ * reaches the lane delivers its delta. One entry per (client, root) on the
+ * cell of the session scope whose turn parked it (#4154): the primary's, a
+ * concurrent secondary's own, or a replaced session's new one. Park, take,
+ * carry and the settle's liveness check all ask that one scope, so a session
+ * never sees another's entry, and a scan that settles after its session ended
+ * is dropped. While an entry exists no second scan starts, so the settle
+ * handler is the session's only writer of the baseline row.
+ */
+interface LateDeadCodeScan {
+	/** Resolved paths of the files edited in the turn the scan was started for. */
+	files: ReadonlySet<string>;
+	/** The baseline row the scan was started against; absent when there was none. */
+	previousScan: DeadCodeResult | undefined;
+	/** Resolved paths edited while the scan ran: the next scan covers them. */
+	carry: Set<string>;
+	/** The scan's result once it succeeded; null while it runs. */
+	settled: DeadCodeResult | null;
+	/** When the lane asked for the scan (`joinedEarlierScan`). */
+	askedAt: number;
+}
+
+const LATE_DEAD_CODE_SCANS = "dead-code-late-scans";
+
+function lateDeadCodeScansOf(
+	scope: SessionScope,
+): Map<string, LateDeadCodeScan> {
+	return scopeCell(
+		scope,
+		LATE_DEAD_CODE_SCANS,
+		() => new Map<string, LateDeadCodeScan>(),
+	) as Map<string, LateDeadCodeScan>;
+}
+
+/**
+ * #4154 J1: did `analyze()` hand back a scan that was already running when the
+ * lane asked at `askedAt`? The client's single flight is process-wide, so the
+ * scan may be another session's, a subagent's, or a fresh fetch's, started
+ * before this turn's edits: it read the tree before them and cannot cover
+ * them. `scannedAt` is the initiator's read stamp, which a joiner inherits
+ * (#3600); a result without one never reached a scan.
+ */
+function joinedEarlierScan(
+	result: { scannedAt?: string },
+	askedAt: number,
+): boolean {
+	return (
+		result.scannedAt !== undefined && Date.parse(result.scannedAt) < askedAt
+	);
+}
+
+const KNIP_CARRIED_FILES = "knip-carried-files";
+
+/**
+ * #4166: per scan root, the files of the last turn that joined a knip scan
+ * already running when the lane asked (J1's rule, as the dead-code lane
+ * applies it). The joined scan may have read the tree before those edits, so
+ * the root's next scan attributes them with its own turn's files. A scan the
+ * lane started itself clears the entry once it succeeds. Lives on the session
+ * scope, so a replaced session starts with none.
+ */
+function knipCarriedFilesOf(scope: SessionScope): Map<string, Set<string>> {
+	return scopeCell(
+		scope,
+		KNIP_CARRIED_FILES,
+		() => new Map<string, Set<string>>(),
+	) as Map<string, Set<string>>;
+}
+
+/**
+ * #4154 V1: a scan's result, with the row a FAILED result is judged against
+ * before it is written: the row on disk once the scan settled, not the one
+ * read before it started. Another writer (another pi-lens process on the same
+ * project) may have stored a good row meanwhile, and the failure must not
+ * replace it. A success needs no row, and a good `startRow` is kept either way,
+ * so only the cold path reads; it reads through `readCacheAsync`, so an inline
+ * caller's `bounded()` still covers the read.
+ */
+function withRowForFailureWrite<R extends { success: boolean }>(
+	scan: Promise<R>,
+	cacheManager: CacheManager,
+	cacheKey: string,
+	cwd: string,
+	startRow: { data: { success: boolean } } | null,
+): Promise<{ result: R; row: { data: { success: boolean } } | null }> {
+	return scan.then((result) =>
+		result.success || startRow?.data.success === true
+			? { result, row: startRow }
+			: cacheManager
+					.readCacheAsync<{ success: boolean }>(cacheKey, cwd)
+					.then((row) => ({ result, row })),
+	);
+}
+
+/** One finished scan and what it is compared with, for the dead-code delta. */
+interface DeadCodeDeltaSource {
+	result: DeadCodeResult;
+	previousScan: DeadCodeResult | undefined;
+	/** Resolved paths of the files whose new findings are attributable to the agent. */
+	modified: ReadonlySet<string>;
+}
+
+function lateDeadCodeScanKey(client: DeadCodeClient, cwd: string): string {
+	return `${client.id}\0${cwd}`;
+}
+
+/** The one `dead-code.log` event a cross-file scan produces, inline or late. */
+function deadCodeScanEvent(
+	client: DeadCodeClient,
+	cwd: string,
+	result: DeadCodeResult,
+	durationMs: number,
+): Parameters<typeof logDeadCodeScan>[0] {
+	return {
+		language: client.language,
+		root: cwd,
+		success: result.success,
+		cached: false,
+		unusedExports: result.unusedExports.length,
+		unusedFiles: result.unusedFiles.length,
+		unusedDeps: result.unusedDeps.length,
+		unlistedDeps: result.unlistedDeps.length,
+		durationMs: result.durationMs ?? durationMs,
+		...(result.excludedWorktrees !== undefined && {
+			excludedWorktrees: result.excludedWorktrees,
+		}),
+		...(!result.success && { reason: result.summary }),
+	};
+}
+
+/** Remove a late scan that will not be used, and count why. */
+function dropLateDeadCodeScan(
+	scans: Map<string, LateDeadCodeScan>,
+	key: string,
+	client: DeadCodeClient,
+	reason: string,
+): void {
+	scans.delete(key);
+	incrementDegradationCount({
+		kind: "dead-code-late-scan-dropped",
+		subject: client.id,
+		reason,
+	});
+}
+
+/**
+ * Keep a dead-code scan that missed the turn_end budget (#4117 F1), or one
+ * that joined a scan older than this turn's edits (#4154 J1). Where it settles
+ * it writes the baseline row (a failure never replaces the good row on disk
+ * then, #925, #4154 V1) and its `dead-code.log` event, and a successful result
+ * waits in the entry for the next turn_end of the same session that reaches
+ * the lane. A result for a session that has ended is dropped and counted.
+ */
+function parkLateDeadCodeScan(args: {
+	scope: SessionScope;
+	cacheManager: CacheManager;
+	client: DeadCodeClient;
+	cwd: string;
+	cacheKey: string;
+	scan: Promise<DeadCodeResult>;
+	startedAt: number;
+	files: ReadonlySet<string>;
+	previousScan: DeadCodeResult | undefined;
+}): void {
+	const { scope, cacheManager, client, cwd, cacheKey, startedAt } = args;
+	const scans = lateDeadCodeScansOf(scope);
+	const key = lateDeadCodeScanKey(client, cwd);
+	const entry: LateDeadCodeScan = {
+		files: args.files,
+		previousScan: args.previousScan,
+		carry: new Set(),
+		settled: null,
+		askedAt: startedAt,
+	};
+	scans.set(key, entry);
+	void withRowForFailureWrite(
+		args.scan,
+		cacheManager,
+		cacheKey,
+		cwd,
+		entry.previousScan ? { data: entry.previousScan } : null,
+	).then(
+		({ result, row }) => {
+			if (!scope.isLive()) {
+				dropLateDeadCodeScan(scans, key, client, "session-ended");
+				return;
+			}
+			const durationMs = Date.now() - startedAt;
+			const cacheKept = wouldPoisonCache(row, result);
+			if (!cacheKept) {
+				cacheManager.writeCache(cacheKey, result, cwd, {
+					scanDurationMs: durationMs,
+				});
+			}
+			logDeadCodeScan({
+				...deadCodeScanEvent(client, cwd, result, durationMs),
+				...(cacheKept && { cacheKept }),
+			});
+			if (!result.success) {
+				dropLateDeadCodeScan(
+					scans,
+					key,
+					client,
+					`scan-failed: ${result.summary}`,
+				);
+				return;
+			}
+			entry.settled = result;
+		},
+		(err: unknown) =>
+			dropLateDeadCodeScan(scans, key, client, `scan-threw: ${err}`),
+	);
 }
 
 // LSP idle reset scheduling — prevents thrashing by delaying shutdown
@@ -797,7 +1019,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			);
 			return;
 		}
-		cacheManager.clearTurnState(cwd, currentOwner);
+		cacheManager.clearTurnState(
+			cwd,
+			currentOwner,
+			isSecondarySession ? sessionId : undefined,
+		);
 	};
 
 	// #449 slice 1: piggyback the instance-registry heartbeat on this existing
@@ -819,7 +1045,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	});
 
 	const cwd = ctxCwd ?? process.cwd();
-	let turnState = cacheManager.readTurnState(cwd);
+	const isSecondarySession = deps.sessionScope?.role === "secondary";
+	const sessionRole = isSecondarySession ? "secondary" : "primary";
+	const allowProjectWideFindings = admitsProjectWideFindings(sessionRole);
+	// Only a positively classified secondary gets an id-scoped durable
+	// partition; ordinary primary callers read the legacy top-level envelope.
+	const turnStateSessionId = isSecondarySession ? sessionId : undefined;
+	let turnState = cacheManager.readTurnState(cwd, turnStateSessionId);
 
 	// A live foreign writer owns this worklist. Do not clear or consume another
 	// pi/MCP session's files; a dead/aged owner is safely evicted instead.
@@ -829,13 +1061,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	const currentOwner: TurnStateOwner = {
 		...(owner ?? {
 			kind: "pi",
-			id: runtime.telemetrySessionId,
+			id: sessionId ?? runtime.telemetrySessionId,
 			pid: process.pid,
 			lastSeen: new Date().toISOString(),
 		}),
 		sessionStartedAt: owner?.sessionStartedAt ?? runtime.sessionStartedAt,
 	};
-	const access = cacheManager.getTurnStateAccess(cwd, currentOwner);
+	const access = isSecondarySession
+		? "owned"
+		: cacheManager.getTurnStateAccess(cwd, currentOwner);
 	// Captured BEFORE the eviction below rewrites the file: the owner the gate
 	// actually judged. This pair is what would have settled #2504 from the
 	// debug log alone.
@@ -862,10 +1096,16 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	) {
 		dbg("turn_end: evicting stale turn-state owner");
 		clearOwnedTurnState();
-		turnState = cacheManager.readTurnState(cwd);
+		turnState = cacheManager.readTurnState(cwd, turnStateSessionId);
 	}
 
-	const files = Object.keys(turnState.files);
+	const ownFiles = Object.keys(turnState.files);
+	// A read-only secondary may still render project-wide scanner results cached
+	// for the primary, but it never adopts those paths as its worklist: any
+	// turn-end write/clear remains keyed to the secondary partition.
+	// A secondary with no partition has no turn work. It must not borrow the
+	// legacy primary list merely because both activations share a project.
+	const files = ownFiles;
 
 	/**
 	 * #2275: widget-footer sibling of #1950's inline-blocker cap, for the
@@ -924,7 +1164,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// the ordinary freshness gate and delivery cache can run. Max-cycle cleanup
 	// below intentionally remains a terminal reset; its pending work stays in
 	// the bounded handoff store for the next eligible turn.
-	if (files.length === 0 && !runtime.hasCascadeRuns()) {
+	if (files.length === 0 && !runtime.hasCascadeRuns() && !isSecondarySession) {
 		// A genuinely clean session must invalidate the persisted guard record.
 		// Blocker records are retained only while the runtime still reports one.
 		if (getFlag("lens-guard") && !runtime.gitGuardHasBlockers) {
@@ -992,7 +1232,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		`turn_end: ${files.length} file(s) modified, cycles: ${turnState.turnCycles}/${turnState.maxCycles}, access: ${access}, owner: ${gateOwnerLabel}`,
 	);
 
-	if (cacheManager.isMaxCyclesExceeded(cwd)) {
+	if (cacheManager.isMaxCyclesExceeded(cwd, turnStateSessionId)) {
 		dbg("turn_end: max cycles exceeded, clearing state and forcing through");
 		clearOwnedTurnState();
 		runtime.fixedThisTurn.clear();
@@ -1011,8 +1251,275 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	 */
 	const staleSecretParts: string[] = [];
 	const advisoryParts: string[] = [];
+	/**
+	 * #3813: one-shot state a producer consumes for a part of this message,
+	 * held until the cap has said what the message kept (see
+	 * `clients/turn-end/delivery-holds.ts`). It folds in #1950 fix-round F1's
+	 * deferred dependency-drift commits: that dedupe silences a turn whose
+	 * rendered content is byte-identical to the last one delivered, so a
+	 * counter must not advance for it (`skipOnSuppressed`).
+	 */
+	const deliveryHolds: DeliveryHold[] = [];
+	/**
+	 * #4161/#4168: identity follows the store's owner, each taken here, at
+	 * entry. `turnScope` is the activation's scope (the coordinator's for the
+	 * primary and on the MCP route, its own for a concurrent secondary): it
+	 * owns the late dead-code scan cell (#4154). `holdScope` is the
+	 * coordinator's scope: it owns the hold stores (the cascade runs and
+	 * parked computes, the park map, and the module-level late-auxiliary and
+	 * runner stores), which a concurrent secondary shares with the primary
+	 * (#3613). A session replaced mid-turn owns none of the held state any
+	 * more, and that is judged at every access, not here: the hold stores are
+	 * drained after awaits that a replacement can land in, so a drain or a
+	 * write-back runs through `holdScope.guardedWrite` and nothing is drained
+	 * once the coordinator's scope has ended (one counted
+	 * `generation-guard-stale-write` row per store or lane). A secondary's own
+	 * end therefore fences only its cell: what it drained from the shared
+	 * stores is restored at settle for the primary, as on master (#4168 R2-F1).
+	 */
+	const turnScope = deps.sessionScope ?? runtime.sessionScope;
+	const holdScope = runtime.captureSessionGeneration();
+	/**
+	 * #3813/#3901: a parked lane belongs to the session that cut it. The park
+	 * map is the coordinator's, shared by a concurrent secondary (subagent)
+	 * activation that runs this function on the process-singleton runtime, so
+	 * its key carries the turn's own session id, the one the deferred-test list
+	 * is keyed by. A secondary neither takes nor shows the primary's parked
+	 * items; `holdScope` fences only the session's end.
+	 */
+	const carryScope = sessionId ?? runtime.telemetrySessionId;
+	const carryLane = (...parts: string[]): string =>
+		[carryScope, ...parts].join(":");
+	/** #3901/#4161: a lane's parked items, taken once, by its own session. */
+	const takeParked = <T>(lane: string): T[] =>
+		holdScope.guardedWrite(`turn-end:${lane}`, () =>
+			runtime.takeCutAdvisoryItems<T>(lane),
+		) ?? [];
+	/**
+	 * #3813/#3901: the hold for an item-bearing advisory whose producer has no
+	 * queue to restore (knip, dead-code, call-graph impact). `shown` are the
+	 * items the part names. A cut part parks the ones that were new this turn
+	 * for the lane's next run, which re-checks each against its own fresh data.
+	 * An item that is itself a re-offer (`isReOffer`) is not parked again, so
+	 * nothing rides every turn: it is counted instead, and a part showing only
+	 * re-offers cannot be held at all.
+	 */
+	const cutAdvisoryHold = <T>(
+		family: "knip" | "dead-code" | "call-graph",
+		lane: string,
+		part: string,
+		shown: readonly T[],
+		isReOffer: (item: T) => boolean,
+	): DeliveryHold => {
+		const fresh = shown.filter((item) => !isReOffer(item));
+		const recordDropped = (reason: string): void => {
+			incrementDegradationCount({
+				kind: "turn-end-advisory-carry-dropped",
+				subject: family,
+				reason,
+			});
+		};
+		return {
+			part,
+			canHold: () => fresh.length > 0,
+			onHeld: () => {
+				for (const evicted of runtime.parkCutAdvisoryItems(lane, fresh)) {
+					recordDropped(
+						`${evicted} evicted: more lanes had cut items parked than the carry bound keeps`,
+					);
+				}
+				if (fresh.length < shown.length) {
+					recordDropped(
+						"the cap cut items this lane had already re-offered once",
+					);
+				}
+			},
+			onDropped: () =>
+				recordDropped(
+					"the cap cut a part that showed only items it had already re-offered once",
+				),
+		};
+	};
 	const projectDiagnosticsDelta: ProjectDiagnostic[] = [];
 	const projectDiagnosticsSources = new Set<string>();
+
+	// Collect-later CLI runners continue off the write path. Their completed
+	// answers go through ONE freshness-then-policy verdict
+	// (`judgeDeferredRunnerFindings`, shared with the commit gate), like late
+	// auxiliary findings.
+	//
+	// #3814: this lane runs BEFORE the blocker replay below. A blocking survivor
+	// is recorded into the inline-blocker map, so the replay delivers it as the
+	// one blocker section a finding gets and the composer persists it with the
+	// turn's other blockers; the late advisory carries the non-blocking
+	// survivors only. Delivered after the replay, a finding the commit gate had
+	// recorded first reached the agent twice in one message, and the persisted
+	// record said no blockers.
+	const runnerFindingsStart = Date.now();
+	const runnerDrainSignal = deps.signal;
+	const deliverySessionId = sessionId ?? runtime.telemetrySessionId;
+	// Turn-end delivery is deliberately non-blocking. Collect already-settled
+	// results and requeue the rest; the edit path already paid the deferral
+	// decision, so another 2s wait would charge every turn while a runner is
+	// still in flight (#2122 F5).
+	const pendingRunnerFindings =
+		(await bounded(
+			drainPendingRunnerFindings(
+				0,
+				runtime.sessionScope.capture(),
+				deliverySessionId,
+			),
+			{
+				ms: HOOK_WALL_BUDGET_MS.turn_end,
+				signal: runnerDrainSignal,
+				hook: "turn_end",
+				label: "drainPendingRunnerFindings",
+			},
+		)) ?? [];
+	let runnerFindingsDelivered = 0;
+	let runnerFindingsStale = 0;
+	let runnerFindingsFailed = 0;
+	let runnerFindingsDropped = 0;
+	/** #3814: blocking survivors newly entered into the blocker map this turn end. */
+	let runnerBlockersRecorded = 0;
+	/** #4484 r2: recorded blockers a settled run of their runner retired. */
+	let runnerBlockersRetired = 0;
+	/** #3248: bounded per-turn on this lane's own row, never per finding. */
+	let runnerFindingsDispositionSuppressed = 0;
+	const runnerFindingsDeliveredIds: string[] = [];
+	for (const pending of pendingRunnerFindings) {
+		const result = pending.result;
+		if (!result) continue;
+		recordRunner(
+			pending.filePath,
+			pending.runnerId,
+			result.status,
+			result.diagnostics.length,
+			Date.now() - pending.markedAtMs,
+			pending.writeIndex,
+		);
+		// #3796: a runner whose findings fail its check reports `failed` with
+		// `blocking_diagnostics`; that goes through the freshness gate and
+		// delivery like a success. Any other failed result (a fault kind, or
+		// none) is a broken runner, whatever it carries: the note is kept and
+		// any partial findings still deliver. `hasUsableResult` owns the rule.
+		if (result.status === "failed" && !hasUsableResult(result)) {
+			runnerFindingsFailed += 1;
+			const detail = result.failureMessage ? `: ${result.failureMessage}` : "";
+			const failedNote = `❌ Deferred runner ${pending.runnerId} failed (${result.failureKind ?? "unknown"})${detail}`;
+			// #3813: the drain above removed this settled entry for good. If the
+			// cap cuts the note, hand back the failure alone (the findings, if
+			// any, are judged on their own part below).
+			deliveryHolds.push({
+				part: failedNote,
+				onHeld: () =>
+					requeueRunnerFindings({
+						...pending,
+						result: { ...result, diagnostics: [] },
+					}),
+			});
+			// @delivery-surface: runtime-turn:late-runner-findings
+			advisoryParts.push(failedNote);
+		}
+		// The survivors are what the agent READS, so they take the same policy
+		// stack the late-AUXILIARY drain below applies (#3248). The verdict runs
+		// the freshness gate first, then the policy against the file's CURRENT
+		// bytes; an unreadable file fails open inside it.
+		const verdict = judgeDeferredRunnerFindings(pending, cwd);
+		runnerFindingsStale += verdict.stale;
+		if (verdict.stale > 0) {
+			// The runner answered for bytes older than the latest edit. Do not
+			// re-arm this completed answer: only a new runner query can restore
+			// coverage for the refreshed bytes.
+			dropStaleRunnerFindings(pending);
+			runnerFindingsDropped += 1;
+		}
+		// #4484 r2: a settled run of a recorded blocker's own runner that no
+		// longer observes it retires it, before the replay below reads the map.
+		runnerBlockersRetired += retireSettledRunnerBlockers(
+			runtime,
+			pending,
+			verdict,
+		);
+		if (verdict.live === 0) continue;
+		const displayPath = toRunnerDisplayPath(cwd, pending.filePath);
+		const runnerKept = verdict.kept;
+		runnerFindingsDispositionSuppressed += verdict.suppressed;
+		if (runnerKept.length === 0) {
+			// Every late finding was marked. A PUSH surface stays silent rather
+			// than re-announcing that the mark is working; the count rides this
+			// lane's bounded per-turn row below.
+			continue;
+		}
+		runnerFindingsDelivered += runnerKept.length;
+		// #3814: the blocking survivors enter the blocker map (the commit gate's
+		// latch, the replay below, a later write to the file clears them). The
+		// commit gate may have recorded them already (a replay records 0).
+		runnerBlockersRecorded += recordDeferredRunnerBlockers(
+			runtime,
+			pending,
+			runnerKept,
+			verdict.bytes,
+		);
+		for (const finding of runnerKept) {
+			if (runnerFindingsDeliveredIds.length < 50) {
+				runnerFindingsDeliveredIds.push(finding.id);
+			}
+		}
+		// The replay delivers the blocking survivors; the advisory carries the rest.
+		const advisoryKept = runnerKept.flatMap((finding) =>
+			finding.semantic === "blocking" ? [] : [finding],
+		);
+		if (advisoryKept.length === 0) continue;
+		const lines = advisoryKept.map(
+			(finding) =>
+				`  ${displayPath}:${finding.line ?? 1}:${finding.column ?? 1} [${finding.rule ?? finding.id}] ${finding.message}`,
+		);
+		// #1616 suppressed-bucket rule: a delivery that still has something to
+		// say states what it dropped, once per delivery.
+		const runnerSuppressedNote =
+			verdict.suppressed > 0
+				? `; suppressed by disposition: ${verdict.suppressed} finding(s)`
+				: "";
+		const lateRunnerPart = `⏱️ Late runner diagnostics (${pending.runnerId} completed after the edit${runnerSuppressedNote}):\n${lines.join("\n")}`;
+		// #3813: the drain above removed this settled entry for good. If the cap
+		// cuts this part, hand back only the NON-blocking half this advisory
+		// carried; the blocking survivors live in the blocker map (#3814), which
+		// the replay persists for the next turn.
+		const {
+			failureKind: _kind,
+			failureMessage: _message,
+			...findingsOnly
+		} = result;
+		deliveryHolds.push({
+			part: lateRunnerPart,
+			onHeld: () =>
+				requeueRunnerFindings({
+					...pending,
+					result: findingsResult(advisoryKept, findingsOnly),
+				}),
+		});
+		// @delivery-surface: runtime-turn:late-runner-findings
+		advisoryParts.push(lateRunnerPart);
+	}
+	logLatency({
+		type: "phase",
+		toolName: "turn_end",
+		filePath: cwd,
+		phase: "late_runner_findings",
+		durationMs: Date.now() - runnerFindingsStart,
+		metadata: {
+			pending: pendingRunnerFindings.length,
+			delivered: runnerFindingsDelivered,
+			stale: runnerFindingsStale,
+			failed: runnerFindingsFailed,
+			dropped: runnerFindingsDropped,
+			blockersRecorded: runnerBlockersRecorded,
+			blockersRetired: runnerBlockersRetired,
+			dispositionSuppressed: runnerFindingsDispositionSuppressed,
+			deliveredIds: runnerFindingsDeliveredIds,
+		},
+	});
 
 	// #1641: past-EOF gate. Runs BEFORE the dependency-drift sweep below — a
 	// cheap statSync per cited file is worth paying first so the pricier
@@ -1039,17 +1546,6 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 
 	/** #1944/#1950: demotions retired after their delivery limit. */
 	let demotedFindingsRetired = 0;
-	/**
-	 * #3813: one-shot state a producer consumes for a part of this message,
-	 * held until the cap has said what the message kept (see
-	 * `clients/turn-end/delivery-holds.ts`). It folds in #1950 fix-round F1's
-	 * deferred dependency-drift commits: that dedupe silences a turn whose
-	 * rendered content is byte-identical to the last one delivered, so a
-	 * counter must not advance for it (`skipOnSuppressed`).
-	 */
-	const deliveryHolds: DeliveryHold[] = [];
-	/** A session replaced mid-turn owns none of the held state any more. */
-	const holdGeneration = runtime.sessionGeneration;
 	/**
 	 * The two inline-blocker commits a hold runs once its advisory reached the
 	 * message. The past-EOF retire is #1944's "after this ONE delivery"; the
@@ -1264,11 +1760,23 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// concurrently off the write hot path; wait a bounded time for them here so
 	// their runs are available to the merge below. A compute still in flight at
 	// the cap is carried over to the next turn_end (never dropped).
+	// #4161: the settle takes the parked computes at the call and writes them
+	// back after its own await; `generation` fences both ends to this turn's
+	// session.
 	const cascadeSettleStart = Date.now();
-	const { settled, timedOut } = await runtime.settleCascadeRuns(
-		cascadeSettleWaitMs(),
-		{ trackTurnEndClock: true },
-	);
+	const cascadeSettleSignal = deps.signal;
+	const { settled, timedOut } = (await bounded(
+		runtime.settleCascadeRuns(cascadeSettleWaitMs(), {
+			trackTurnEndClock: true,
+			generation: holdScope,
+		}),
+		{
+			ms: HOOK_WALL_BUDGET_MS.turn_end,
+			signal: cascadeSettleSignal,
+			hook: "turn_end",
+			label: "settleCascadeRuns",
+		},
+	)) ?? { settled: 0, timedOut: 0 };
 	logLatency({
 		type: "phase",
 		toolName: "turn_end",
@@ -1277,6 +1785,12 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		durationMs: Date.now() - cascadeSettleStart,
 		metadata: { settled, timedOut },
 	});
+	// #4485: one read of the silent-push touches the computes left unanswered,
+	// now that they have settled. An answer that landed meanwhile appends its
+	// run through the reconcile wiring in time for the consume below; silence
+	// stays for the quiet window. Synchronous, and only reads clients the
+	// touches already hold.
+	peekOutstandingCascadeTouches(holdScope);
 
 	// Merge accumulated cascade results from all pipeline runs this turn.
 	// Two-pass dedup:
@@ -1284,7 +1798,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	//   2. Neighbor-level: each neighbor is claimed by the latest cascade result
 	//      that covers it — suppresses stale neighbor state from earlier writes.
 	const t0 = Date.now();
-	const cascadeRuns = runtime.consumeCascadeRuns().filter((run) => {
+	const cascadeRuns = (
+		holdScope.guardedWrite("turn-end:cascade-runs", () =>
+			runtime.consumeCascadeRuns(),
+		) ?? []
+	).filter((run) => {
 		const originSeq = run.origin?.projectSeq;
 		const originTurn = run.origin?.turnSeq;
 		// A deferred result from AFTER a later write is not current state. Old test
@@ -1390,20 +1908,52 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// per-file cause is claimed), so one label suffices; the edited file and cwd
 	// stay as fallbacks.
 	const cascadeLogFilePath = cascadeResults[0]?.filePath ?? files[0] ?? cwd;
+	// #4487: the turn the pending record labels and records against.
+	const cascadeTurn = runtime.turnIndex;
+	// #4487: an edited file's own dispatch reports its errors (with #4484,
+	// the ones still observed as well as the new ones); the cascade record
+	// keeps none for it.
+	const editedKeys = new Set<string>();
+	for (const file of files) {
+		const absolute = path.resolve(cwd, file);
+		editedKeys.add(normalizeMapKey(absolute));
+		forgetCascadePendingNeighbor(absolute);
+	}
+	// The latest result per primary (last writer wins).
+	const seen = new Map<string, CascadeResult>();
+	for (const result of cascadeResults) {
+		seen.set(normalizeMapKey(result.filePath), result);
+	}
+	const keptResults = new Set(seen.values());
+	// #4487: the run that observed each neighbour last this turn. Iterating
+	// in reverse lets the latest claim it first. A run covers a neighbour its
+	// result lists or its `observedNeighborPaths` names, so a later clean run
+	// (which has no result) supersedes an earlier result's errors too. Each
+	// neighbour then renders at most once per turn, from its last observer.
+	const lastObserver = new Map<string, { run: CascadeRun; filePath: string }>();
+	for (const run of [...cascadeRuns].reverse()) {
+		if (run.result && !keptResults.has(run.result)) continue;
+		for (const neighborPath of [
+			...(run.result?.neighbors ?? []).map((n) => n.filePath),
+			...(run.observedNeighborPaths ?? []),
+		]) {
+			const nk = normalizeMapKey(neighborPath);
+			if (!lastObserver.has(nk))
+				lastObserver.set(nk, { run, filePath: neighborPath });
+		}
+	}
+	// #4487: a fresh clean observation clears the neighbour's pending errors
+	// at once; errors are recorded only when the section showing them is
+	// delivered (the cascade section's hold below).
+	for (const [nk, { run, filePath }] of lastObserver) {
+		const observedClean =
+			run.observedNeighborPaths?.some((p) => normalizeMapKey(p) === nk) &&
+			!run.result?.neighbors.some(
+				(n) => normalizeMapKey(n.filePath) === nk && n.diagnostics.length > 0,
+			);
+		if (observedClean) forgetCascadePendingNeighbor(filePath);
+	}
 	if (cascadeResults.length > 0) {
-		const seen = new Map<string, (typeof cascadeResults)[number]>();
-		for (const result of cascadeResults) {
-			seen.set(normalizeMapKey(result.filePath), result);
-		}
-		// Iterate in reverse so the latest result claims each neighbor first.
-		const neighborOwner = new Map<string, string>();
-		for (const result of [...seen.values()].reverse()) {
-			const pk = normalizeMapKey(result.filePath);
-			for (const n of result.neighbors) {
-				const nk = normalizeMapKey(n.filePath);
-				if (!neighborOwner.has(nk)) neighborOwner.set(nk, pk);
-			}
-		}
 		const parts: string[] = [];
 		const sectionRuns: Array<(typeof cascadeRuns)[number]> = [];
 		// #1446 item 1: track what actually gets injected — a suppressed result
@@ -1414,30 +1964,92 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		let injectedNeighborCount = 0;
 		let injectedDiagnosticCount = 0;
 		let suppressedByOwnership = 0;
+		// #4487: the neighbour errors this section shows, recorded as pending
+		// when it is delivered.
+		const sectionObservations: Array<{
+			filePath: string;
+			diagnostics: CascadeResult["neighbors"][number]["diagnostics"];
+			checkedAt: number | undefined;
+		}> = [];
+		// #4403 round 5 (V1): the servers whose "no language server answered"
+		// line this section shows. They are marked delivered only when the
+		// section reaches the agent (the delivery hold below), so a run
+		// superseded at this turn_end, or a cut section, does not use up the
+		// line.
+		const shownUnansweredServerIds = new Set<string>();
+		// Round 6 (W2): the kept lines head the section (`renderCascadeResult`).
+		const unansweredLines: string[] = [];
 		for (const result of seen.values()) {
-			const pk = normalizeMapKey(result.filePath);
-			const ownsAny = result.neighbors.some(
-				(n) => neighborOwner.get(normalizeMapKey(n.filePath)) === pk,
+			const ownedNeighbors = result.neighbors.filter(
+				(n) =>
+					lastObserver.get(normalizeMapKey(n.filePath))?.run.result === result,
 			);
-			if (ownsAny && result.formatted) {
-				// Fix B (#3167/#3168): a carried run's re-rendered blocker is labeled
-				// so the agent can tell it from a fresh observation — with the
-				// run's own observation age (#3168 F3).
-				const carryMeta = carriedMetaByResult.get(result);
-				const carrySuffix = cascadeCarrySuffix(
-					carryMeta?.carriedTurns,
-					carryMeta?.observedAt,
+			const ownsAny = ownedNeighbors.length > 0;
+			let rendered =
+				ownsAny && result.formatted
+					? renderCascadeResult(result, shownUnansweredServerIds)
+					: undefined;
+			// #4487: render again from the result's layout when it no longer owns
+			// every neighbour (a later observer shows the rest), or when an error
+			// it shows was first delivered on an earlier turn.
+			const layout = result.layout;
+			if (rendered && layout) {
+				const since = (
+					n: CascadeResult["neighbors"][number],
+					d: CascadeResult["neighbors"][number]["diagnostics"][number],
+				) => cascadeStillPresentSince(n.filePath, d, cascadeTurn);
+				const relabel = ownedNeighbors.some((n) =>
+					n.diagnostics.some((d) => since(n, d) !== undefined),
 				);
-				parts.push(
-					carrySuffix
-						? `${result.formatted}\n${carrySuffix}`
-						: result.formatted,
-				);
-				if (carrySuffix) carriedRunsRendered += 1;
+				if (relabel || ownedNeighbors.length < result.neighbors.length) {
+					// @delivery-surface: runtime-turn:cascade-blocker
+					const block = formatCascadeNeighborDiagnostics(
+						layout.cwd,
+						ownedNeighbors,
+						{
+							noun: layout.noun,
+							includeReason: layout.includeReason,
+							stillPresentSince: since,
+						},
+					);
+					rendered = {
+						...rendered,
+						text: composeCascadeSection(block, layout),
+					};
+				}
+			}
+			if (rendered && (rendered.text || rendered.lines.length > 0)) {
+				unansweredLines.push(...rendered.lines);
+				if (rendered.text) {
+					// Fix B (#3167/#3168): a carried run's re-rendered blocker is
+					// labeled so the agent can tell it from a fresh observation —
+					// with the run's own observation age (#3168 F3).
+					const carryMeta = carriedMetaByResult.get(result);
+					const carrySuffix = cascadeCarrySuffix(
+						carryMeta?.carriedTurns,
+						carryMeta?.observedAt,
+					);
+					parts.push(
+						carrySuffix ? `${rendered.text}\n${carrySuffix}` : rendered.text,
+					);
+					if (carrySuffix) carriedRunsRendered += 1;
+				}
 				const sectionRun = runByResult.get(result);
 				if (sectionRun) sectionRuns.push(sectionRun);
-				injectedNeighborCount += result.neighbors.length;
-				injectedDiagnosticCount += result.neighbors.reduce(
+				for (const n of ownedNeighbors) {
+					if (n.diagnostics.length === 0) continue;
+					// #4495 round 3: a neighbour pi edited this turn is reported by
+					// its own dispatch; the record keeps nothing for it, even when a
+					// run read it before the edit.
+					if (editedKeys.has(normalizeMapKey(n.filePath))) continue;
+					sectionObservations.push({
+						filePath: n.filePath,
+						diagnostics: n.diagnostics,
+						checkedAt: sectionRun?.checkedAt,
+					});
+				}
+				injectedNeighborCount += ownedNeighbors.length;
+				injectedDiagnosticCount += ownedNeighbors.reduce(
 					(s, n) => s + n.diagnostics.length,
 					0,
 				);
@@ -1492,12 +2104,31 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				parts.push(testSection);
 			}
 		}
+		if (unansweredLines.length > 0) parts.unshift(unansweredLines.join("\n"));
 		if (parts.length > 0) {
 			const section = parts.join("\n\n");
 			// @delivery-surface: runtime-turn:cascade-blocker
 			blockerParts.push(section);
+			const shownServerIds = [...shownUnansweredServerIds];
 			deliveryHolds.push({
 				part: section,
+				onDelivered: () => {
+					markCascadeUnansweredPrimariesDelivered(shownServerIds);
+					// #4487: peek-then-commit. What the agent was shown is pending
+					// until a fresh observation clears it. #4495 round 3: stamped
+					// with the run's read bound, never the delivery time, which
+					// would postdate a write landing between the read and now. A
+					// run with no read bound records 0, so it never passes the
+					// freshness gate as unchanged.
+					for (const o of sectionObservations) {
+						recordDeliveredCascadeNeighbor(
+							o.filePath,
+							o.diagnostics,
+							cascadeTurn,
+							o.checkedAt ?? 0,
+						);
+					}
+				},
 				onHeld: () => {
 					for (const run of sectionRuns) runtime.appendCascadeRun(run);
 				},
@@ -1538,6 +2169,182 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			},
 		});
 	}
+	// #4487: pending neighbour errors no run observed this turn. A
+	// neighbour error the agent was shown stays pending until a fresh
+	// observation lacks it; a turn whose cascade did not cover the neighbour
+	// says so in one line per neighbour instead of going silent (which reads
+	// as resolved). Blocker tier, like the section the errors came from;
+	// derived from the record each turn, so a cut line needs no hold. Only
+	// turns that reach this merge render it (a read-only turn with no runs
+	// returns earlier).
+	const pendingCandidates = listCascadePendingNeighbors().filter((entry) => {
+		const key = normalizeMapKey(entry.filePath);
+		if (lastObserver.has(key) || editedKeys.has(key)) return false;
+		return isUnderDir(entry.filePath, cwd);
+	});
+	// #4495 (review F1, round 3): each entry is a claim about the file's
+	// content at `checkedAt`, the earliest moment it could have been read. The
+	// shared freshness gate judges it against the file: gone (`dropped`), the
+	// claim is moot and is forgotten silently; written after `checkedAt` by
+	// something pi never saw (`stale`: git checkout, an external editor or
+	// formatter), pi cannot tell a fix from a touch without a re-check, so the
+	// line says once that it changed and was not re-checked, and the entry is
+	// forgotten when that line is delivered; otherwise (`live`) the errors
+	// stay unresolved. Quiet: the gate's own rows name a demotion, and this
+	// store drops or announces, so it writes `cascade_pending_gated` instead.
+	// An unreadable path fails open (live); the stat budget equals the
+	// record's cap, so it cannot be spent here.
+	const { "cascade-pending-neighbors": pendingGate } =
+		gateFindingsByPathFreshness({
+			cwd,
+			quiet: true,
+			sources: {
+				"cascade-pending-neighbors": {
+					findings: pendingCandidates,
+					citedPath: (entry) => entry.filePath,
+					scannedAtOf: (entry) => entry.checkedAt,
+				},
+			},
+		});
+	const unresolvedNeighbors = pendingGate.live;
+	const changedNeighbors = pendingGate.stale;
+	const gateKept = new Set([...unresolvedNeighbors, ...changedNeighbors]);
+	const deletedNeighbors: typeof pendingCandidates = [];
+	for (const entry of pendingCandidates) {
+		if (gateKept.has(entry)) continue;
+		deletedNeighbors.push(entry);
+		forgetCascadePendingNeighbor(entry.filePath);
+	}
+	const maxShown = RUNTIME_CONFIG.pipeline.cascadeMaxFiles;
+	const pendingAge = (checkedAt: number) =>
+		formatCacheAgeLabel(checkedAt > 0 ? checkedAt : undefined);
+	const pendingBlocks: string[] = [];
+	let unresolvedShown = 0;
+	if (unresolvedNeighbors.length > 0) {
+		const lines = unresolvedNeighbors
+			.slice(-maxShown)
+			.reverse()
+			.map(
+				(entry) =>
+					`  • ${toRunnerDisplayPath(cwd, entry.filePath)}: ${entry.errorCount} error(s) unresolved (${pendingAge(entry.checkedAt)})`,
+			);
+		unresolvedShown = lines.length;
+		const more = unresolvedNeighbors.length - lines.length;
+		if (more > 0) lines.push(`  ... and ${more} more neighbor file(s)`);
+		pendingBlocks.push(
+			`📐 Cascade errors from an earlier turn, not re-checked this turn — still unresolved until a cascade or an edit shows them gone:\n${lines.join("\n")}`,
+		);
+	}
+	// Only the named entries are forgotten on delivery; the rest stay changed
+	// and are named on a later turn.
+	const changedShown = changedNeighbors.slice(-maxShown).reverse();
+	if (changedShown.length > 0) {
+		const lines = changedShown.map(
+			(entry) =>
+				`  • ${toRunnerDisplayPath(cwd, entry.filePath)}: ${entry.errorCount} error(s) changed since checked (${pendingAge(entry.checkedAt)}), not re-checked`,
+		);
+		const more = changedNeighbors.length - changedShown.length;
+		if (more > 0) lines.push(`  ... and ${more} more neighbor file(s)`);
+		pendingBlocks.push(
+			`📐 Cascade errors from an earlier turn whose file changed outside pi since they were checked — not re-checked, named this once:\n${lines.join("\n")}`,
+		);
+	}
+	if (pendingBlocks.length > 0) {
+		const pendingSection = pendingBlocks.join("\n");
+		// @delivery-surface: runtime-turn:cascade-pending-errors
+		blockerParts.push(pendingSection);
+		if (changedShown.length > 0) {
+			// Peek-then-commit: a cut line keeps its entries for the next turn.
+			deliveryHolds.push({
+				part: pendingSection,
+				onDelivered: () => {
+					for (const entry of changedShown) {
+						forgetCascadePendingNeighbor(entry.filePath);
+					}
+				},
+			});
+		}
+		logCascade({
+			phase: "cascade_pending_rendered",
+			filePath: cascadeLogFilePath,
+			metadata: {
+				neighbors: unresolvedNeighbors.length,
+				shown: unresolvedShown,
+				changed: changedShown.length,
+			},
+		});
+	}
+	if (changedNeighbors.length + deletedNeighbors.length > 0) {
+		logCascade({
+			phase: "cascade_pending_gated",
+			filePath: cascadeLogFilePath,
+			metadata: {
+				changed: changedNeighbors.length,
+				deleted: deletedNeighbors.length,
+				changedPaths: changedNeighbors.slice(0, 10).map((e) => e.filePath),
+				deletedPaths: deletedNeighbors.slice(0, 10).map((e) => e.filePath),
+			},
+		});
+	}
+
+	// Fix B (#3167/#3168 F4): a coverage advisory computed from a CARRIED
+	// indeterminate run describes the previous turn's evidence — label it so
+	// the absence-of-coverage statement is not read as current. A MIXED
+	// bucket (some carried, some fresh) is left UNLABELED: a Math.max
+	// suffix on the finished multi-line advisory would attach the carry to
+	// a file that was not carried.
+	const withCarryLabel = (
+		advisory: string | undefined,
+		runs: ReadonlyArray<{ carriedTurns?: number; observedAt?: number }>,
+	): string | undefined => {
+		if (advisory === undefined) return undefined;
+		const carried = runs.filter((r) => (r.carriedTurns ?? 0) > 0);
+		if (carried.length === 0 || carried.length !== runs.length) {
+			return advisory;
+		}
+		// #3168 F13: the bucket's age is the OLDEST carried observation, and
+		// only when EVERY carried run carries one. A `Math.min` sentinel
+		// (`?? Number.MAX_SAFE_INTEGER`) silently ignored the unstamped runs
+		// and stated a confident age for a bucket that contains an unaged
+		// one; one missing stamp collapses the age half to the helper's
+		// neutral "scan age unknown" wording instead.
+		const stamps = carried.map((r) => r.observedAt);
+		const observedAt = stamps.every((s): s is number => s !== undefined)
+			? Math.min(...stamps)
+			: undefined;
+		const suffix = cascadeCarrySuffix(carried[0]?.carriedTurns, observedAt);
+		if (!suffix) return advisory;
+		labeledAdvisories += 1;
+		// #3168 F11: newline, as the blocker path does above. A space join
+		// welded the suffix onto the LAST bullet of a multi-bullet advisory,
+		// so the carry label read as a property of that one file.
+		return `${advisory}\n${suffix}`;
+	};
+	// #3813: drain-then-restore. A cut coverage advisory hands its runs back
+	// for the next turn WITHOUT their results (the section rides ahead of every
+	// advisory and may have been delivered) and without what the other
+	// advisories and the pending record read from them (#4485/#4487), so one
+	// cut advisory does not bring back another.
+	const holdAdvisory = (
+		advisory: string | undefined,
+		runs: readonly CascadeRun[],
+		keep: "indeterminate" | "unconfirmed",
+	): void => {
+		if (advisory === undefined) return;
+		deliveryHolds.push({
+			part: advisory,
+			onHeld: () => {
+				for (const run of runs) {
+					const restored: CascadeRun = { ...run, result: undefined };
+					delete restored.observedNeighborPaths;
+					if (keep !== "indeterminate") delete restored.indeterminate;
+					if (keep !== "unconfirmed") delete restored.unconfirmed;
+					runtime.appendCascadeRun(restored);
+				}
+			},
+		});
+	};
+
 	// #1023: surface an HONEST note whenever a cascade run could not compute
 	// downstream impact (degraded/over-cap graph, missing node, a thrown compute,
 	// or a deliberately budget-truncated neighbor set) — never a silent all-clear
@@ -1620,52 +2427,6 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		// "ℹ️ Advisory — no action required this turn:" label, so an imperative
 		// ("review dependents manually") would contradict it. The #533 substance
 		// stays: a clean cascade result does NOT cover these files' dependents.
-		// Fix B (#3167/#3168 F4): a coverage advisory computed from a CARRIED
-		// indeterminate run describes the previous turn's evidence — label it so
-		// the absence-of-coverage statement is not read as current. A MIXED
-		// bucket (some carried, some fresh) is left UNLABELED: a Math.max
-		// suffix on the finished multi-line advisory would attach the carry to
-		// a file that was not carried.
-		const withCarryLabel = (
-			advisory: string | undefined,
-			runs: ReadonlyArray<{ carriedTurns?: number; observedAt?: number }>,
-		): string | undefined => {
-			if (advisory === undefined) return undefined;
-			const carried = runs.filter((r) => (r.carriedTurns ?? 0) > 0);
-			if (carried.length === 0 || carried.length !== runs.length) {
-				return advisory;
-			}
-			// #3168 F13: the bucket's age is the OLDEST carried observation, and
-			// only when EVERY carried run carries one. A `Math.min` sentinel
-			// (`?? Number.MAX_SAFE_INTEGER`) silently ignored the unstamped runs
-			// and stated a confident age for a bucket that contains an unaged
-			// one; one missing stamp collapses the age half to the helper's
-			// neutral "scan age unknown" wording instead.
-			const stamps = carried.map((r) => r.observedAt);
-			const observedAt = stamps.every((s): s is number => s !== undefined)
-				? Math.min(...stamps)
-				: undefined;
-			const suffix = cascadeCarrySuffix(carried[0]?.carriedTurns, observedAt);
-			if (!suffix) return advisory;
-			labeledAdvisories += 1;
-			// #3168 F11: newline, as the blocker path does above. A space join
-			// welded the suffix onto the LAST bullet of a multi-bullet advisory,
-			// so the carry label read as a property of that one file.
-			return `${advisory}\n${suffix}`;
-		};
-		const holdAdvisory = (
-			advisory: string | undefined,
-			runs: typeof indeterminateRuns,
-		): void => {
-			if (advisory === undefined) return;
-			deliveryHolds.push({
-				part: advisory,
-				onHeld: () => {
-					for (const run of runs)
-						runtime.appendCascadeRun({ ...run, result: undefined });
-				},
-			});
-		};
 		const graphAdvisory = withCarryLabel(
 			buildAdvisory(graphRuns, {
 				lead: (fileCount, reasons) =>
@@ -1681,7 +2442,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		);
 		// @delivery-surface: runtime-turn:cascade-coverage-advisory
 		if (graphAdvisory) advisoryParts.push(graphAdvisory);
-		holdAdvisory(graphAdvisory, graphRuns);
+		holdAdvisory(graphAdvisory, graphRuns, "indeterminate");
 
 		const bindingAdvisory = withCarryLabel(
 			buildAdvisory(bindingRuns, {
@@ -1695,7 +2456,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		);
 		// @delivery-surface: runtime-turn:cascade-coverage-advisory
 		if (bindingAdvisory) advisoryParts.push(bindingAdvisory);
-		holdAdvisory(bindingAdvisory, bindingRuns);
+		holdAdvisory(bindingAdvisory, bindingRuns, "indeterminate");
 
 		const budgetAdvisory = withCarryLabel(
 			buildAdvisory(budgetRuns, {
@@ -1716,7 +2477,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		);
 		// @delivery-surface: runtime-turn:cascade-coverage-advisory
 		if (budgetAdvisory) advisoryParts.push(budgetAdvisory);
-		holdAdvisory(budgetAdvisory, budgetRuns);
+		holdAdvisory(budgetAdvisory, budgetRuns, "indeterminate");
 
 		const fileCount = new Set(
 			indeterminateRuns.map((r) => normalizeMapKey(r.filePath)),
@@ -1753,6 +2514,79 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				...(byFile.length > 20 && { byFileTruncated: byFile.length - 20 }),
 			},
 		});
+	}
+
+	// #4485: selected neighbours a run touched but got no answer for within
+	// its bound. One advisory line per server, aggregated over the turn's
+	// runs: a neighbour a later run observed drops out, and so does one the
+	// turn edited (its own dispatch answers for it). Advisory tier, the
+	// #1023 doctrine: an unanswered neighbour is a coverage gap, not a
+	// finding. Not repeated next turn: a late answer renders through the peek
+	// or the quiet window, silence expires with its own log row.
+	const unconfirmedRuns = cascadeRuns.filter((r) => r.unconfirmed);
+	if (unconfirmedRuns.length > 0) {
+		const runOrder = new Map(cascadeRuns.map((r, i) => [r, i]));
+		const byServer = new Map<
+			string,
+			{ waitMs: number; primaries: Set<string>; paths: Map<string, string> }
+		>();
+		for (const run of unconfirmedRuns) {
+			for (const group of run.unconfirmed?.servers ?? []) {
+				for (const neighborPath of group.paths) {
+					const nk = normalizeMapKey(neighborPath);
+					if (editedKeys.has(nk)) continue;
+					const observer = lastObserver.get(nk)?.run;
+					if (
+						observer &&
+						(runOrder.get(observer) ?? -1) > (runOrder.get(run) ?? -1)
+					)
+						continue;
+					const bucket = byServer.get(group.serverId) ?? {
+						waitMs: group.waitMs,
+						primaries: new Set<string>(),
+						paths: new Map<string, string>(),
+					};
+					bucket.waitMs = Math.max(bucket.waitMs, group.waitMs);
+					bucket.primaries.add(toRunnerDisplayPath(cwd, run.filePath));
+					bucket.paths.set(nk, toRunnerDisplayPath(cwd, neighborPath));
+					byServer.set(group.serverId, bucket);
+				}
+			}
+		}
+		const capped = (items: string[], max: number): string =>
+			items.length > max
+				? `${items.slice(0, max).join(", ")} (+${items.length - max} more)`
+				: items.join(", ");
+		const blocks: string[] = [];
+		let pathCount = 0;
+		for (const [serverId, bucket] of byServer) {
+			const paths = [...bucket.paths.values()];
+			pathCount += paths.length;
+			const within = bucket.waitMs > 0 ? ` within ${bucket.waitMs} ms` : "";
+			blocks.push(
+				`Cascade sent ${paths.length} dependent(s) of ${capped([...bucket.primaries], 3)} to ${serverId}, ` +
+					`but no answer arrived${within}; a clean cascade result does not cover them.\n` +
+					`  • ${serverId}: ${capped(paths, 5)}`,
+			);
+		}
+		if (blocks.length > 0) {
+			const pendingAdvisory = withCarryLabel(
+				blocks.join("\n"),
+				unconfirmedRuns,
+			);
+			// @delivery-surface: runtime-turn:cascade-coverage-advisory
+			if (pendingAdvisory) advisoryParts.push(pendingAdvisory);
+			holdAdvisory(pendingAdvisory, unconfirmedRuns, "unconfirmed");
+			logCascade({
+				phase: "cascade_unconfirmed_rendered",
+				filePath: cascadeLogFilePath,
+				metadata: {
+					servers: byServer.size,
+					paths: pathCount,
+					runs: unconfirmedRuns.length,
+				},
+			});
+		}
 	}
 
 	// Fix B (#3168 F6): the success-path record — see the counters above.
@@ -1798,6 +2632,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		success?: boolean;
 		totalIssues?: number;
 		newIssues?: number;
+		/** #3901: items re-offered because the cap cut them on the previous turn. */
+		reOffered?: number;
 		blockerIssues?: number;
 		/** #3248: findings dropped by a stored disposition before rendering. */
 		dispositionSuppressed?: number;
@@ -1808,7 +2644,19 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		cacheKept?: boolean;
 		/** The hook's own signal fired while the scan was awaited (Escape). */
 		aborted?: boolean;
+		/** #3872: this root's last two scans both outlasted the budget left (this is the shorter), so it was not awaited. */
+		scanFloorMs?: number;
+		/** #3872: linked worktrees nested under the root, which knip walks as project files. */
+		nestedWorktrees?: number;
+		/** #3872: files with issues dropped from the result for living in one. */
+		nestedFilesDropped?: number;
+		/** #4166: the scan joined was already running when the lane asked; its delta was delivered and the turn's files carried. */
+		joined?: boolean;
+		/** #4166: files now carried for the root's next scan. */
+		carried?: number;
 	};
+	// #4166: the entry scope, never one read after the knip await.
+	const knipCarried = knipCarriedFilesOf(turnScope);
 	// #3872: knip runs in the checkout that owns each edit. A linked worktree is
 	// its own project; the session root would walk it as a nested copy of the
 	// whole tree (live: +300 issues per worktree, a 7 s scan past a 3 s budget).
@@ -1820,15 +2668,29 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			reason: `${toRunnerDisplayPath(cwd, root)} not scanned: more than ${MAX_KNIP_ROOTS_PER_TURN} checkouts edited this turn`,
 		});
 	}
-	/** One checkout's finished scan: cache write, delta, delivery. `scanRoot === cwd` is the session checkout. */
+	/**
+	 * What a root whose last scan outlasted the budget is still given to answer:
+	 * one timer tick, which a memo hit (microtasks) beats and a real scan loses to.
+	 */
+	const KNOWN_SLOW_KNIP_GRACE_MS = 1;
+	/** Issues each knip section names; a cut section parks exactly these (#3901). */
+	const KNIP_MAX_SHOWN = 5;
+	/**
+	 * One checkout's finished scan: cache write, delta, delivery. `scanRoot ===
+	 * cwd` is the session checkout. `joined`: a successful scan that was already
+	 * running when the lane asked (#4166).
+	 */
 	const applyKnipResult = (
 		scanRoot: string,
 		prevKnip: CacheEntry<KnipResult> | null,
 		knipResult: KnipResult,
+		rowNow: { data: { success: boolean } } | null,
+		joined: boolean,
 	): KnipTurnMeta => {
 		// Never overwrite a good scan with a failure (#925, #1467): the last
-		// good result stays until a new successful scan replaces it.
-		const knipWouldPoison = wouldPoisonCache(prevKnip, knipResult);
+		// good result stays until a new successful scan replaces it. `rowNow` is
+		// the row on disk once the scan settled, not `prevKnip` (#4154 V1).
+		const knipWouldPoison = wouldPoisonCache(rowNow, knipResult);
 		if (knipWouldPoison) {
 			dbg(
 				`turn_end: keeping last good knip cache; this run failed: ${knipResult.summary}`,
@@ -1847,16 +2709,38 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			dispositionSuppressed: 0,
 			...(!knipResult.success && { reason: knipResult.summary }),
 			...(knipResult.failureKind && { failureKind: knipResult.failureKind }),
+			...(knipResult.nestedWorktrees !== undefined && {
+				nestedWorktrees: knipResult.nestedWorktrees,
+				nestedFilesDropped: knipResult.nestedFilesDropped,
+			}),
 			...(knipWouldPoison && { cacheKept: true }),
 		};
 
+		// #3901: items the cap cut on the previous turn. A scan that did not
+		// succeed leaves them parked for the next one; a successful scan takes
+		// them (offered once) and re-checks each below.
+		// One lane per part kind: both parts of one scan are cut together (the cap
+		// that cuts a blocker always cuts the advisory behind it), and a park
+		// REPLACES its lane's entry (review r1 F1).
+		const knipBlockerLane = carryLane("knip", scanRoot, "blocker");
+		const knipAdvisoryLane = carryLane("knip", scanRoot, "advisory");
+		const parkedKnip = knipResult.success
+			? [
+					...takeParked<KnipIssue>(knipBlockerLane),
+					...takeParked<KnipIssue>(knipAdvisoryLane),
+				]
+			: [];
 		if (knipResult.success && knipResult.issues.length > 0) {
 			// Deliberately excludes the line number — see stableFindingKey's
 			// doc comment (#1483: mirrors the dead-code fix in #1477).
 			const issueKey = (i: KnipIssue) =>
 				stableFindingKey(i.type, i.file, i.name, i.package);
 			const prevKeys = new Set((prevKnip?.data?.issues ?? []).map(issueKey));
-			const modifiedSet = new Set(files.map((f) => resolveRunnerPath(cwd, f)));
+			const modifiedSet = new Set(
+				[...files, ...(knipCarried.get(scanRoot) ?? [])].map((f) =>
+					resolveRunnerPath(cwd, f),
+				),
+			);
 
 			const newIssues = knipResult.issues.filter((issue) => {
 				if (prevKeys.has(issueKey(issue))) return false;
@@ -1865,6 +2749,18 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				return modifiedSet.has(abs);
 			});
 			knipMeta.newIssues = newIssues.length;
+			// #3901: a parked item is offered again only while this scan still
+			// reports it (a fixed one is not re-announced), as this scan's own
+			// record of it. It bypasses the baseline and the edited-file gate: the
+			// cut turn overwrote the one and may have retired the other.
+			const reOffered = stillReportedParked(
+				parkedKnip,
+				knipResult.issues,
+				issueKey,
+				new Set(newIssues.map(issueKey)),
+			);
+			const reOfferedKeys = new Set(reOffered.map(issueKey));
+			if (reOffered.length > 0) knipMeta.reOffered = reOffered.length;
 			if (newIssues.length > 0) {
 				projectDiagnosticsDelta.push(
 					...knipIssuesToProjectDiagnostics(scanRoot, newIssues),
@@ -1885,7 +2781,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			// `knipIssuesToProjectDiagnostics` is a straight `issues.map(...)`
 			// (one diagnostic per issue, never empty), so this keeps the pairing
 			// total while staying honest under `noUncheckedIndexedAccess`.
-			const knipPaired = newIssues.flatMap((issue) =>
+			const knipPaired = [...newIssues, ...reOffered].flatMap((issue) =>
 				knipIssuesToProjectDiagnostics(scanRoot, [issue]).map((diagnostic) => ({
 					issue,
 					diagnostic,
@@ -1916,7 +2812,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				let report =
 					"🔴 New unresolved imports/deps in modified code (Knip):\n";
 				let firstPath: string | null = null;
-				for (const issue of blockerIssues.slice(0, 5)) {
+				for (const issue of blockerIssues.slice(0, KNIP_MAX_SHOWN)) {
 					const display = displayPath(issue);
 					if (!firstPath && display !== "(unknown)") firstPath = display;
 					report += `  ${display}${issue.line ? `:${issue.line}` : ""} — ${issue.type}: ${issue.name}\n`;
@@ -1926,6 +2822,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				}
 				// @delivery-surface: runtime-turn:knip-blocker
 				blockerParts.push(report);
+				deliveryHolds.push(
+					cutAdvisoryHold(
+						"knip",
+						knipBlockerLane,
+						report,
+						blockerIssues.slice(0, KNIP_MAX_SHOWN),
+						(issue) => reOfferedKeys.has(issueKey(issue)),
+					),
+				);
 			}
 
 			// Turn-end injects only this turn's HIGH-CONFIDENCE, ATTRIBUTABLE
@@ -1942,14 +2847,36 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			if (unusedExportDelta.length > 0) {
 				let report =
 					"⚠️ Newly unused exports in files you edited — check if callers need updating (Knip):\n";
-				for (const issue of unusedExportDelta.slice(0, 5)) {
+				for (const issue of unusedExportDelta.slice(0, KNIP_MAX_SHOWN)) {
 					const display = displayPath(issue);
 					report += `  ${display}${issue.line ? `:${issue.line}` : ""} — ${issue.name}\n`;
 				}
 				// @delivery-surface: runtime-turn:knip-advisory
 				advisoryParts.push(report);
+				deliveryHolds.push(
+					cutAdvisoryHold(
+						"knip",
+						knipAdvisoryLane,
+						report,
+						unusedExportDelta.slice(0, KNIP_MAX_SHOWN),
+						(issue) => reOfferedKeys.has(issueKey(issue)),
+					),
+				);
 			}
 		}
+		// #4166 J1: a joined scan's delta is delivered above, against the row
+		// read when the lane asked, as for any scan. It may have read the tree
+		// before this turn's edits, so they are carried to the root's next scan;
+		// the row written above keeps that scan from re-delivering this delta.
+		// A carry this replaces needs no keeping: its files were edited before
+		// an earlier join settled, and the single flight (one scan per root)
+		// started this scan after that, so it read them and attributed them.
+		if (joined) {
+			const carry = new Set(files);
+			knipCarried.set(scanRoot, carry);
+			knipMeta.joined = true;
+			knipMeta.carried = carry.size;
+		} else if (knipResult.success) knipCarried.delete(scanRoot);
 		return knipMeta;
 	};
 	const logKnipRow = (
@@ -2012,15 +2939,33 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				// the scan finishes off-hook and warms knip's own cache for the next
 				// turn. Its late result is never written or delivered here -- the turn
 				// it was computed for has already ended.
+				//
+				// A root whose last TWO scans both took longer than the budget left
+				// is not awaited again (one cold scan is not a measurement): the wait would end in the same deferral, three
+				// seconds later on every turn (live clone with six unignored
+				// worktrees: the handler sat at 3000 ms on each of three turns). The
+				// scan is still started, so a root that became fast is noticed on the
+				// next turn, and the grace below still answers a memo hit, which
+				// resolves in microtasks.
+				const remainingMs = Math.max(
+					0,
+					HOOK_WALL_BUDGET_MS.turn_end - (Date.now() - turnEndStart),
+				);
+				const scanFloorMs = knipClient.scanFloorMs?.(scanRoot);
+				const knownSlow =
+					scanFloorMs !== undefined && scanFloorMs > remainingMs;
 				const scanned = await bounded(
-					knipClient.analyze(scanRoot, getKnipIgnorePatterns(), {
-						projectSeq: runtime.projectSeq,
-					}),
+					withRowForFailureWrite(
+						knipClient.analyze(scanRoot, getKnipIgnorePatterns(), {
+							projectSeq: runtime.projectSeq,
+						}),
+						cacheManager,
+						"knip",
+						scanRoot,
+						prevKnip,
+					),
 					{
-						ms: Math.max(
-							0,
-							HOOK_WALL_BUDGET_MS.turn_end - (Date.now() - turnEndStart),
-						),
+						ms: knownSlow ? KNOWN_SLOW_KNIP_GRACE_MS : remainingMs,
 						signal: deps.signal,
 						hook: "turn_end",
 						label: "knip",
@@ -2028,15 +2973,52 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				);
 				if (scanned === undefined) {
 					dbg(`turn_end: knip for ${scanRoot} outlived the turn_end budget`);
+					const aborted = deps.signal?.aborted === true;
+					const nestedWorktrees = knipClient.nestedWorktrees?.(scanRoot) ?? 0;
 					metadata = {
 						execution: "deferred",
-						aborted: deps.signal?.aborted === true,
+						aborted,
+						...(knownSlow && {
+							reason: "scan-exceeds-budget",
+							scanFloorMs,
+						}),
+						...(nestedWorktrees > 0 && { nestedWorktrees }),
 					};
+					// The cause, once per root and counted (the root's rows carry the
+					// per-turn number): knip walks these worktrees because the project
+					// never ignored them, and only the project can stop that. A turn the
+					// user cancelled is not a degradation.
+					if (nestedWorktrees > 0 && !aborted) {
+						incrementDegradationCount({
+							kind: "turn-end-knip-nested-worktrees",
+							subject: toRunnerDisplayPath(cwd, scanRoot),
+							reason: `${nestedWorktrees} linked worktree(s) nested under the scan root: knip walks them as project files and the scan did not fit the turn_end budget; add their directory (for example /.worktrees/) to .gitignore to drop the cost`,
+						});
+					}
 				} else {
-					metadata = applyKnipResult(scanRoot, prevKnip, scanned);
+					// #4166: the single flight is process-wide, so the scan joined may
+					// have read the tree before this turn's edits (the previous turn's
+					// deferred scan, a fresh fetch). A memo hit is no join: its
+					// project sequence says nothing changed. A failure carries
+					// `scannedAt` too, but it attributes nothing.
+					const joined =
+						scanned.result.success &&
+						scanned.result.execution !== "cache" &&
+						joinedEarlierScan(scanned.result, startedAt);
+					metadata = applyKnipResult(
+						scanRoot,
+						prevKnip,
+						scanned.result,
+						scanned.row,
+						joined,
+					);
 				}
 			}
-			budgetSpent = metadata.execution === "deferred";
+			// A root that was not awaited spent none of the budget: the next
+			// checkout still gets its scan (an Escape ends the loop either way).
+			budgetSpent =
+				metadata.execution === "deferred" &&
+				(metadata.scanFloorMs === undefined || metadata.aborted === true);
 			logKnipRow(scanRoot, startedAt, metadata);
 		}
 	}
@@ -2060,6 +3042,12 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		reason?: string;
 		/** True when a failed run left the previous good cache in place (#1467). */
 		cacheKept?: boolean;
+		/** #4117: `deferred` when a scan outlived the turn_end budget and was abandoned. */
+		execution?: "deferred";
+		/** #4117: the abandonment was the hook's own signal (Escape), not the clock. */
+		aborted?: boolean;
+		/** #4117: linked worktrees the scan was told to leave out. */
+		excludedWorktrees?: number;
 	} = {};
 	if (runtime.isStartupScanInFlight("dead-code")) {
 		dbg("turn_end: skipping dead-code (startup scan still in flight)");
@@ -2079,44 +3067,229 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		/** #3248: bounded per-turn on this lane's own row, never per finding. */
 		let deadCodeDispositionSuppressed = 0;
 		const reasons: string[] = [];
+		/**
+		 * The attributable delta of finished scans: what became unused in the files
+		 * each source's `modified` names, against that source's `baseline` (the row
+		 * its scan was compared with). A source is a scan that finished inside this
+		 * turn, or one that missed an earlier turn's budget and settled since
+		 * (#4117 F1); the last source is the newest and gives the totals and the
+		 * re-offered cut items.
+		 */
+		const deliverDeadCodeDelta = (
+			client: DeadCodeClient,
+			sources: readonly DeadCodeDeltaSource[],
+		): void => {
+			const latest = sources.at(-1);
+			if (latest === undefined) return;
+			const result = latest.result;
+			// #3901: items the cap cut on the previous turn. A failed scan
+			// leaves them parked; a successful one takes them (offered once).
+			const deadCodeLane = carryLane("dead-code", client.id);
+			const parkedDeadCode = takeParked<DeadCodeIssue>(deadCodeLane);
+			deadCodeMeta.totalIssues =
+				(deadCodeMeta.totalIssues ?? 0) + deadCodeIssues(result).length;
+			// No baseline means every finding looks new. Report nothing rather
+			// than blame the edit for the whole project's pre-existing debt.
+			if (!sources.some((source) => source.previousScan?.success)) {
+				reasons.push(`${client.id}:no_previous_scan`);
+				return;
+			}
+			const newIssues: DeadCodeIssue[] = [];
+			for (const source of sources) {
+				if (!source.previousScan?.success) continue;
+				const prevKeys = new Set(
+					deadCodeIssues(source.previousScan).map(deadCodeIssueKey),
+				);
+				for (const issue of deadCodeIssues(source.result)) {
+					if (prevKeys.has(deadCodeIssueKey(issue)) || !issue.file) continue;
+					if (source.modified.has(resolveRunnerPath(cwd, issue.file))) {
+						newIssues.push(issue);
+					}
+				}
+			}
+			// #3901: a parked item is offered again only while this scan still
+			// reports it, as this scan's own record of it; it bypasses the
+			// baseline and the edited-file gate the cut turn overwrote.
+			const reOffered = stillReportedParked(
+				parkedDeadCode,
+				deadCodeIssues(result),
+				deadCodeIssueKey,
+				new Set(newIssues.map(deadCodeIssueKey)),
+			);
+			if (newIssues.length === 0 && reOffered.length === 0) {
+				reasons.push(`${client.id}:clean`);
+				return;
+			}
+			newIssueTotal += newIssues.length;
+			if (newIssues.length > 0) {
+				projectDiagnosticsDelta.push(
+					...newIssues.map((issue) =>
+						deadCodeIssueToProjectDiagnostic(cwd, issue, result.language),
+					),
+				);
+				projectDiagnosticsSources.add("dead-code");
+			}
+			// #3248: the rendered advisory takes the stored-disposition
+			// filter, keyed off this lane's OWN adapter. The delta record
+			// above keeps the unfiltered set — its reader applies the policy
+			// on read, so filtering both would double-apply on one lane.
+			const deadCodeDeliverable = filterFindingsByDisposition(
+				[...newIssues, ...reOffered],
+				cwd,
+				(issue) =>
+					deadCodeIssueToProjectDiagnostic(cwd, issue, result.language),
+			);
+			deadCodeDispositionSuppressed += deadCodeDeliverable.suppressed;
+			// Every finding on this scan was marked: a PUSH surface stays
+			// silent rather than re-announcing that the mark is working; the
+			// count rides this lane's bounded per-turn row.
+			if (deadCodeDeliverable.kept.length === 0) {
+				reasons.push(`${client.id}:all_disposed`);
+				return;
+			}
+			const deadCodePart = formatDeadCodeDelta(
+				deadCodeDeliverable.kept,
+				result.language,
+			);
+			// @delivery-surface: runtime-turn:dead-code-advisory
+			advisoryParts.push(deadCodePart);
+			const reOfferedKeys = new Set(reOffered.map(deadCodeIssueKey));
+			deliveryHolds.push(
+				cutAdvisoryHold(
+					"dead-code",
+					deadCodeLane,
+					deadCodePart,
+					deadCodeDeliverable.kept.slice(0, DEAD_CODE_DELTA_MAX_SHOWN),
+					(issue) => reOfferedKeys.has(deadCodeIssueKey(issue)),
+				),
+			);
+		};
 		// A malformed client or deps object must never abort turn_end. Before the
 		// per-turn delta this block only read a cache; now it iterates and awaits,
 		// so the whole thing needs the guard, not just `client.analyze`.
 		try {
+			// #4168 F1: the entry scope, never one read after the knip await.
+			const lateScans = lateDeadCodeScansOf(turnScope);
 			for (const client of deadCodeClients) {
 				if (!client.detect(cwd)) {
 					reasons.push(`${client.id}:not_detected`);
 					continue;
 				}
-				if (![...modifiedFiles()].some((f) => client.owns(f))) {
-					reasons.push(`${client.id}:no_owned_files`);
-					continue;
-				}
 				const cacheKey = `dead-code-${client.id}`;
-				const prev = cacheManager.readCache<DeadCodeResult>(cacheKey, cwd);
-				// Back off after a timeout/kill so an unresponsive scanner cannot cost
-				// every later turn its full analysis budget (mirrors knip).
-				if (
-					prev &&
-					!prev.data.success &&
-					isHardFailureSummary(prev.data.summary)
-				) {
-					dbg(
-						`turn_end: skipping dead-code after failure: ${prev.data.summary}`,
-					);
-					deadCodeMeta.skipped = true;
-					reasons.push(`${client.id}:backoff:${prev.data.summary}`);
-					continue;
+				const lateKey = lateDeadCodeScanKey(client, cwd);
+				const sources: DeadCodeDeltaSource[] = [];
+				// A scan an earlier turn abandoned at its budget (#4117 F1): its
+				// session may be over; if it finished, its delta is delivered now
+				// and the files edited meanwhile join this turn's scan; if it still
+				// runs, nothing else starts and this turn's files wait for it.
+				const late = lateScans.get(lateKey);
+				let carried: ReadonlySet<string> = new Set();
+				if (late?.settled) {
+					lateScans.delete(lateKey);
+					sources.push({
+						result: late.settled,
+						previousScan: late.previousScan,
+						modified: late.files,
+					});
+					carried = late.carry;
+					reasons.push(`${client.id}:late_scan`);
+					// #4154 J1: a scan that was already running when the lane asked read
+					// the tree before the files it was parked for were edited. Its delta
+					// still shows what it saw; the next scan covers those files too.
+					if (joinedEarlierScan(late.settled, late.askedAt)) {
+						carried = new Set([...late.carry, ...late.files]);
+						reasons.push(`${client.id}:joined`);
+					}
 				}
-				const startMs = Date.now();
 				try {
-					const result = await client.analyze(cwd);
+					if (late && !late.settled) {
+						for (const file of modifiedFiles()) late.carry.add(file);
+						reasons.push(`${client.id}:in_flight`);
+						continue;
+					}
+					const scanFiles = new Set([...modifiedFiles(), ...carried]);
+					if (![...scanFiles].some((f) => client.owns(f))) {
+						reasons.push(`${client.id}:no_owned_files`);
+						continue;
+					}
+					const prev = cacheManager.readCache<DeadCodeResult>(cacheKey, cwd);
+					// Back off after a timeout/kill so an unresponsive scanner cannot cost
+					// every later turn its full analysis budget (mirrors knip). #4117: a
+					// scan abandoned at the budget that later timed out wrote no row, so
+					// the client that saw it settle is asked as well (optional: doubles).
+					const previousFailedHard =
+						prev &&
+						!prev.data.success &&
+						isHardFailureSummary(prev.data.summary);
+					const abandonedFailure = previousFailedHard
+						? null
+						: (client.recentHardFailure?.(cwd) ?? null);
+					if (previousFailedHard || abandonedFailure !== null) {
+						const failure = previousFailedHard
+							? prev.data.summary
+							: (abandonedFailure ?? "");
+						dbg(`turn_end: skipping dead-code after failure: ${failure}`);
+						deadCodeMeta.skipped = true;
+						reasons.push(`${client.id}:backoff:${failure}`);
+						continue;
+					}
+					const startMs = Date.now();
+					// #4117: awaited under the turn_end budget that is LEFT and the
+					// hook's signal, as knip is (#3872). `bounded()` abandons the await,
+					// never the process: vulture keeps its own 30 s timeout and
+					// single-flight slot, and a scan that misses the budget is parked
+					// (`parkLateDeadCodeScan`) so its row is written where it settles and
+					// its delta delivered by a later turn. No further client starts once
+					// the budget is spent. A failure's row is re-read inside the same
+					// bound (#4154 V1).
+					const scan = client.analyze(cwd);
+					const settled = await bounded(
+						withRowForFailureWrite(scan, cacheManager, cacheKey, cwd, prev),
+						{
+							signal: deps.signal,
+							hook: "turn_end",
+							label: "dead-code",
+							ms: Math.max(
+								0,
+								HOOK_WALL_BUDGET_MS.turn_end - (Date.now() - turnEndStart),
+							),
+						},
+					);
+					// #4154 J1: a joined scan that predates this turn's edits is not
+					// their answer even when it finishes in time: parked like a late
+					// one, its delta lands next turn and its files join the next scan.
+					const joined =
+						settled !== undefined && joinedEarlierScan(settled.result, startMs);
+					if (settled === undefined || joined) {
+						if (joined) {
+							reasons.push(`${client.id}:joined`);
+						} else {
+							dbg(`turn_end: dead-code(${client.id}) outlived the budget`);
+							deadCodeMeta.execution = "deferred";
+							deadCodeMeta.aborted = deps.signal?.aborted === true;
+							reasons.push(`${client.id}:deferred`);
+						}
+						parkLateDeadCodeScan({
+							scope: turnScope,
+							cacheManager,
+							client,
+							cwd,
+							cacheKey,
+							scan,
+							startedAt: startMs,
+							files: scanFiles,
+							previousScan: prev?.data,
+						});
+						if (joined) continue;
+						break;
+					}
+					const { result } = settled;
 					const durationMs = Date.now() - startMs;
 					// Never overwrite a good scan with a failure (#925, #1467): a
 					// vulture timeout on one .py turn would otherwise evict the
 					// session_start scan, and the backoff above would then latch
-					// off the poisoned record.
-					if (wouldPoisonCache(prev, result)) {
+					// off the poisoned record. The good row is the one on disk now.
+					if (wouldPoisonCache(settled.row, result)) {
 						dbg(
 							`turn_end: keeping last good dead-code(${client.id}) cache; this run failed: ${result.summary}`,
 						);
@@ -2128,75 +3301,31 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					}
 					// One event per cross-file scan (AGENTS.md) — the per-turn scan is
 					// now the primary path, so dead-code.log must see it too.
-					logDeadCodeScan({
-						language: client.language,
-						success: result.success,
-						cached: false,
-						unusedExports: result.unusedExports.length,
-						unusedFiles: result.unusedFiles.length,
-						unusedDeps: result.unusedDeps.length,
-						unlistedDeps: result.unlistedDeps.length,
-						durationMs: result.durationMs ?? durationMs,
-						...(!result.success && { reason: result.summary }),
-					});
+					logDeadCodeScan(deadCodeScanEvent(client, cwd, result, durationMs));
 					deadCodeMeta.success = result.success;
+					if (result.excludedWorktrees !== undefined) {
+						deadCodeMeta.excludedWorktrees =
+							(deadCodeMeta.excludedWorktrees ?? 0) + result.excludedWorktrees;
+					}
 					if (!result.success) {
 						reasons.push(`${client.id}:scan_failed:${result.summary}`);
 						continue;
 					}
-					deadCodeMeta.totalIssues =
-						(deadCodeMeta.totalIssues ?? 0) + deadCodeIssues(result).length;
-					// No baseline means every finding looks new. Report nothing rather
-					// than blame the edit for the whole project's pre-existing debt.
-					if (!prev?.data.success) {
-						reasons.push(`${client.id}:no_previous_scan`);
-						continue;
-					}
-					const prevKeys = new Set(
-						deadCodeIssues(prev.data).map(deadCodeIssueKey),
-					);
-					const modified = modifiedFiles();
-					const newIssues = deadCodeIssues(result).filter((issue) => {
-						if (prevKeys.has(deadCodeIssueKey(issue))) return false;
-						if (!issue.file) return false;
-						return modified.has(resolveRunnerPath(cwd, issue.file));
+					sources.push({
+						result,
+						previousScan: prev?.data,
+						modified: scanFiles,
 					});
-					if (newIssues.length === 0) {
-						reasons.push(`${client.id}:clean`);
-						continue;
-					}
-					newIssueTotal += newIssues.length;
-					projectDiagnosticsDelta.push(
-						...newIssues.map((issue) =>
-							deadCodeIssueToProjectDiagnostic(cwd, issue, result.language),
-						),
-					);
-					projectDiagnosticsSources.add("dead-code");
-					// #3248: the rendered advisory takes the stored-disposition
-					// filter, keyed off this lane's OWN adapter. The delta record
-					// above keeps the unfiltered set — its reader applies the policy
-					// on read, so filtering both would double-apply on one lane.
-					const deadCodeDeliverable = filterFindingsByDisposition(
-						newIssues,
-						cwd,
-						(issue) =>
-							deadCodeIssueToProjectDiagnostic(cwd, issue, result.language),
-					);
-					deadCodeDispositionSuppressed += deadCodeDeliverable.suppressed;
-					// Every finding on this scan was marked: a PUSH surface stays
-					// silent rather than re-announcing that the mark is working; the
-					// count rides this lane's bounded per-turn row.
-					if (deadCodeDeliverable.kept.length === 0) {
-						reasons.push(`${client.id}:all_disposed`);
-						continue;
-					}
-					// @delivery-surface: runtime-turn:dead-code-advisory
-					advisoryParts.push(
-						formatDeadCodeDelta(deadCodeDeliverable.kept, result.language),
-					);
 				} catch (err) {
 					dbg(`turn_end: dead-code(${client.id}) failed: ${err}`);
 					reasons.push(`${client.id}:threw`);
+				} finally {
+					try {
+						deliverDeadCodeDelta(client, sources);
+					} catch (err) {
+						dbg(`turn_end: dead-code(${client.id}) delivery failed: ${err}`);
+						reasons.push(`${client.id}:threw`);
+					}
 				}
 			}
 		} catch (err) {
@@ -2301,7 +3430,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		cwd,
 		signal: deps.signal,
 		readScannerCache,
-		peekActionableWarnings: () => runtime.peekActionableWarnings(),
+		peekActionableWarnings: () => runtime.peekActionableWarnings(sessionId),
 	};
 
 	// govulncheck — the session_start-cached Go CVE store, delivered as ONE
@@ -2363,10 +3492,12 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	const govGate = scannerGates.govulncheck;
 	const gitleaksGate = scannerGates.gitleaks;
 	const trivySecretsGate = scannerGates["trivy-secrets"];
-	const govDelivery = govulncheckLane.render(
-		govulncheckLane.gate({ govulncheck: govGate }, laneCtx),
-		laneCtx,
-	);
+	const govDelivery = allowProjectWideFindings
+		? govulncheckLane.render(
+				govulncheckLane.gate({ govulncheck: govGate }, laneCtx),
+				laneCtx,
+			)
+		: {};
 	for (const [store, count] of Object.entries(
 		govDelivery.dispositionSuppressed ?? {},
 	)) {
@@ -2390,16 +3521,18 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// what is not one lane's rule: the gated arms it hands over, the order the
 	// tiers are pushed in, and the per-lane suppression counts that fold into
 	// the one notice below.
-	const secretsDelivery = secretsLane.render(
-		secretsLane.gate(
-			{
-				gitleaks: gitleaksGate,
-				"trivy-secrets": trivySecretsGate,
-			},
-			laneCtx,
-		),
-		laneCtx,
-	);
+	const secretsDelivery = allowProjectWideFindings
+		? secretsLane.render(
+				secretsLane.gate(
+					{
+						gitleaks: gitleaksGate,
+						"trivy-secrets": trivySecretsGate,
+					},
+					laneCtx,
+				),
+				laneCtx,
+			)
+		: {};
 	for (const [store, count] of Object.entries(
 		secretsDelivery.dispositionSuppressed ?? {},
 	)) {
@@ -2508,12 +3641,21 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 
 	const t3 = Date.now();
 	let madgeStats: MadgeBatchStats | undefined;
+	const madgeAvailabilitySignal = deps.signal;
 	// Off by default (#766): this pass only writes debug output, and user-facing
 	// madge diagnostics come from the session-start `madge` cache + the
 	// `lens_diagnostics` extractor. Enabled with `--lens-turn-end-madge` /
 	// `turnEnd.madge.enabled=true` for those who want the per-edit circular note.
-	if (getFlag("lens-turn-end-madge") && (await depChecker.ensureAvailable())) {
-		const madgeFiles = cacheManager.getFilesForMadge(cwd);
+	if (
+		getFlag("lens-turn-end-madge") &&
+		(await bounded(depChecker.ensureAvailable(), {
+			ms: HOOK_WALL_BUDGET_MS.turn_end,
+			signal: madgeAvailabilitySignal,
+			hook: "turn_end",
+			label: "madge.ensureAvailable",
+		}))
+	) {
+		const madgeFiles = cacheManager.getFilesForMadge(cwd, turnStateSessionId);
 		if (madgeFiles.length > 0) {
 			dbg(
 				`turn_end: madge checking ${madgeFiles.length} file(s) for circular deps`,
@@ -2695,15 +3837,17 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			entries: DeferredTestTarget[],
 			label: string,
 		): DeferredTestTarget[] => {
-			const ordered = [
-				...entries.filter((entry) => !isThisSession(entry)),
-				...entries.filter(isThisSession),
-			];
-			if (ordered.length <= TEST_RUNNER_MAX_PERSISTED_TARGETS) return ordered;
-			dbg(
-				`turn_end: ${label} test target list held ${ordered.length} entries, bounded to the newest ${TEST_RUNNER_MAX_PERSISTED_TARGETS} (oldest foreign-session rows dropped)`,
+			const bounded = boundDeferredTargets(
+				entries,
+				TEST_RUNNER_MAX_PERSISTED_TARGETS,
+				isThisSession,
 			);
-			return ordered.slice(-TEST_RUNNER_MAX_PERSISTED_TARGETS);
+			if (bounded.length !== entries.length) {
+				dbg(
+					`turn_end: ${label} test target list held ${entries.length} entries, bounded to the newest ${TEST_RUNNER_MAX_PERSISTED_TARGETS} (oldest foreign-session rows dropped)`,
+				);
+			}
+			return bounded;
 		};
 		const writeTestFindings = (
 			record: TestRunnerFindingsCache,
@@ -2867,10 +4011,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		let missingTargetFiles = 0;
 		let excludedTargets = 0;
 		let retiredSkips = 0;
+		let noTestFile = 0;
+		const candidatesByRoot = new Map<string, number>();
 		for (const { display, abs, isNeighbor } of candidates) {
 			// #3871: select in the checkout that owns the edit. For an edit the
 			// session owns this is `cwd`, exactly as before.
 			const testRoot = testRootFor(abs);
+			candidatesByRoot.set(testRoot, (candidatesByRoot.get(testRoot) ?? 0) + 1);
 			const target = testRunnerClient.getTestRunTarget(
 				abs,
 				testRoot,
@@ -2927,6 +4074,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					`turn_end: ${display} → test ${target.runner} ${path.relative(cwd, target.testFile)} (${target.strategy}${isNeighbor ? ", cascade-neighbor" : ""})`,
 				);
 			} else if (!target) {
+				noTestFile++;
 				dbg(
 					`turn_end: ${display} → no test file found${isNeighbor ? " (cascade-neighbor)" : ""}`,
 				);
@@ -2958,6 +4106,49 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			});
 			dbg(
 				`turn_end: test target count capped at ${TEST_RUNNER_MAX_TARGETS}, ${overCapTargets} skipped`,
+			);
+		}
+		if (candidates.length > 0) {
+			// #3871: ONE record per turn, pushed (the MCP / Stop-hook route's dbg
+			// is a no-op), so a turn that ran 0 tests says which checkout owned
+			// each edit and why nothing was selected. The live session that
+			// ran 0 tests in 44 turn-ends left only per-edit dbg lines.
+			const selectedByRoot = new Map<string, number>();
+			for (const target of targets) {
+				selectedByRoot.set(
+					target.testRoot,
+					(selectedByRoot.get(target.testRoot) ?? 0) + 1,
+				);
+			}
+			const roots = [...candidatesByRoot.entries()].map(
+				([root, candidateCount]) => ({
+					root: root === cwd ? "." : toRunnerDisplayPath(cwd, root),
+					candidates: candidateCount,
+					selected: selectedByRoot.get(root) ?? 0,
+				}),
+			);
+			emitBounded(
+				"turn_end_test_selection",
+				`${cwd}:turn:${runtime.turnIndex}`,
+				{
+					filePath: cwd,
+					durationMs: 0,
+					metadata: {
+						sessionId: turnSessionId,
+						candidates: candidates.length,
+						selected: targets.length,
+						noTestFile,
+						excluded: excludedTargets,
+						missing: missingTargetFiles,
+						overCap: overCapTargets,
+						retired: retiredSkips,
+						roots: roots.slice(0, TURN_END_SELECTION_ROOT_ROWS),
+						rootsOmitted: Math.max(
+							0,
+							roots.length - TURN_END_SELECTION_ROOT_ROWS,
+						),
+					},
+				},
 			);
 		}
 		if (targets.length > 0) {
@@ -3038,10 +4229,16 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 							targets.find(
 								(candidate) => candidate.testFile === result.value.file,
 							)?.testRoot ?? cwd;
+						// #3871: name the refused borrow only when the shell actually
+						// set an ambient Python environment.
+						const ambientNote =
+							result.value.runner === "pytest" && hasAmbientPythonEnvironment()
+								? "; ambient Python environments outside this checkout were not borrowed"
+								: "";
 						incrementDegradationCount({
 							kind: "turn-end-test-root-skipped",
 							subject: result.value.notRun,
-							reason: `${toRunnerDisplayPath(cwd, skippedRoot)} has no ${result.value.runner} install of its own; its tests were skipped rather than fetched through npx or run in another environment`,
+							reason: `${toRunnerDisplayPath(cwd, skippedRoot)} has no ${result.value.runner} install of its own${ambientNote}; its tests were skipped rather than fetched through npx or run in another environment`,
 						});
 						dbg(
 							`turn_end: skipped ${toRunnerDisplayPath(cwd, result.value.file)}: ${result.value.notRun} in ${toRunnerDisplayPath(cwd, skippedRoot)}`,
@@ -3057,6 +4254,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 									{
 										file: result.value.file,
 										sourceFile: target.sourceFile,
+										runner: target.runner,
 										fileSeq:
 											target.fileSeqAtRun === undefined
 												? ({
@@ -3559,7 +4757,25 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					calleeKey: string;
 					results: ReturnType<typeof impact>;
 				}[] = [];
-				for (const filePath of files.slice(0, 5)) {
+				// #3813: files whose impact lines the cap cut on the previous turn.
+				// Impact is recomputed from the CURRENT graph, so a re-offer is as
+				// fresh as any line; a file edited again this turn is simply fresh.
+				const impactFiles = files.slice(0, 5);
+				const impactFileKeys = new Set(
+					impactFiles.map((file) =>
+						normalizeMapKey(resolveRunnerPath(cwd, file)),
+					),
+				);
+				const reOfferedImpactFiles = takeParked<string>(
+					carryLane("call-graph"),
+				).filter(
+					(file) =>
+						!impactFileKeys.has(normalizeMapKey(resolveRunnerPath(cwd, file))),
+				);
+				/** Files that contributed a line to the part. */
+				const shownImpactFiles: string[] = [];
+				for (const filePath of [...impactFiles, ...reOfferedImpactFiles]) {
+					const linesBefore = impactLines.length;
 					// Turn-state files may be cwd-relative while graph keys are absolute,
 					// and persisted graphs can contain either slash style/casing. Compare
 					// through the shared normalized path seam; keep the original filePath
@@ -3636,11 +4852,20 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 								);
 						}
 					}
+					if (impactLines.length > linesBefore) shownImpactFiles.push(filePath);
 				}
 				if (impactLines.length > 0) {
+					const impactPart = `📊 Call-graph impact (changed symbols have callers):\n${impactLines.join("\n")}`;
 					// @delivery-surface: runtime-turn:call-graph-advisory
-					advisoryParts.push(
-						`📊 Call-graph impact (changed symbols have callers):\n${impactLines.join("\n")}`,
+					advisoryParts.push(impactPart);
+					deliveryHolds.push(
+						cutAdvisoryHold(
+							"call-graph",
+							carryLane("call-graph"),
+							impactPart,
+							shownImpactFiles,
+							(file) => !impactFiles.includes(file),
+						),
 					);
 				}
 				if (impactFindings.length > 0) {
@@ -3753,8 +4978,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				turnIndex: runtime.turnIndex,
 				files,
 				modifiedRangesByFile,
-				dispatchWarnings: runtime.peekActionableWarnings(),
+				dispatchWarnings: runtime.peekActionableWarnings(sessionId),
 				includeLspCodeActions: !!getFlag("lens-actionable-warning-actions"),
+				// #4323: the cold LSP read leaves a switched-off Opengrep unstarted.
+				getFlag,
 				projectSeqStart: runtime.turnStartProjectSeq,
 				projectSeqEnd: runtime.projectSeq,
 				// #3676: the quick fix credits its writes with this epoch.
@@ -3971,29 +5198,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		// at the report INPUT so the advisory, the persisted report and the delta
 		// view all agree; the delta view's own filter then re-applies to the same
 		// set and is idempotent. Per file, because the anchor is content-bound.
-		const qualityWarningsByFile = new Map<string, CodeQualityWarningRecord[]>();
-		for (const warning of runtime.peekCodeQualityWarnings()) {
-			const group = qualityWarningsByFile.get(warning.filePath);
-			if (group) group.push(warning);
-			else qualityWarningsByFile.set(warning.filePath, [warning]);
-		}
-		const qualityWarnings: CodeQualityWarningRecord[] = [];
-		let qualityDispositionSuppressed = 0;
-		for (const [filePath, group] of qualityWarningsByFile) {
-			let content: string | undefined;
-			try {
-				content = fs.readFileSync(filePath, "utf-8");
-			} catch {
-				content = undefined;
-			}
-			const { kept, suppressed } = applyPushedFindingPolicy(group, {
+		const { kept: qualityWarnings, suppressed: qualityDispositionSuppressed } =
+			applyPushedFindingPolicyByFile(
+				runtime.peekCodeQualityWarnings(sessionId),
 				cwd,
-				filePath,
-				content,
-			});
-			qualityWarnings.push(...kept);
-			qualityDispositionSuppressed += suppressed;
-		}
+			);
 		const qualityReport = buildCodeQualityWarningsReport({
 			cwd,
 			sessionId: runtime.telemetrySessionId,
@@ -4040,169 +5249,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		});
 	}
 
-	cacheManager.incrementTurnCycle(cwd, currentOwner);
-
-	// Collect-later CLI runners continue off the write path. Their completed
-	// diagnostics use the same freshness gate as late auxiliary findings and
-	// enter the ordinary turn-end advisory delivery channel.
-	const runnerFindingsStart = Date.now();
-	// Turn-end delivery is deliberately non-blocking. Collect already-settled
-	// results and requeue the rest; the edit path already paid the deferral
-	// decision, so another 2s wait would charge every turn while a runner is
-	// still in flight (#2122 F5).
-	const pendingRunnerFindings = await drainPendingRunnerFindings(0);
-	let runnerFindingsDelivered = 0;
-	let runnerFindingsStale = 0;
-	let runnerFindingsFailed = 0;
-	let runnerFindingsDropped = 0;
-	/** #3248: bounded per-turn on this lane's own row, never per finding. */
-	let runnerFindingsDispositionSuppressed = 0;
-	const runnerFindingsDeliveredIds: string[] = [];
-	/** #3796: late parts carrying a blocking finding — never "no action required". */
-	const unlabeledAdvisoryParts = new Set<string>();
-	for (const pending of pendingRunnerFindings) {
-		const result = pending.result;
-		if (!result) continue;
-		recordRunner(
-			pending.filePath,
-			pending.runnerId,
-			result.status,
-			result.diagnostics.length,
-			Date.now() - pending.markedAtMs,
-			pending.writeIndex,
-		);
-		// #3796: a runner whose findings fail its check reports `failed` WITH
-		// diagnostics and no fault kind (or `blocking_diagnostics`); that goes
-		// through the freshness gate and delivery like a success. A failed result
-		// with no diagnostics, or with a fault kind (timeout, server_error), is a
-		// broken runner: the note is kept and any partial findings still deliver.
-		if (
-			result.status === "failed" &&
-			(result.diagnostics.length === 0 ||
-				(result.failureKind !== undefined &&
-					result.failureKind !== "blocking_diagnostics"))
-		) {
-			runnerFindingsFailed += 1;
-			const detail = result.failureMessage ? `: ${result.failureMessage}` : "";
-			const failedNote = `❌ Deferred runner ${pending.runnerId} failed (${result.failureKind ?? "unknown"})${detail}`;
-			// #3813: the drain above removed this settled entry for good. If the
-			// cap cuts the note, hand back the failure alone (the findings, if
-			// any, are judged on their own part below).
-			deliveryHolds.push({
-				part: failedNote,
-				onHeld: () =>
-					requeueRunnerFindings({
-						...pending,
-						result: { ...result, diagnostics: [] },
-					}),
-			});
-			// @delivery-surface: runtime-turn:late-runner-findings
-			advisoryParts.push(failedNote);
-		}
-		const findings = result.diagnostics;
-		if (findings.length === 0) continue;
-		const { "late-runner-findings": gate } = gateFindingsByPathFreshness({
-			cwd,
-			sources: {
-				"late-runner-findings": {
-					findings,
-					scannedAt: pending.markedAtMs,
-					citedPath: (finding: (typeof findings)[number]) => finding.filePath,
-				},
-			},
-		});
-		runnerFindingsStale += gate.stale.length;
-		if (gate.stale.length > 0) {
-			// The runner answered for bytes older than the latest edit. Do not
-			// re-arm this completed answer: only a new runner query can restore
-			// coverage for the refreshed bytes.
-			dropStaleRunnerFindings(pending);
-			runnerFindingsDropped += 1;
-		}
-		if (gate.live.length === 0) continue;
-		const displayPath = toRunnerDisplayPath(cwd, pending.filePath);
-		// #3248: the survivors are what the agent READS, so they take the same
-		// policy stack the late-AUXILIARY drain below applies — this lane is its
-		// twin (same post-gate `Diagnostic[]`, same rendering) and was the one
-		// push surface still re-reporting a finding the agent had marked. AFTER
-		// the freshness gate, like every other lane: the anchor is derived from
-		// the post-gate identity, never the raw pre-gate set. The file's CURRENT
-		// bytes; an unreadable file fails open inside the helper.
-		let runnerContent: string | undefined;
-		try {
-			runnerContent = fs.readFileSync(pending.filePath, "utf-8");
-		} catch {
-			runnerContent = undefined;
-		}
-		const { kept: runnerKept, suppressed: runnerSuppressedHere } =
-			applyPushedFindingPolicy(gate.live, {
-				cwd,
-				filePath: pending.filePath,
-				content: runnerContent,
-			});
-		runnerFindingsDispositionSuppressed += runnerSuppressedHere;
-		if (runnerKept.length === 0) {
-			// Every late finding was marked. A PUSH surface stays silent rather
-			// than re-announcing that the mark is working; the count rides this
-			// lane's bounded per-turn row below.
-			continue;
-		}
-		const lines = runnerKept.map(
-			(finding) =>
-				`  ${displayPath}:${finding.line ?? 1}:${finding.column ?? 1} [${finding.rule ?? finding.id}] ${finding.message}`,
-		);
-		runnerFindingsDelivered += runnerKept.length;
-		for (const finding of runnerKept) {
-			if (runnerFindingsDeliveredIds.length < 50) {
-				runnerFindingsDeliveredIds.push(finding.id);
-			}
-		}
-		// #1616 suppressed-bucket rule: a delivery that still has something to
-		// say states what it dropped, once per delivery.
-		const runnerSuppressedNote =
-			runnerSuppressedHere > 0
-				? `; suppressed by disposition: ${runnerSuppressedHere} finding(s)`
-				: "";
-		const lateBlocking = runnerKept.some(
-			(finding) => finding.semantic === "blocking",
-		);
-		const lateRunnerPart = `⏱️ Late runner diagnostics (${pending.runnerId} completed after the edit${runnerSuppressedNote}${lateBlocking ? "; blocking: fix before continuing" : ""}):\n${lines.join("\n")}`;
-		if (lateBlocking) unlabeledAdvisoryParts.add(lateRunnerPart);
-		// @delivery-surface: runtime-turn:late-runner-findings
-		advisoryParts.push(lateRunnerPart);
-		// #3813: handed back as the findings alone, still pre-policy so a mark
-		// made in the meantime applies, and the stale half already counted
-		// above is not carried (it would be dropped and recorded twice).
-		const {
-			failureKind: _kind,
-			failureMessage: _message,
-			...findingsOnly
-		} = result;
-		deliveryHolds.push({
-			part: lateRunnerPart,
-			onHeld: () =>
-				requeueRunnerFindings({
-					...pending,
-					result: { ...findingsOnly, diagnostics: gate.live },
-				}),
-		});
-	}
-	logLatency({
-		type: "phase",
-		toolName: "turn_end",
-		filePath: cwd,
-		phase: "late_runner_findings",
-		durationMs: Date.now() - runnerFindingsStart,
-		metadata: {
-			pending: pendingRunnerFindings.length,
-			delivered: runnerFindingsDelivered,
-			stale: runnerFindingsStale,
-			failed: runnerFindingsFailed,
-			dropped: runnerFindingsDropped,
-			dispositionSuppressed: runnerFindingsDispositionSuppressed,
-			deliveredIds: runnerFindingsDeliveredIds,
-		},
-	});
+	cacheManager.incrementTurnCycle(cwd, currentOwner, turnStateSessionId);
 
 	// #2001/#2002: collect-later delivery for auxiliary LSP servers whose
 	// aux-grace window expired without a publication (opengrep on Windows:
@@ -4214,11 +5261,36 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// (baseline preserved, TTL anchor advanced) until the re-arm TTL; a dead
 	// client drops silently.
 	const lateAuxStart = Date.now();
-	const drainedPairs = drainPendingAuxiliaryCoverage();
 	// #2168: cap evictions retire a pair before any drain can observe it — read
 	// and reset that count here so it folds into this turn's reconciliation
 	// sum instead of the pair vanishing uncounted.
-	const lateAuxCapEvicted = drainPendingAuxCapEvictedCount();
+	// #4161: both belong to the session current now; a replaced one takes none.
+	const lateAuxDrain = isSecondarySession
+		? {
+				drainedPairs: drainPendingAuxiliaryCoverage(),
+				lateAuxCapEvicted: drainPendingAuxCapEvictedCount(),
+			}
+		: (holdScope.guardedWrite("turn-end:late-aux", () => ({
+				drainedPairs: drainPendingAuxiliaryCoverage(),
+				lateAuxCapEvicted: drainPendingAuxCapEvictedCount(),
+			})) ?? { drainedPairs: [], lateAuxCapEvicted: 0 });
+	const { drainedPairs, lateAuxCapEvicted } = lateAuxDrain;
+	/**
+	 * #4161: a re-arm after the probe's await lands only in this session.
+	 * True when it landed: a dropped one is the stale-write row's, never a
+	 * `rearmed` count (#4168 F2).
+	 */
+	const rearmLateAux = (pair: (typeof drainedPairs)[number]): boolean =>
+		isSecondarySession
+			? (rearmPendingAuxiliaryCoverage(pair), true)
+			: holdScope.guardedWrite(
+					// One subject for the store (#4168 F3): the row's count carries how many.
+					"turn-end:late-aux-rearm",
+					() => {
+						rearmPendingAuxiliaryCoverage(pair);
+						return true;
+					},
+				) === true;
 	let lateAuxDelivered = 0;
 	let lateAuxStale = 0;
 	let lateAuxMissing = 0;
@@ -4289,8 +5361,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					lateAuxProbeFailed += pairs.length;
 					for (const pair of pairs) {
 						if (canRearmPendingAuxiliary(pair)) {
-							rearmPendingAuxiliaryCoverage(pair);
-							lateAuxRearmed += 1;
+							if (rearmLateAux(pair)) lateAuxRearmed += 1;
 						} else if (isPendingAuxiliaryPastRearmTtl(pair)) {
 							lateAuxExpired += 1;
 						} else {
@@ -4349,13 +5420,14 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						const pastTtl = isPendingAuxiliaryPastRearmTtl(pair);
 						const atCeiling = (pair.rearmCount ?? 0) >= MAX_LATE_AUX_REARMS;
 						if (!pastTtl && !atCeiling) {
-							rearmPendingAuxiliaryCoverage(pair);
-							lateAuxRearmed += 1;
-							if (lateAuxStuckPairs.length < 20)
-								lateAuxStuckPairs.push({
-									filePath: pair.filePath,
-									serverId: pair.serverId,
-								});
+							if (rearmLateAux(pair)) {
+								lateAuxRearmed += 1;
+								if (lateAuxStuckPairs.length < 20)
+									lateAuxStuckPairs.push({
+										filePath: pair.filePath,
+										serverId: pair.serverId,
+									});
+							}
 						} else {
 							if (pastTtl) lateAuxExpired += 1;
 							else lateAuxCeilingExhausted += 1;
@@ -4386,13 +5458,14 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						// anchored on `lastRearmedAtMs`, advanced by every successful
 						// empty probe: the scanner is demonstrably alive, just slow.
 						if (canRearmPendingAuxiliary(pair)) {
-							rearmPendingAuxiliaryCoverage(pair);
-							lateAuxRearmed += 1;
-							if (lateAuxStuckPairs.length < 20)
-								lateAuxStuckPairs.push({
-									filePath: pair.filePath,
-									serverId: pair.serverId,
-								});
+							if (rearmLateAux(pair)) {
+								lateAuxRearmed += 1;
+								if (lateAuxStuckPairs.length < 20)
+									lateAuxStuckPairs.push({
+										filePath: pair.filePath,
+										serverId: pair.serverId,
+									});
+							}
 						} else {
 							if (isPendingAuxiliaryPastRearmTtl(pair)) lateAuxExpired += 1;
 							else lateAuxCeilingExhausted += 1;
@@ -4483,8 +5556,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 							// a refreshed baseline absorbed the edit, so an older queued
 							// scan that published later passed both gates).
 							if (canRearmPendingAuxiliary(pair)) {
-								rearmPendingAuxiliaryCoverage(pair);
-								lateAuxRearmed += 1;
+								if (rearmLateAux(pair)) lateAuxRearmed += 1;
 							} else if (isPendingAuxiliaryPastRearmTtl(pair)) {
 								lateAuxExpired += 1;
 							} else {
@@ -4749,11 +5821,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		...resolvedParts.map(asIs),
 		...blockerParts.map(asIs),
 		...staleSecretParts.map(asIs),
+		// #3814: a blocking late-runner finding never reaches `advisoryParts`; it
+		// rides the blocker replay, so every advisory part gets the label.
 		...advisoryParts.map((raw) => ({
 			raw,
-			text: unlabeledAdvisoryParts.has(raw)
-				? raw
-				: `ℹ️ Advisory — no action required this turn:\n${raw}`,
+			text: `ℹ️ Advisory — no action required this turn:\n${raw}`,
 		})),
 	];
 	const findingParts = composedParts.map((part) => part.text);
@@ -4774,7 +5846,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		const settleHolds = (suppressed: boolean): void => {
 			const outcome = holdPlan.settle({
 				suppressed,
-				isCurrentSession: () => runtime.isCurrentSession(holdGeneration),
+				isCurrentSession: () => holdScope.isCurrent(),
 				onFault: (cause) => dbg(`turn_end: delivery hold failed: ${cause}`),
 			});
 			heldSections = outcome.held;
@@ -4990,8 +6062,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	}
 
 	runtime.fixedThisTurn.clear();
-	runtime.clearActionableWarnings();
-	runtime.clearCodeQualityWarnings();
+	// #3613: only this turn's session's records; a concurrent session drains
+	// its own at its own turn end.
+	runtime.clearActionableWarnings(sessionId);
+	runtime.clearCodeQualityWarnings(sessionId);
 	if (demotedFindingsRetired > 0) {
 		// #1944: the retired payload must not survive as a SUPPRESSION key.
 		// `turn-end-findings-last` holds a content signature used to silence a

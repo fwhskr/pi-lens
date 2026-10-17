@@ -31,8 +31,17 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
 import { SCRATCH_DIR_ROOT } from "../../scripts/lib/scratch-dir.mjs";
+import { requireBuiltDist } from "../support/require-built-dist.js";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -73,6 +82,15 @@ describe("bootstrapFixtureWorkspace (#2670/#2658)", () => {
 	let fakeRepoRoot: string;
 
 	const fx = { lang: "test-lang", dir: "fx-dir", file: "a.txt" };
+
+	// #4003: loads the shipped dist/ modules the helper's session guard reads.
+	beforeAll(() => {
+		requireBuiltDist(
+			repoRoot,
+			"clients/lsp/config.js",
+			"clients/lsp/session-roots.js",
+		);
+	});
 
 	beforeEach(async () => {
 		({ bootstrapFixtureWorkspace } = await import(
@@ -520,5 +538,82 @@ describe("withScratchHome (#2670/#2506-shape)", () => {
 		} finally {
 			spy.mockRestore();
 		}
+	});
+});
+
+// Recurrence #4514: the nightly LSP scripts never adopted project trust, so
+// from 2026-10-10 (#4248/#4269) the launch gate refused their servers and 30 of
+// 54 rows read `unknown`. These drive the helpers against the REAL
+// dist/clients/project-trust.js latch (the module the scripts import), not a
+// stand-in; a fake would pass whether or not the latch ever moved.
+describe("adoptFixtureProjectTrust / fixtureTrustRefusal (#4514)", () => {
+	type TrustModule = {
+		getProjectTrustState: () => string;
+		resetProjectTrust: () => void;
+		setProjectTrustState: (state: string) => void;
+	};
+	let helpers: {
+		adoptFixtureProjectTrust: (opts: {
+			repoRoot: string;
+			adopt?: (ctx: unknown) => unknown;
+		}) => Promise<void>;
+		fixtureTrustRefusal: (repoRoot: string) => Promise<string | undefined>;
+	};
+	let trust: TrustModule;
+
+	beforeAll(() => {
+		requireBuiltDist(repoRoot, path.join("clients", "project-trust.js"));
+	});
+
+	beforeEach(async () => {
+		helpers = await import(
+			pathToFileURL(
+				path.join(repoRoot, "scripts", "lib", "lsp-fixture-workspace.mjs"),
+			).href
+		);
+		trust = await import(
+			pathToFileURL(path.join(repoRoot, "dist", "clients", "project-trust.js"))
+				.href
+		);
+		trust.resetProjectTrust();
+	});
+
+	afterEach(() => {
+		trust.resetProjectTrust();
+	});
+
+	it("moves the process-wide latch from unknown to trusted through the host accessor seam", async () => {
+		expect(trust.getProjectTrustState()).toBe("unknown");
+		await helpers.adoptFixtureProjectTrust({ repoRoot });
+		expect(trust.getProjectTrustState()).toBe("trusted");
+	});
+
+	it("passes the injected adopter a host context that answers true (smoke-tools deps seam)", async () => {
+		const seen: Array<{ isProjectTrusted: () => boolean }> = [];
+		await helpers.adoptFixtureProjectTrust({
+			repoRoot,
+			adopt: (ctx) => {
+				seen.push(ctx as { isProjectTrusted: () => boolean });
+			},
+		});
+		expect(seen).toHaveLength(1);
+		expect(seen[0].isProjectTrusted()).toBe(true);
+		// The injected adopter replaces the real one: the latch did not move.
+		expect(trust.getProjectTrustState()).toBe("unknown");
+	});
+
+	it("names the refusal when trust was never adopted, for both non-trusted states", async () => {
+		expect(await helpers.fixtureTrustRefusal(repoRoot)).toBe(
+			"refused: project trust is unknown",
+		);
+		trust.setProjectTrustState("untrusted");
+		expect(await helpers.fixtureTrustRefusal(repoRoot)).toBe(
+			"refused: project trust is untrusted",
+		);
+	});
+
+	it("reports no refusal once trust is adopted", async () => {
+		await helpers.adoptFixtureProjectTrust({ repoRoot });
+		expect(await helpers.fixtureTrustRefusal(repoRoot)).toBeUndefined();
 	});
 });

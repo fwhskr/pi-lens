@@ -37,12 +37,19 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import {
+	resolveGitCheckout,
+	resolveGitIdentity,
+} from "./review-graph/git-identity.js";
 import { collectSourceFilesWithBudgetAsync } from "./source-filter.js";
 import { createHash } from "node:crypto";
 
+import { BoundedFifoMap } from "./bounded-cache.js";
+import { incrementDegradationCount } from "./degradation-ledger.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { createSingleFlight } from "./single-flight.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
 
 interface FileStatEntry {
@@ -99,6 +106,27 @@ export interface PendingOpaqueBaseline {
 	strategy: "git" | "stat-diff";
 	stats?: FileStatsSnapshot;
 	statsUnknownReason?: OpaqueUnknownReason;
+}
+
+/**
+ * Opaque recovery feeds dispatch and LSP resync; it is not read evidence.
+ * Keep its lifecycle gate shared by the pre-call baseline and post-call take.
+ */
+export function shouldRunOpaqueRecovery(
+	toolName: string,
+	workspaceRoot: string | undefined,
+): workspaceRoot is string {
+	return toolName === "bash" && workspaceRoot !== undefined;
+}
+
+/**
+ * The turn a baseline was recorded in: the session's turn key and the
+ * coordinator's liveness test for it (`RuntimeCoordinator.turnKey` and
+ * `isLiveTurnKey`, #3613), so a concurrent session's turn stays live.
+ */
+export interface OpaqueBaselineTurn {
+	key: number;
+	isLive: (key: number) => boolean;
 }
 
 export interface CaptureOptions {
@@ -278,29 +306,109 @@ export function diffFileContent(
 	return changed;
 }
 
+/**
+ * The session-stamped slot (`<cwd>:<generation>`) a baseline lives in, derived
+ * once for the `tool_call` record and the `tool_result` take (shape 19). The
+ * generation keeps a concurrent-secondary session (#473) from consuming another
+ * session's baseline.
+ */
+export function opaqueBaselineSlot(
+	scanRoot: string,
+	sessionGeneration: number,
+): string {
+	return `${normalizeMapKey(path.resolve(scanRoot))}:${sessionGeneration}`;
+}
+
+/**
+ * Upper bound on baselines awaiting their `tool_result`, so per-call keying
+ * keeps the bound a one-entry slot had by construction. Real batches are a
+ * handful of calls; a codemode fan-out of dozens still fits.
+ */
+export const OPAQUE_BASELINE_PENDING_CAP = 64;
+
+/**
+ * Baselines awaiting their `tool_result`, one entry per bash call (#4137).
+ *
+ * pi runs the bash calls of one assistant message in parallel (top level and
+ * codemode's nested `Promise.all` alike), so all N `tool_call`s precede the
+ * first `tool_result`. A slot per cwd kept the last baseline and N-1 calls lost
+ * the evidence that proves they authored their own writes. The tool-call id
+ * gives each call its own entry; a host that supplies no id keeps the shared
+ * slot, the only identity it offers.
+ *
+ * A call's recovery window also holds its siblings' writes, which it dispatches
+ * as opaque; the pipeline dedupe ranks authority, so the sibling's own authored
+ * dispatch of the same bytes still runs (`claimPipelineDispatch`).
+ */
 export class OpaqueBaselineStore {
-	private readonly byCwd = new Map<string, PendingOpaqueBaseline>();
-	private evictions = 0;
+	private readonly pending = new BoundedFifoMap<
+		string,
+		{ state: PendingOpaqueBaseline; turn: OpaqueBaselineTurn | undefined }
+	>(OPAQUE_BASELINE_PENDING_CAP);
 
-	record(cwdKey: string, baseline: PendingOpaqueBaseline): void {
-		if (this.byCwd.has(cwdKey)) this.evictions += 1;
-		this.byCwd.set(cwdKey, baseline);
+	private static keyOf(slot: string, callId: string | undefined): string {
+		return callId === undefined ? slot : `${slot}#${callId}`;
 	}
 
-	take(cwdKey: string): PendingOpaqueBaseline | undefined {
-		const baseline = this.byCwd.get(cwdKey);
-		this.byCwd.delete(cwdKey);
-		return baseline;
+	/**
+	 * Store `state` for a call. A baseline this displaces is lost: its
+	 * `tool_result` will find nothing and report `partial-recognition-no-baseline`,
+	 * withholding the blocker section of a write the agent authored. That loss is
+	 * counted in the degradation ledger, one entry per cause with a running count,
+	 * never one row per occurrence (#4137).
+	 *
+	 * First, an entry whose turn is over is retired: pi sends no `tool_result`
+	 * for a call a `tool_call` handler blocked or Escape aborted before it ran,
+	 * and on a non-git project the entry holds a whole-tree stat snapshot.
+	 */
+	record(
+		slot: string,
+		callId: string | undefined,
+		state: PendingOpaqueBaseline,
+		turn?: OpaqueBaselineTurn,
+	): void {
+		for (const [staleKey, entry] of this.pending.entriesArray())
+			if (entry.turn && !entry.turn.isLive(entry.turn.key)) {
+				this.pending.delete(staleKey);
+				recordBaselineLoss("unsettled");
+			}
+		const key = OpaqueBaselineStore.keyOf(slot, callId);
+		const overwrote = this.pending.delete(key);
+		const evicted = this.pending.set(key, { state, turn });
+		if (overwrote) recordBaselineLoss("overwrite");
+		if (evicted.length > 0) recordBaselineLoss("cap");
 	}
 
-	get evictionCount(): number {
-		return this.evictions;
+	take(
+		slot: string,
+		callId: string | undefined,
+	): PendingOpaqueBaseline | undefined {
+		const key = OpaqueBaselineStore.keyOf(slot, callId);
+		const entry = this.pending.get(key);
+		this.pending.delete(key);
+		return entry?.state;
 	}
 
 	/** Session-boundary clear - unconsumed baselines are unreachable after reset. */
 	takeAllForTest(): void {
-		this.byCwd.clear();
+		this.pending.clear();
 	}
+}
+
+const BASELINE_LOSS_REASONS = {
+	overwrite:
+		"a pending bash baseline was replaced before its tool_result took it; that call reports partial-recognition-no-baseline and withholds blockers (host without distinct tool-call ids, or a reused id)",
+	cap: `more than ${OPAQUE_BASELINE_PENDING_CAP} bash baselines awaited a tool_result; the oldest was dropped`,
+	unsettled:
+		"a bash baseline outlived its turn with no tool_result (the call was blocked or aborted before it ran) and was retired; a result that still arrives reports partial-recognition-no-baseline",
+} as const;
+
+function recordBaselineLoss(cause: keyof typeof BASELINE_LOSS_REASONS): void {
+	incrementDegradationCount({
+		kind: "opaque-baseline-lost",
+		subject: cause,
+		reason: BASELINE_LOSS_REASONS[cause],
+	});
 }
 
 const globalStoreSymbol = Symbol.for("pi-lens:opaque-snapshot-store");
@@ -330,6 +438,125 @@ export function resetOpaqueMutationState(): void {
 	getOpaqueBaselineStore().takeAllForTest();
 	gitRepoMemo.clear();
 	gitToplevelMemo.clear();
+	headRecords.clear();
+	headLooks.clear();
+}
+
+/**
+ * #4493: the HEAD each session last saw in a scan slot, so a clean-tree HEAD
+ * move (checkout, reset --hard, a completed rebase or cherry-pick, or one made
+ * outside pi) is seen at all: `git status` is empty after one. Keyed by
+ * {@link headRecordKey}, so one session never reads or writes another's.
+ * Cleared with the rest of this module at the session boundary, where the LSP
+ * service resets too, so no held document outlives its record.
+ */
+const HEAD_RECORD_CAP = 64;
+const headRecords = new BoundedFifoMap<string, string>(HEAD_RECORD_CAP);
+
+/** One session's HEAD record key in a scan slot ({@link opaqueBaselineSlot}). */
+export function headRecordKey(
+	slot: string,
+	sessionId: string | undefined,
+): string {
+	return `${slot}|${sessionId ?? ""}`;
+}
+
+/**
+ * Record `head` for `key` and return the HEAD it replaces when that differs:
+ * the move to resync. A first observation returns `undefined`. Synchronous, so
+ * two looks cannot both claim a move; {@link serializeHeadLook} keeps the
+ * looks of one key in order.
+ */
+export function observeGitHead(key: string, head: string): string | undefined {
+	const previous = headRecords.get(key);
+	headRecords.delete(key);
+	headRecords.set(key, head);
+	return previous !== undefined && previous !== head ? previous : undefined;
+}
+
+/**
+ * #4493: one HEAD look per record key at a time. A session's parallel tool
+ * calls look concurrently. A look that arrives mid-flight joins it: it returns
+ * only once the flight has sent the move's bytes to the primary servers, so a
+ * parallel read or edit never runs against the stale view (review r1 F1). It
+ * also gets one trailing look of its own, which reads HEAD after the flight,
+ * so a move made after the flight read HEAD is seen before it returns (review
+ * r1 F2, #1687's shape). An entry lives while its flight runs.
+ */
+const headLooks = createSingleFlight<void>({ coalesceTrailing: true });
+
+/** Run `look` as the only HEAD look of `key` in flight. */
+export function serializeHeadLook(
+	key: string,
+	look: () => Promise<void>,
+): Promise<void> {
+	return headLooks.run(key, look);
+}
+
+const COMMIT_ID = /^[0-9a-f]{40,64}$/;
+
+/**
+ * HEAD's commit id, or `undefined` for an unborn HEAD or a failed read. Every
+ * non-bash tool_call looks, so the common case reads the files git keeps
+ * (`resolveGitIdentity`: HEAD, the loose ref, packed-refs; about 0.05 ms)
+ * and spawns `git rev-parse` only when those cannot answer: a reftable ref
+ * store, a SHA-256 detached HEAD, or anything else they do not resolve.
+ */
+export async function readGitHead(root: string): Promise<string | undefined> {
+	const fromFiles = resolveGitIdentity(root)?.headCommit;
+	if (fromFiles && COMMIT_ID.test(fromFiles)) return fromFiles;
+	const result = await safeSpawnAsync(
+		"git",
+		["rev-parse", "--verify", "-q", "HEAD"],
+		{ cwd: root, timeout: 3000 },
+	);
+	const head =
+		!result.error && result.status === 0 ? result.stdout?.trim() : undefined;
+	return head && COMMIT_ID.test(head) ? head : undefined;
+}
+
+/**
+ * The directory git prints porcelain and diff paths relative to: the top of
+ * the checkout `root` is in, in `root`'s own spelling (git's own toplevel is
+ * a real path). Read from files; `root` itself when that cannot answer.
+ *
+ * The file walk stops at the first `.git` it finds, but git skips a `.git`
+ * directory with no HEAD and keeps looking. Such a top is not git's, so it
+ * answers `root` (a stray `/tmp/.git` once sent every path to `/tmp`).
+ */
+function gitPathBase(root: string): string {
+	const top = resolveGitCheckout(root)?.spelledRoot;
+	if (!top) return root;
+	const dotGit = path.join(top, ".git");
+	// A `.git` file (a linked worktree) names a git dir the walk checked.
+	const linked =
+		fs.statSync(dotGit, { throwIfNoEntry: false })?.isFile() === true;
+	return linked || fs.existsSync(path.join(dotGit, "HEAD")) ? top : root;
+}
+
+/**
+ * The files that differ between commits `from` and `to`, as map keys, or
+ * `undefined` when git failed or the listing was cut. The whole checkout's
+ * delta, so a held document outside a subdirectory cwd is in it too;
+ * `--no-renames` lists both sides of a rename.
+ */
+export async function listGitHeadDelta(
+	root: string,
+	from: string,
+	to: string,
+): Promise<string[] | undefined> {
+	const result = await safeSpawnAsync(
+		"git",
+		["diff", "--name-only", "--no-renames", "-z", from, to],
+		{ cwd: root, timeout: 5000, maxOutputBytes: MAX_GIT_STATUS_OUTPUT_BYTES },
+	);
+	if (truncatedByOutputCap(result) || result.error || result.status !== 0)
+		return undefined;
+	const base = gitPathBase(root);
+	return (result.stdout ?? "")
+		.split("\0")
+		.filter(Boolean)
+		.map((relPath) => normalizeMapKey(path.resolve(base, relPath)));
 }
 
 /** Cached git-worktree probe (repos don't stop being git mid-session). */
@@ -556,6 +783,9 @@ export async function recoverOpaqueChangesViaGit(
 			scannedCount: 0,
 		};
 	}
+	// Porcelain paths are relative to the top of the checkout, not to `root`
+	// (#4493 residual 3): from a subdirectory each one pointed below itself.
+	const base = gitPathBase(root);
 	const entries: GitStatusEntry[] = [];
 	let unknownStatusCount = 0;
 	let skipNext = false; // rename's OLD path follows its NEW path
@@ -586,7 +816,7 @@ export async function recoverOpaqueChangesViaGit(
 		}
 		if (!isKnownPorcelainStatus(status)) unknownStatusCount += 1;
 		if (status.includes("R") || status.includes("C")) skipNext = true;
-		entries.push({ status, absPath: path.resolve(root, relPath) });
+		entries.push({ status, absPath: path.resolve(base, relPath) });
 	}
 	if (skipNext) {
 		return {

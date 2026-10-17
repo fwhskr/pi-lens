@@ -1,11 +1,17 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { normalizeEphemeralMapKey } from "../../clients/path-utils.js";
 import { mapGeneratedLineToOriginal } from "./mutation-source-map.mjs";
 
 const IMPORT_SPECIFIER_RE =
 	/(?:from\s+|import\s*(?:\(\s*)?|require\(\s*)["']([^"']+)["']/g;
+// A test can reach a mutation source through `path.resolve(...)`/`path.join(...)`
+// instead of an import specifier (e.g. analyze-pi-lens-logs-detectors.test.ts).
+// The argument window runs to end of line, so a nested `path.dirname(...)` does
+// not hide the relative literal that follows it.
+const PATH_RESOLVER_LINE_RE =
+	/(?:\bpath\s*\.\s*)?\b(?:resolve|join)\s*\(([^\n]*)/g;
+const STRING_LITERAL_RE = /["']([^"']+)["']/g;
 const MUTATION_LANE_EXCLUSION_RE = /^\s*\/\/\s*mutation-lane:\s*exclude\s*$/m;
 const MUTATION_LANE_EXCLUSIONS_PATH =
 	"tests/config/stryker-diff-exclusions.json";
@@ -67,6 +73,26 @@ export const DEFAULT_MAX_RANGES = 40;
 // about mutant execution cost.
 export const DEFAULT_MAX_TESTS = 47;
 
+// #4092: the count cap above never bound the nightly. The PR's own test files
+// (every test file changed in the window) are exempt from it, so both shards of
+// run 37629970371 ran 122 test files, not 47, and the initial test run took
+// 358 s on 4 cores and 449 s on 2, past Stryker's 5-minute default. The run is
+// now also bounded by estimated runtime: each coverage probe records the test
+// time vitest reports for its file, and the kept tests are fitted into
+// MAX_DRY_RUN_SECONDS. 240 s is where the four initial runs that passed in CI
+// sat (231 to 254 s, run 37605896822), and stryker.config.mjs's
+// `dryRunTimeoutMinutes` (10) is 2.5x it. A test with no timing counts
+// UNKNOWN_TEST_SECONDS and every file adds TEST_FILE_OVERHEAD_SECONDS (import
+// and transform; 58 s over 122 files at 2 cores). The unknown cost is the p95 of
+// the 122 measured files (12 s), not their mean (3.2 s, half of it one 169 s
+// file; median 0.13 s): an all-unknown own set costed at the mean kept 64 files
+// of which the actual seconds reached 360 s (p95 over 400 shuffles), costed at
+// 12 s the p95 is 221 s, inside the cap (R2 F2 of #4108). Raw measurements:
+// tests/fixtures/mutation-dry-run-measurement.json.
+export const MAX_DRY_RUN_SECONDS = 240;
+export const UNKNOWN_TEST_SECONDS = 12;
+export const TEST_FILE_OVERHEAD_SECONDS = 0.5;
+
 /**
  * Wall-clock bound the driver puts on the Stryker child, in minutes. It must
  * stay strictly below .github/workflows/ci.yml's `mutation` job `timeout-minutes`, or
@@ -98,6 +124,46 @@ export const isCompiledMutationSource = (file) =>
 	!file.endsWith(".test.ts") &&
 	!file.endsWith(".d.ts");
 
+/**
+ * A path that may sit on the nightly carry-over queue (#4005): a runtime source
+ * spelled as a plain repository-relative path. The queue lives in an issue body
+ * a maintainer can edit, so the list is validated on read: no `..`, absolute,
+ * backslash, comma, `-->` or whitespace spelling gets through.
+ */
+export const isQueueablePath = (file) =>
+	typeof file === "string" &&
+	/^[A-Za-z0-9_./@+-]+$/.test(file) &&
+	file
+		.split("/")
+		.every((part) => part !== "" && part !== "." && part !== "..") &&
+	isCompiledMutationSource(file);
+
+const QUEUE_BASE_RE = /^[0-9a-f]{40}$/;
+
+/**
+ * One carry-over queue entry (#4005 r4): `path@sha`, the sha being the base the
+ * file's unevaluated changes start from, or a bare `path` (no base: read
+ * against the window base). Only a full lowercase sha is split off; any other
+ * suffix stays part of the spelling, which then has to be a queueable path by
+ * itself. Returns null when the spelling is not an entry.
+ *
+ * @param {unknown} spelling
+ * @returns {{file: string, base: string | null} | null}
+ */
+export function parseQueueEntry(spelling) {
+	const text = typeof spelling === "string" ? spelling.trim() : "";
+	const at = text.lastIndexOf("@");
+	const split = at > 0 && QUEUE_BASE_RE.test(text.slice(at + 1));
+	const file = split ? text.slice(0, at) : text;
+	return isQueueablePath(file)
+		? { file, base: split ? text.slice(at + 1) : null }
+		: null;
+}
+
+/** @param {{file: string, base: string | null}} entry */
+export const formatQueueEntry = ({ file, base }) =>
+	base ? `${file}@${base}` : file;
+
 export const isMutationSourceFile = (file) =>
 	isScriptMutationFile(file) || isCompiledMutationSource(file);
 
@@ -128,6 +194,17 @@ function extractRelativeSpecifiers(content) {
 		if (match[1].startsWith(".")) specifiers.push(match[1]);
 		match = IMPORT_SPECIFIER_RE.exec(content);
 	}
+	PATH_RESOLVER_LINE_RE.lastIndex = 0;
+	let call = PATH_RESOLVER_LINE_RE.exec(content);
+	while (call) {
+		STRING_LITERAL_RE.lastIndex = 0;
+		let literal = STRING_LITERAL_RE.exec(call[1]);
+		while (literal) {
+			if (literal[1].startsWith(".")) specifiers.push(literal[1]);
+			literal = STRING_LITERAL_RE.exec(call[1]);
+		}
+		call = PATH_RESOLVER_LINE_RE.exec(content);
+	}
 	return specifiers;
 }
 
@@ -138,15 +215,134 @@ function normalized(file) {
 		.replace(/\.(?:mjs|js|cjs|ts)$/, "");
 }
 
-export function capMutationFiles(files, maxFiles = DEFAULT_MAX_FILES) {
+/**
+ * True when a test's source reaches `sourceFile` through a relative import (or
+ * a path literal, as mapRelatedTests reads them). The same resolution
+ * mapRelatedTests applies, for one test at a time.
+ *
+ * @param {string} testFile repo-relative test path
+ * @param {string} content the test's source
+ * @param {string} sourceFile repo-relative mutation source
+ */
+export function importsMutationSource(testFile, content, sourceFile) {
+	const target = normalized(sourceFile);
+	return extractRelativeSpecifiers(content).some(
+		(specifier) =>
+			normalized(path.resolve(path.dirname(testFile), specifier)) === target,
+	);
+}
+
+/**
+ * The heaviest `maxFiles` files by changed-line weight (#3810, from the #3797
+ * review): the old alphabetical cut skipped the four files holding #3706's
+ * actual change and mutated its label plumbing and an oxfmt reflow. Equal
+ * weights fall back to the path so the choice stays deterministic.
+ *
+ * @param {string[]} files
+ * @param {number} [maxFiles]
+ * @param {Map<string, number>} [weights] changed lines per file (see changedLineWeights)
+ */
+export function capMutationFiles(
+	files,
+	maxFiles = DEFAULT_MAX_FILES,
+	weights = new Map(),
+) {
 	if (!Number.isInteger(maxFiles) || maxFiles < 0) {
 		throw new RangeError("maxFiles must be a non-negative integer");
 	}
-	const ordered = [...files].sort();
+	// Path order first, then a stable sort by weight: equal weights keep it.
+	const ordered = [...files]
+		.sort()
+		.sort((a, b) => (weights.get(b) ?? 0) - (weights.get(a) ?? 0));
 	return {
 		selected: ordered.slice(0, maxFiles),
 		skipped: ordered.slice(maxFiles),
 	};
+}
+
+/**
+ * The mutate set of one nightly run (#4005): files carried over from earlier
+ * nights first, in their queue order, then the new window's files by changed-
+ * line weight, under the one `maxFiles` cap. What the cap leaves out, pending
+ * files first, is `skipped` and goes back on the queue.
+ *
+ * @param {{pending?: string[], windowFiles: string[], maxFiles?: number, weights?: Map<string, number>}} options
+ */
+export function selectMutationFiles({
+	pending = [],
+	windowFiles,
+	maxFiles = DEFAULT_MAX_FILES,
+	weights = new Map(),
+}) {
+	const queue = [...new Set(pending)];
+	const queued = new Set(queue);
+	const head = queue.slice(0, maxFiles);
+	const rest = capMutationFiles(
+		windowFiles.filter((file) => !queued.has(file)),
+		maxFiles - head.length,
+		weights,
+	);
+	return {
+		selected: [...head, ...rest.selected],
+		skipped: [...queue.slice(maxFiles), ...rest.skipped],
+	};
+}
+
+/**
+ * Split one globally selected population into disjoint deterministic shards.
+ * Selection happens before splitting so queue order and path@sha bases have
+ * one canonical decision (#4035 r2).
+ *
+ * @param {{selected: string[], skipped: string[], shardIndex?: number, shardCount?: number}} options
+ */
+export function partitionMutationFiles({
+	selected,
+	skipped,
+	shardIndex = 0,
+	shardCount = 1,
+}) {
+	if (
+		!Number.isInteger(shardIndex) ||
+		!Number.isInteger(shardCount) ||
+		shardCount < 1 ||
+		shardIndex < 0 ||
+		shardIndex >= shardCount
+	)
+		throw new RangeError("invalid mutation shard");
+	return {
+		selected: selected.filter((_, index) => index % shardCount === shardIndex),
+		// One shard owns skipped files so combined reports do not duplicate them.
+		skipped: shardIndex === 0 ? skipped : [],
+	};
+}
+
+/**
+ * Changed line ranges per file, each file against its own base (#4005 r4): a
+ * carried-over file against the base its queue entry carries (its earlier
+ * changes are outside the current window), every other file against the
+ * window base. One `diff(base, files)` call per distinct base; it is the git
+ * call, injected so the split is testable.
+ *
+ * @param {{files: string[], baseRef: string, baseOf?: Map<string, string>, diff: (base: string, files: string[]) => Map<string, Array<[number, number]>>}} options
+ */
+export function collectChangedRanges({
+	files,
+	baseRef,
+	baseOf = new Map(),
+	diff,
+}) {
+	const groups = new Map([[baseRef, []]]);
+	for (const file of files) {
+		const base = baseOf.get(file) ?? baseRef;
+		if (!groups.has(base)) groups.set(base, []);
+		groups.get(base).push(file);
+	}
+	const out = new Map();
+	for (const [base, subset] of groups) {
+		if (subset.length === 0) continue;
+		for (const [k, v] of diff(base, subset)) out.set(k, v);
+	}
+	return out;
 }
 
 /**
@@ -179,6 +375,21 @@ export function parseChangedLineRanges(diffText) {
 		ranges.get(file).push([start, Math.max(start, newStart + count - 1)]);
 	}
 	return ranges;
+}
+
+/**
+ * Changed lines per file, from the ranges of `parseChangedLineRanges`.
+ *
+ * @param {Map<string, Array<[number, number]>>} rangesByFile
+ * @returns {Map<string, number>}
+ */
+export function changedLineWeights(rangesByFile) {
+	return new Map(
+		[...rangesByFile].map(([file, ranges]) => [
+			file,
+			ranges.reduce((sum, [start, end]) => sum + (1 + end - start), 0),
+		]),
+	);
 }
 
 /**
@@ -267,21 +478,54 @@ export function extractSnippet(sourceLines, location) {
  *
  * @param {{status: number|null, signal?: string|null, error?: Error & {code?: string}}} result
  * @param {number} budgetMinutes
+ * @param {{minutes?: number} | null} [dryRunTimeout] set when Stryker's own
+ *   initial-test-run bound fired (#4092), which no spawn error reveals
  */
-function strykerFailureCause(result, budgetMinutes) {
+function strykerFailureCause(result, budgetMinutes, dryRunTimeout = null) {
+	if (dryRunTimeout) {
+		return `the initial test run exceeded Stryker's dryRunTimeoutMinutes${dryRunTimeout.minutes === undefined ? "" : ` (${dryRunTimeout.minutes})`} before any mutant was evaluated`;
+	}
 	return result.error?.code === "ETIMEDOUT"
 		? `the ${budgetMinutes}-minute mutation budget expired before Stryker produced a result`
 		: `dry run or mutation execution failed (Stryker status ${result.status ?? "unknown"}${result.error ? `: ${result.error.message}` : ""})`;
 }
 
+// Stryker's DryRunExecutor logs this at ERROR when the initial test run passes
+// `dryRunTimeoutMinutes` (@stryker-mutator/core 3-dry-run-executor.js
+// logTimeoutInitialRun), then throws, so the child exits 1 like any other
+// dry-run failure; the text is the only discriminator (#4092). Anchored to the
+// logger's own line (`HH:MM:SS (pid) ERROR DryRunExecutor <message>`, with the
+// ANSI colour codes chalk adds, verbatim from run 37629970371): Stryker's
+// command runner puts the whole vitest output into the "One or more tests
+// failed in the initial test run" log, and a test that asserts or prints the
+// literal (this lane's own tests do) would otherwise read as a timeout and hide
+// a real failure. The two logs are exclusive in Stryker (a Complete run with
+// failures, or a Timeout), so the failed-tests line also vetoes.
+const ANSI = String.raw`(?:\x1b\[[0-9;]*m)*`;
+const DRY_RUN_TIMEOUT_RE = new RegExp(
+	String.raw`^${ANSI}\d{2}:\d{2}:\d{2} \(\d+\) ERROR DryRunExecutor${ANSI} Initial test run timed out!\s*$`,
+	"m",
+);
+const DRY_RUN_TESTS_FAILED_RE =
+	/One or more tests failed in the initial test run/;
+
+/**
+ * @param {string} [output] Stryker's console output or its file log
+ */
+export const isDryRunTimeout = (output = "") =>
+	DRY_RUN_TIMEOUT_RE.test(output) && !DRY_RUN_TESTS_FAILED_RE.test(output);
+
 /**
  * @param {{status: number|null, signal?: string|null, error?: Error & {code?: string}}} result
  * @param {number} budgetMinutes
+ * @param {{tests?: string[], output?: string, dryRunTimeoutMinutes?: number}} [details]
+ *   `output` is Stryker's console text or file log: it names the failing tests
+ *   and tells a dry-run timeout (`isDryRunTimeout`) from any other failure
  */
 export function describeStrykerFailure(
 	result,
 	budgetMinutes,
-	{ tests = [], output = "" } = {},
+	{ tests = [], output = "", dryRunTimeoutMinutes } = {},
 ) {
 	const failed = [
 		...new Set(
@@ -295,7 +539,10 @@ export function describeStrykerFailure(
 		named.length > 0
 			? `; tests involved: ${named.join(", ")}`
 			: "; no related test file was identified";
-	return `mutation diff: dry run failed; no mutants evaluated; ${strykerFailureCause(result, budgetMinutes)}${suffix}`;
+	const dryRunTimeout = isDryRunTimeout(output)
+		? { minutes: dryRunTimeoutMinutes }
+		: null;
+	return `mutation diff: dry run ${dryRunTimeout ? "timed out" : "failed"}; no mutants evaluated; ${strykerFailureCause(result, budgetMinutes, dryRunTimeout)}${suffix}`;
 }
 
 /**
@@ -325,56 +572,6 @@ export function formatCapNotice(selectedCount, totalCount, skipped) {
 	return `capped: ${selectedCount} of ${totalCount} changed files mutated; skipped: ${skipped.join(", ")}`;
 }
 
-export function formatTestCapNotice(selectedCount, totalCount) {
-	return `capped: ${selectedCount} of ${totalCount} related tests selected; dropped: ${totalCount - selectedCount}`;
-}
-
-/**
- * Bound the test population without changing any under-cap selection. Sibling
- * tests are first, then tests with a direct import, then any future incidental
- * relations. Ties use the normalized path and then the original index for
- * exact duplicate paths, making a capped selection reproducible even when
- * directory enumeration changes.
- *
- * @param {string[]} tests
- * @param {number} maxTests
- * @param {Map<string, number>} [priorities]
- */
-export function capRelatedTests(
-	tests,
-	maxTests = DEFAULT_MAX_TESTS,
-	priorities = new Map(),
-) {
-	if (!Number.isInteger(maxTests) || maxTests < 0) {
-		throw new RangeError("maxTests must be a non-negative integer");
-	}
-	if (tests.length <= maxTests) return { selected: tests, dropped: [] };
-	const ranked = tests
-		.map((test, index) => ({
-			test,
-			index,
-			pathKey: normalizeEphemeralMapKey(test),
-			priority: priorities.get(test) ?? 2,
-		}))
-		.sort(
-			(a, b) =>
-				a.priority - b.priority ||
-				(a.pathKey < b.pathKey ? -1 : a.pathKey > b.pathKey ? 1 : 0) ||
-				a.index - b.index,
-		);
-	const selectedSet = new Set(
-		ranked.slice(0, maxTests).map(({ test }) => test),
-	);
-	return {
-		selected: ranked
-			.filter(({ test }) => selectedSet.has(test))
-			.map(({ test }) => test),
-		dropped: ranked
-			.filter(({ test }) => !selectedSet.has(test))
-			.map(({ test }) => test),
-	};
-}
-
 /**
  * The conventional test-file location a mutation source's basename maps to,
  * mirroring the file's top-level directory: `scripts/lib/ci-checks.mjs` ->
@@ -399,12 +596,14 @@ function conventionalTestSibling(file) {
 /**
  * Select tests that cover changed mutation sources (scripts/**\/*.mjs and
  * the compiled-source classes in isCompiledMutationSource) through one-hop
- * relative imports or the conventional tests/<dir>/<name>.test.ts sibling.
- * Compiled sources are matched the same way scripts are: test files import
- * them with a relative specifier (typically ending in `.js`, since that is
- * what TypeScript's `nodenext` resolution and the repo's own tests use to
- * reach a compiled `clients/*.ts` module -- e.g. `tests/index-wiring.test.ts`
- * imports `../index.js`), which `normalized()` compares extension-agnostically.
+ * relative imports, the conventional tests/<dir>/<name>.test.ts sibling, a
+ * `<name>-*.test.ts` sibling beside it, or a relative literal a test resolves
+ * by path (`path.resolve`/`path.join`). Compiled sources are matched the same
+ * way scripts are: test files import them with a relative specifier (typically
+ * ending in `.js`, since that is what TypeScript's `nodenext` resolution and
+ * the repo's own tests use to reach a compiled `clients/*.ts` module -- e.g.
+ * `tests/index-wiring.test.ts` imports `../index.js`), which `normalized()`
+ * compares extension-agnostically.
  *
  * @param {string[]} changedFiles
  * @param {{ testFiles?: string[], readFile?: (file: string) => string }} [options]
@@ -437,15 +636,18 @@ export function mapRelatedTests(
 
 	for (const file of sources) {
 		const sibling = conventionalTestSibling(file);
-		const siblingEntry = testContents.find(
-			([test]) => normalized(test) === normalized(sibling),
-		);
-		if (siblingEntry) {
-			const siblingExclusion = siblingEntry[2];
-			if (siblingExclusion) excluded.set(sibling, siblingExclusion);
+		const siblingKey = normalized(sibling);
+		const prefixKey = siblingKey.replace(/\.test$/, "") + "-";
+		for (const [test, , exclusion] of testContents) {
+			const testKey = normalized(test);
+			const isSibling =
+				testKey === siblingKey ||
+				(testKey.startsWith(prefixKey) && testKey.endsWith(".test"));
+			if (!isSibling) continue;
+			if (exclusion) excluded.set(test, exclusion);
 			else {
-				related.get(file).add(sibling);
-				priorities.set(sibling, 0);
+				related.get(file).add(test);
+				priorities.set(test, 0);
 			}
 		}
 		const target = normalized(file);
@@ -492,20 +694,25 @@ export function mapRelatedTests(
  * during sandbox init, BEFORE `buildCommand` runs, so the base config's
  * `"npm run build"` would silently discard every mutant for a compiled
  * target before a single test executes (see scripts/lib/mutation-touch-
- * build.mjs's own header). `force: true` keeps `incremental` enabled (so a
- * budget-killed run still saves a partial report, round 2 S2) while never
- * reading a STALE `.stryker/incremental.json` left by an earlier, unrelated
- * local run (round 2 T4) -- `force` makes Stryker treat any existing
- * incremental file as absent on the read side, without disabling the
- * write-on-interrupt behavior that depends on `options.incremental` alone.
+ * build.mjs's own header). `force` keeps `incremental` enabled (so a
+ * budget-killed run still saves a partial report, round 2 S2) while making
+ * Stryker treat any existing incremental file as absent on the read side,
+ * without disabling the write-on-interrupt behavior that depends on
+ * `options.incremental` alone. It is true unless the caller proved the file
+ * belongs to this run's tests and inputs (`reuse`, #3810): otherwise a STALE
+ * `.stryker/incremental.json` from an earlier, unrelated local run (round 2
+ * T4) or an earlier push with different tests would be read. `fileLogLevel`
+ * makes Stryker write its "N of M mutant result(s) are reused" line to
+ * `stryker.log`, the only place the reuse count exists.
  *
  * @param {object} baseConfig stryker.config.mjs's default export
- * @param {{command: string}} options the per-run test command
+ * @param {{command: string, reuse?: boolean}} options the per-run test command
  */
-export function buildRunConfig(baseConfig, { command }) {
+export function buildRunConfig(baseConfig, { command, reuse = false }) {
 	return {
 		...baseConfig,
-		force: true,
+		force: !reuse,
+		fileLogLevel: "info",
 		buildCommand: "node scripts/lib/mutation-touch-build.mjs",
 		commandRunner: { ...baseConfig.commandRunner, command },
 	};
@@ -542,8 +749,9 @@ export function parseDryRunCost(output) {
 /**
  * How many mutants the remaining budget affords, from a real measured dry
  * run. Vitest runners are CPU-bound in this lane: the #3649 measurement saw
- * only 1.11x wall-clock speedup at Stryker concurrency 2, so this estimator
- * deliberately models one effective worker. `safetyFactor` (< 1) reserves
+ * only 1.11x wall-clock speedup at Stryker concurrency 2 (#3810 measured the
+ * CI runner again: concurrency 3 and 4 ran the mutation phase 1.10x and 1.13x
+ * faster than 2), so this estimator deliberately models one effective worker. `safetyFactor` (< 1) reserves
  * headroom for timing variance and fixed run overhead.
  *
  * @param {{remainingMs: number, dryRunMs: number, fixedOverheadMs?: number, safetyFactor?: number}} args

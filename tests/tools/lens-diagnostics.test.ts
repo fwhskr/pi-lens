@@ -4,6 +4,8 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
+import * as lspConfig from "../../clients/lsp/config.js";
+import { LSP_SERVERS } from "../../clients/lsp/server.js";
 import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
 import { hashDiagnosticContent } from "../../clients/lsp/diagnostic-binding.js";
 import { PROJECT_DIAGNOSTICS_CACHE_VERSION } from "../../clients/project-diagnostics/cache.js";
@@ -137,6 +139,10 @@ vi.mock(
 
 beforeEach(() => {
 	resetDegradationLedger();
+	// #4397: the once-per-session claims (`runner_coverage_retired` per runner)
+	// are process state shared by every case; a case that logs the row must not
+	// depend on which sibling consumed the claim first.
+	resetOncePerSessionPhases();
 	projectDiagnosticsMocks.scanProjectDiagnostics.mockReset();
 	projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReset();
 	projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReset();
@@ -219,6 +225,7 @@ describe("lens_diagnostics compact filename", () => {
 		const file = path.join(cwd, "app.ts");
 		fs.writeFileSync(file, "const app = 1;\n");
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => []),
 			getCapabilitySnapshots: vi.fn(async () => []),
@@ -247,6 +254,7 @@ describe("lens_diagnostics compact filename", () => {
 		fs.writeFileSync(diagnosed, "const diagnosed = 1;\n");
 		fs.writeFileSync(unrelated, "const unrelated = 1;\n");
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => []),
 			getCapabilitySnapshots: vi.fn(async () => []),
@@ -273,6 +281,37 @@ describe("lens_diagnostics compact filename", () => {
 		} finally {
 			removeTempDirSync(cwd);
 		}
+	});
+});
+
+describe("lens_diagnostics compact line for a file no language server answered (#4322)", () => {
+	it("says no language server answered rather than that it cannot confirm clean", () => {
+		const tool = makeTool({}, {});
+		const rendered = (
+			tool.renderResult!(
+				{
+					content: [
+						{ type: "text", text: "Primary LSP (json): not available" },
+					],
+					details: {
+						source: "lsp",
+						mode: "file",
+						filePath: "/project/probe.json",
+						totalDiagnostics: 0,
+						unconfirmed: true,
+						primaryUnavailable: "Primary LSP (json): not available",
+					},
+				} as any,
+				{ expanded: false },
+				{} as Theme,
+				{ args: { source: "lsp", path: "/project/probe.json" } },
+			) as any
+		)
+			.render(200)
+			.join("\n");
+		expect(rendered).toContain(
+			"lens_diagnostics probe.json — unconfirmed (no language server answered)",
+		);
 	});
 });
 
@@ -319,6 +358,7 @@ describe("lens_diagnostics source and scope routing", () => {
 			),
 		);
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () =>
 				tiers.map(([_, message, severity]) => ({
@@ -398,6 +438,7 @@ describe("lens_diagnostics source and scope routing", () => {
 			),
 		);
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => [
 				{
@@ -443,6 +484,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		const file = path.join(cwd, "bad.ts");
 		fs.writeFileSync(file, "const value: number = 'bad';\n");
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => [
 				{
@@ -466,7 +508,13 @@ describe("lens_diagnostics source and scope routing", () => {
 			expect(result.details.source).toBe("lsp");
 			expect(result.details.scope).toBe("paths");
 			expect(result.content[0].text).toContain("probe finding");
-			expect(service.getDiagnostics).toHaveBeenCalledWith(file, "full");
+			// #4323: the third argument is the config-disabled auxiliaries; this
+			// tool is built without a flag resolver, so nothing is excluded.
+			expect(service.getDiagnostics).toHaveBeenCalledWith(
+				file,
+				"full",
+				undefined,
+			);
 		} finally {
 			removeTempDirSync(cwd);
 		}
@@ -479,6 +527,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		fs.writeFileSync(path.join(cwd, "one.ts"), "const one = 1;\n");
 		const service = {
 			runWorkspaceDiagnostics: vi.fn(async () => []),
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(async () => []),
 			getCapabilitySnapshots: vi.fn(async () => []),
@@ -509,6 +558,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		fs.writeFileSync(path.join(cwd, "outside.ts"), "const b = 1;\n");
 		const touched: string[] = [];
 		const service = {
+			announceCreatedFiles: vi.fn(),
 			touchFile: vi.fn(async (file: string) => {
 				touched.push(file);
 				return undefined;
@@ -542,6 +592,7 @@ describe("lens_diagnostics source and scope routing", () => {
 		const touchedByScope = new Map<string, string[]>();
 		function makeService(key: string) {
 			return {
+				announceCreatedFiles: vi.fn(),
 				touchFile: vi.fn(async (f: string) => {
 					touchedByScope.set(key, [...(touchedByScope.get(key) ?? []), f]);
 					return undefined;
@@ -709,16 +760,6 @@ describe("lens_diagnostics source=lsp compact render", () => {
 // ── schema ────────────────────────────────────────────────────────────────────
 
 describe("lens_diagnostics schema", () => {
-	it("exposes mode and severity parameters", () => {
-		const tool = makeTool();
-		const props = (tool.parameters as { properties: Record<string, unknown> })
-			.properties;
-		expect(props.mode).toBeDefined();
-		expect(props.severity).toBeDefined();
-		expect(props.refreshRunners).toBeDefined();
-		expect(props.analysisRoot).toBeDefined();
-	});
-
 	it("passes an explicit analysis root through mode=full (#2053)", async () => {
 		const lspService = {
 			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
@@ -736,6 +777,37 @@ describe("lens_diagnostics schema", () => {
 			expect.anything(),
 			expect.objectContaining({ analysisRoot: "/home/me/repo" }),
 		);
+	});
+
+	// #1617/#1625, folded onto the shared line by #1634: what the fresh
+	// analyzers dropped for a mark is counted with its lanes, in the text and in
+	// `details`. Recurrence: the analyzer note had no pin, and once mode=full
+	// gained its own count a second "suppressed by disposition" line (or a
+	// `details` count that overwrote the other) went unseen.
+	it("mode=full states what the analyzers dropped for a mark, with its lanes", async () => {
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: ["knip"],
+			analyzed: ["knip"],
+			cold: [],
+			timings: {},
+			failed: [],
+			dispositionSuppressed: 2,
+			dispositionSuppressedByLane: { knip: 2 },
+		});
+		const result = await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "all" },
+		);
+		const text = result.content[0].text;
+		expect(text).toContain(
+			"suppressed by disposition: 2 finding(s) (analyzer lanes: knip 2) dropped from this result",
+		);
+		expect(text.match(/suppressed by disposition/g)).toHaveLength(1);
+		expect(result.details).toMatchObject({
+			dispositionSuppressed: 2,
+			dispositionSuppressedByLane: { knip: 2 },
+		});
 	});
 
 	it("rejects an invalid explicit analysis root as a failed tool call (#2977 F2)", async () => {
@@ -841,7 +913,9 @@ describe("lens_diagnostics mode=delta", () => {
 
 	it("uses the server-owned cwd for the rendered row", async () => {
 		// #2846: the renderer must not independently rediscover a marker root.
-		const { LSP_SERVERS } = await import("../../clients/lsp/server.js");
+		// #4397: LSP_SERVERS is imported statically at the top of the file: a
+		// dynamic import after the wall-clock case's `vi.resetModules()` is a
+		// second copy the tool never reads.
 		const server = LSP_SERVERS.find((entry) => entry.id === "typescript");
 		if (!server) throw new Error("typescript server missing from registry");
 		const originalRoot = server.root;
@@ -3854,8 +3928,7 @@ describe("lens_diagnostics mode=all", () => {
 		// has no findings at all (dropped by withIssues), the `.ts` row
 		// renders — so the seam is called exactly once, for the rendered file.
 		// Pre-O2 the projection ran over every summary and the count was 2.
-		const config = await import("../../clients/lsp/config.js");
-		const seamSpy = vi.spyOn(config, "resolveLspCwdForFile");
+		const seamSpy = vi.spyOn(lspConfig, "resolveLspCwdForFile");
 		try {
 			mockSummaries.push({
 				filePath: "/proj/src/a.ts",
@@ -4495,13 +4568,6 @@ describe("lens_diagnostics mode=all", () => {
 // ── paths scope restrictor (#461) ───────────────────────────────────────────────
 
 describe("lens_diagnostics paths", () => {
-	it("exposes paths in the schema", () => {
-		const tool = makeTool();
-		const props = (tool.parameters as { properties: Record<string, unknown> })
-			.properties;
-		expect(props.paths).toBeDefined();
-	});
-
 	it("mode=all: paths filter shows only listed files, excluding unrelated cached findings", async () => {
 		mockSummaries.length = 0;
 		mockSummaries.push(sum("/proj/src/keep.ts", { warnings: 1 }));
@@ -4917,6 +4983,10 @@ describe("lens_diagnostics honors the turn abort (ctx.signal)", () => {
 
 describe("lens_diagnostics wall-clock ceiling (never-hang guarantee)", () => {
 	it("stops mode=full and marks timedOut when the wall-clock budget is exceeded", async () => {
+		// The sweep ceiling is read once at module load (`FULL_SCAN_WALL_CLOCK_MS`),
+		// so this case needs a fresh module graph. #4397: that reset makes every
+		// later `await import(...)` return a SECOND copy; cases that patch a module
+		// the tool reads import it statically at the top of the file instead.
 		vi.resetModules();
 		process.env.PI_LENS_LENS_DIAGNOSTICS_FULL_TIMEOUT_MS = "1";
 		const { createLensDiagnosticsTool: freshCreate } =

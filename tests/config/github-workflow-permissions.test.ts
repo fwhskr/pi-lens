@@ -49,17 +49,38 @@ const EXPECTED_PERMISSIONS: Record<
 	".github/workflows/install-smoke.yml": {
 		workflow: {},
 		jobs: {
+			// #4291: the diff classifier reads the PR's file list.
+			scope: { contents: "read", "pull-requests": "read" },
 			smoke: { contents: "read" },
+			"npm-strict": { contents: "read" },
 			"pi-load": { contents: "read" },
+			"lsp-handshake": { contents: "read" },
 			"mise-repro": { contents: "read" },
 			"host-range-smoke": { contents: "read", actions: "read" },
-			"host-latest-smoke": { contents: "read", issues: "write" },
+			"host-latest-smoke": { contents: "read" },
+			// #4077: the tracking issue is written by its own guarded job.
+			"host-latest-notify": { contents: "read", issues: "write" },
 		},
 	},
 	".github/workflows/labels.yml": {
 		workflow: {},
 		jobs: {
 			sync: { contents: "read", issues: "write" },
+		},
+	},
+	// #4288 R7: `pr-body-lint` reads the closed issue's labels, so it needs
+	// issues:read; the title job reads only the PR and the close-keyword job only
+	// the body. Pin every job so a later edit cannot silently drop the read.
+	".github/workflows/pr-metadata.yml": {
+		workflow: {},
+		jobs: {
+			"pr-title-lint": { contents: "read", "pull-requests": "read" },
+			"pr-body-lint": {
+				contents: "read",
+				"pull-requests": "read",
+				issues: "read",
+			},
+			"close-keyword-lint": { "pull-requests": "read" },
 		},
 	},
 };

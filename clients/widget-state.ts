@@ -12,7 +12,7 @@ import { normalizeEphemeralMapKey, normalizeMapKey } from "./path-utils.js";
 import { fitLine } from "./tui-fit.js";
 import { WriteOrderingGuard } from "./write-ordering-guard.js";
 import { collectForwardImportMtimes } from "./blocker-freshness.js";
-import { normalizeMessage } from "./finding-identity.js";
+import { findingIdentity } from "./finding-identity.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { PAST_EOF_STALE_MARKER } from "./diagnostic-line-freshness.js";
 import { STALE_LINE_MARKER } from "./stale-marker.js";
@@ -770,9 +770,11 @@ export const widgetStore = defineSessionStore<PersistedWidgetState>({
 	restore: async (_scope, payload, ctx) => {
 		clearWidgetState();
 		const state = payload as PersistedWidgetState | undefined;
-		if (!state?.files) return;
+		if (!state?.files) return { itemsIn: 0, itemsKept: 0 };
 		// Only a sidecar reaches here (startup, resume), and it carries savedAt.
-		importWidgetState(await dropStaleFiles(state, ctx.savedAt as number));
+		const fresh = await dropStaleFiles(state, ctx.savedAt as number);
+		importWidgetState(fresh);
+		return { itemsIn: state.files.length, itemsKept: fresh.files.length };
 	},
 	reset: () => clearWidgetState(),
 	reason:
@@ -989,13 +991,7 @@ function normalizeDiagnostics(
  * finding. That test, not this one, is what keeps the round-2 F2 case above
  * closed — the marked line's TEXT moved, so its span still matches.
  */
-function retentionIdentity(d: WidgetDiagnostic): string {
-	return JSON.stringify([
-		d.tool ?? "",
-		d.rule ?? "",
-		normalizeMessage(d.message),
-	]);
-}
+const retentionIdentity: (d: WidgetDiagnostic) => string = findingIdentity;
 
 /** `filePath`'s current content, or `undefined` when it cannot be read. */
 function readContentOrUndefined(filePath: string): string | undefined {
@@ -1937,6 +1933,21 @@ export function getFileDiagnosticSummaries(): FileDiagnosticSummary[] {
 }
 
 /**
+ * #1634: copies of the disposition-tagged rows {@link getFileDiagnosticSummaries}
+ * leaves out of a file's projection — the rows the footer's `suppressed: N`
+ * chip counts — so a cache-only report can say how many findings a mark is
+ * hiding instead of reading clean.
+ */
+export function getSuppressedDiagnostics(filePath: string): WidgetDiagnostic[] {
+	const rec = files.get(fileMapKey(filePath));
+	const rows: WidgetDiagnostic[] = [];
+	for (const d of rec?.allDiagnostics ?? []) {
+		if (d.disposition !== undefined) rows.push({ ...d });
+	}
+	return rows;
+}
+
+/**
  * How many {@link WidgetDiagnostic.suppressedRetained} rows this file's record
  * is currently carrying (#3158 round 2 F4).
  *
@@ -2031,11 +2042,33 @@ export function recordLsp(
 
 const HORIZONTAL_MIN_WIDTH = 70;
 
+// #3959: compact summary header. The tally is this line's primary datum, so
+// the language list gets only the leftover width and is truncated first — a
+// whole-line fitLine truncation eats the totals from the tail.
+function fitCompactHeader(
+	width: number,
+	label: string,
+	languages: string,
+	chip: string,
+	summary: string,
+): string {
+	const tail = chip + (summary ? "  " + summary : "");
+	const langBudget = width - visibleWidth(` ${label}`) - visibleWidth(tail);
+	const langs =
+		languages && langBudget >= 4
+			? "  " + fitLine(languages, langBudget - 2, "…")
+			: "";
+	return fitLine(` ${label}${langs}${tail}`, width);
+}
+
 export function renderWidget(
 	width: number,
 	theme: {
 		fg: (color: string, s: string) => string;
 	},
+	// #3959: one-line summary switch (ui.compactWidget / --lens-compact-widget).
+	// An options object instead of a boolean flag parameter, per no-flag-argument.
+	opts?: { compact?: boolean },
 ): string[] {
 	const dim = (s: string) => theme.fg("dim", s);
 	const red = (s: string) => theme.fg("error", s);
@@ -2075,8 +2108,27 @@ export function renderWidget(
 	const spawning = [...lspServers.values()].filter(
 		(s) => s.status === "spawning",
 	);
+	// #3959: compact is a single line, so fold the spawning state into the header
+	// for narrow/wide consistency (narrow mode would otherwise drop it silently).
 	const lspChip =
-		useHorizontal && spawning.length > 0 ? "  " + dim("LSP↑") : "";
+		(useHorizontal || opts?.compact) && spawning.length > 0
+			? "  " + dim("LSP↑")
+			: "";
+
+	// #3959: compact mode stops at the summary header. File rows, the
+	// suppressed count and blocker details stay reachable via lens_diagnostics.
+	if (opts?.compact) {
+		lines.push(
+			fitCompactHeader(
+				w,
+				cyan("pi-lens"),
+				langStr ? dim(langStr) : "",
+				lspChip,
+				summary,
+			),
+		);
+		return lines;
+	}
 
 	const header = ` ${cyan("pi-lens")}${langStr ? "  " + dim(langStr) : ""}${lspChip}${summary ? "  " + summary : ""}`;
 	lines.push(fitLine(header, w));

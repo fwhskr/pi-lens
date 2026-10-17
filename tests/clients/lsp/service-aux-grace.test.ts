@@ -188,6 +188,7 @@ function makeClient(
 		// matching real client behaviour (server pushes → client caches → wait resolves).
 		getDiagnostics: vi.fn(() => (waitSettled ? diags : [])),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {}),
 			change: vi.fn(async () => {}),
 			close: vi.fn(async () => {}),
@@ -228,6 +229,7 @@ function makeLateBoundClient(content: string, serverId = "opengrep") {
 			published ? { contentHash: hashDiagnosticContent(content) } : undefined,
 		),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {
 				published = false;
 			}),
@@ -306,6 +308,7 @@ function makeVersionlessLateClient(serverId = "opengrep") {
 		getDiagnostics: vi.fn(() => (published ? [diagnostic] : [])),
 		getDiagnosticBinding: vi.fn(() => undefined),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {
 				published = false;
 			}),
@@ -341,6 +344,7 @@ function makeWedgeableAux(
 	const client = {
 		...makeClient(delayMs, diags, { serverId }),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn((filePath: string) =>
 				filePath === wedgePath
 					? new Promise<void>((resolve) => {
@@ -1388,8 +1392,10 @@ describe("R8 — aux grace: touchFile with-auxiliary path", () => {
 	])(
 		"tracks a cold typos spawn of $observedMs ms instead of using a flat grace",
 		async ({ observedMs, expectedFinding }) => {
-			const { LSPService, auxWaitBudgetMs } =
-				await import("../../../clients/lsp/index.js");
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			// #1488: the aux wait policy moved to its own module.
+			const { auxWaitBudgetMs } =
+				await import("../../../clients/lsp/auxiliary-lifecycle.js");
 			const {
 				recordSuccessfulLspSpawn,
 				_clearSuccessfulLspSpawnHistoryForTests,
@@ -1445,7 +1451,8 @@ describe("R8 — aux grace: touchFile with-auxiliary path", () => {
 	);
 
 	it("clamps a cold auxiliary budget at 8000 ms", async () => {
-		const { auxWaitBudgetMs } = await import("../../../clients/lsp/index.js");
+		const { auxWaitBudgetMs } =
+			await import("../../../clients/lsp/auxiliary-lifecycle.js");
 		const {
 			recordSuccessfulLspSpawn,
 			_clearSuccessfulLspSpawnHistoryForTests,
@@ -1947,7 +1954,7 @@ describe("R8 — aux grace: raceToCompletion per-role unit tests", () => {
 			{
 				timeoutMs: 5000,
 				graceMs: 0, // No additional quality grace
-				descriptors: [{ role: "primary" }, { role: "auxiliary" }],
+				descriptors: [{ role: "language" }, { role: "auxiliary" }],
 				auxGraceMs: 500,
 			},
 		);
@@ -1980,7 +1987,7 @@ describe("R8 — aux grace: raceToCompletion per-role unit tests", () => {
 			{
 				timeoutMs: 5000,
 				graceMs: 0,
-				descriptors: [{ role: "primary" }, { role: "auxiliary" }],
+				descriptors: [{ role: "language" }, { role: "auxiliary" }],
 				auxGraceMs: 500,
 			},
 		);
@@ -2014,7 +2021,7 @@ describe("R8 — aux grace: raceToCompletion per-role unit tests", () => {
 				timeoutMs: 1500,
 				graceMs: 0,
 				// No descriptors with role:"auxiliary" → aux-grace path not entered.
-				descriptors: [{ role: "primary" }, { role: "primary" }],
+				descriptors: [{ role: "language" }, { role: "language" }],
 				auxGraceMs: 500,
 			},
 		);
@@ -2052,7 +2059,7 @@ describe("R8 — aux grace: raceToCompletion per-role unit tests", () => {
 			{
 				timeoutMs: 5000,
 				graceMs: 0, // No quality grace
-				descriptors: [{ role: "primary" }, { role: "auxiliary" }],
+				descriptors: [{ role: "language" }, { role: "auxiliary" }],
 				auxGraceMs: 500,
 			},
 		);
@@ -2816,6 +2823,7 @@ describe('#1533 — silent auxiliary honesty on clientScope "all"', () => {
 			const auxClient = {
 				...makeClient(9000, [], { serverId: "opengrep" }),
 				notify: {
+					announceCreated: () => undefined,
 					open: vi.fn(() => new Promise<void>(() => {})),
 					change: vi.fn(async () => {}),
 					close: vi.fn(async () => {}),
@@ -2877,7 +2885,7 @@ describe('#1533 — silent auxiliary honesty on clientScope "all"', () => {
 	// BLAST-RADIUS PINS (#1533 review). The highest-frequency `"all"` caller is the
 	// cascade per-edit neighbour fan-out, which caps the touch at 1000/2000ms and
 	// does NOT exclude opengrep. The concern raised was that newly-`silent` verdicts
-	// there would block `recentlyCleanNeighborCache` seeding via
+	// there would block `recentlyCleanNeighborCache` (deleted since, #4486) seeding via
 	// `isConfirmedTouch`.
 	//
 	// The answer has TWO cases, and stating only the first would be the same
@@ -3057,6 +3065,7 @@ describe('#1533 — silent auxiliary honesty on clientScope "all"', () => {
 			getOperationSupport: () => ({}),
 			getDiagnostics: vi.fn(() => []),
 			notify: {
+				announceCreated: () => undefined,
 				open: vi.fn(async () => {}),
 				change: vi.fn(async () => {}),
 				close: vi.fn(async () => {}),

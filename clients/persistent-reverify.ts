@@ -40,6 +40,7 @@
  */
 
 import * as fs from "node:fs";
+import { freshnessFromMtime } from "./freshness.js";
 import type {
 	ActionableWarningsReport,
 	ActionableWarningsReportFile,
@@ -52,7 +53,7 @@ import {
 	touchCompletedConfirmationPolicy,
 	type TouchFileResult,
 } from "./lsp/diagnostic-binding.js";
-import { type getLSPService } from "./lsp/index.js";
+import { type getLSPService } from "./lsp/capabilities.js";
 import { findAuxiliaryProfileForSource } from "./dispatch/auxiliary-lsp.js";
 
 /** At most this many files are re-observed per turn_end (the drift backstop's
@@ -129,7 +130,10 @@ export function selectPersistentReverifyFiles(
 		} catch {
 			continue;
 		}
-		if (mtimeMs > stamp) {
+		if (
+			freshnessFromMtime({ mtimeMs, referenceMs: stamp, toleranceMs: 0 })
+				.verdict === "stale"
+		) {
 			skippedChanged += 1;
 			continue;
 		}

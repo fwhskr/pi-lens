@@ -1,0 +1,244 @@
+import { spawnSync } from "node:child_process";
+import { readFileSync, rmSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { expect, describe, it } from "vitest";
+import { TOOL_REGISTRY } from "../../clients/tool-config.js";
+import { type RealPi, withRealPi } from "../support/real-pi-harness.js";
+
+const realPiAvailable =
+	spawnSync("pi", ["--version"], { stdio: "ignore" }).status === 0;
+
+const situationalTools: string[] = TOOL_REGISTRY.flatMap((tool) =>
+	"situational" in tool && tool.situational && tool.piName ? [tool.piName] : [],
+).sort();
+
+function roster(pi: RealPi): string[] {
+	const tools = pi.providerObservations().at(-1)?.tools;
+	return (Array.isArray(tools) ? tools : [])
+		.flatMap((tool) =>
+			typeof (tool as { name?: unknown }).name === "string"
+				? [(tool as { name: string }).name]
+				: [],
+		)
+		.sort();
+}
+
+/** Tool names, in wire order, of the provider request at `index`. */
+function wireTools(pi: RealPi, index: number): string[] {
+	const tools = pi.providerObservations()[index]?.tools;
+	return (Array.isArray(tools) ? tools : []).flatMap((tool) =>
+		typeof (tool as { name?: unknown }).name === "string"
+			? [(tool as { name: string }).name]
+			: [],
+	);
+}
+
+/** The session sidecars that carry a lazy-tool memory. */
+function lazyMemorySidecars(pi: RealPi): string[] {
+	return pi.lens.sessionSidecars().filter((file) => {
+		try {
+			return readFileSync(file, "utf8").includes('"lazy-tool-memory":["');
+		} catch {
+			return false;
+		}
+	});
+}
+
+/**
+ * Activate a lazy tool, then restart pi on the same session (`--continue`) and
+ * return the roster before and on the first request after the restart. The
+ * scripted provider restarts its script in the new process, so that first
+ * request is sent before any tool ran: it shows the loadout pi and pi-lens
+ * agreed on, not an activation the new process made itself.
+ */
+async function activateThenResume(
+	forgetMemory: boolean,
+): Promise<{ activated: string[]; resumed: string[] }> {
+	return withRealPi(
+		{
+			fixture: "lifecycle",
+			script: "script.json",
+			persistedSession: true,
+			env: { PI_LENS_TEST_MODE: "0" },
+		},
+		async (pi) => {
+			await pi.prompt("startup");
+			await pi.awaitAssistantTurn();
+			await pi.awaitToolResult("pi_lens_activate_tools");
+			await pi.awaitAssistantTurn();
+			const activated = wireTools(pi, pi.providerObservations().length - 1);
+			expect(activated).toContain("ast_grep_search");
+			expect(
+				activated.filter((name) => situationalTools.includes(name)),
+			).toEqual(["ast_grep_search"]);
+			// The sidecar is a fire-and-forget write at turn_end; restarting
+			// before it lands would test that race, not the loadout.
+			await expect.poll(() => lazyMemorySidecars(pi)).not.toHaveLength(0);
+			if (forgetMemory)
+				for (const file of lazyMemorySidecars(pi))
+					rmSync(file, { force: true });
+
+			await pi.resume();
+			const before = pi.providerObservations().length;
+			await pi.prompt("after resume");
+			await expect
+				.poll(() => pi.providerObservations().length)
+				.toBeGreaterThan(before);
+			return { activated, resumed: wireTools(pi, before) };
+		},
+	);
+}
+
+function lifecycleRows(pi: RealPi) {
+	return pi.lens
+		.latencyRows()
+		.filter((row) => row.phase === "session_scope_transition")
+		.map((row) => {
+			const metadata = row.metadata as
+				| { transition?: string; reason?: string }
+				| undefined;
+			return `${metadata?.transition}:${metadata?.reason}`;
+		});
+}
+
+function deadWeightRows(pi: RealPi) {
+	return pi.lens
+		.extensionLog()
+		.filter((row) => row.message === "situational tool dead weight");
+}
+
+function deadWeightTools(pi: RealPi, index: number): string[] | undefined {
+	const tools = (
+		deadWeightRows(pi)[index]?.metadata as { tools?: string[] } | undefined
+	)?.tools;
+	return tools ? [...tools].sort() : undefined;
+}
+
+async function sessionFile(pi: RealPi): Promise<string> {
+	await expect.poll(() => pi.sessionFiles().length).toBeGreaterThan(0);
+	return pi.sessionFiles().at(-1) as string;
+}
+
+async function turn(pi: RealPi, text: string, expected: string[]) {
+	await pi.prompt(text);
+	await pi.awaitAssistantTurn();
+	await expect.poll(() => roster(pi)).toEqual(expected);
+}
+
+// flake-shape: real-process-spawn — this is the only lane that can observe a real pi factory re-run, persisted-session restart, and stdin-close shutdown in one process sequence.
+// Recurrence prevented: an in-process mock preserves its extension closure and cannot prove pi's lifecycle ordering (#2891, #2858, #2866).
+describe.skipIf(!realPiAvailable)("real pi lifecycle witness", () => {
+	it("drives startup, reload, new, resume, fork, and quit in order", async () => {
+		await withRealPi(
+			{
+				fixture: "lifecycle",
+				script: "script.json",
+				agentSettings: { defaultTools: ["+codemode"] },
+				persistedSession: true,
+				env: { PI_LENS_TEST_MODE: "0" },
+				extensions: [
+					fileURLToPath(
+						new URL(
+							"../fixtures/real-harness/reload-extension.mjs",
+							import.meta.url,
+						),
+					),
+				],
+			},
+			async (pi) => {
+				await pi.prompt("startup");
+				await pi.awaitAssistantTurn();
+				await pi.awaitToolResult("pi_lens_activate_tools");
+				await pi.awaitAssistantTurn();
+				const activatedRoster = roster(pi);
+				expect(activatedRoster).toContain("ast_grep_search");
+				const freshRoster = activatedRoster.filter(
+					(name) => name !== "ast_grep_search",
+				);
+				const initialSessionFile = await sessionFile(pi);
+
+				await pi.prompt("/real-harness-reload");
+				await turn(pi, "after reload", activatedRoster);
+				await expect.poll(() => deadWeightRows(pi)).toHaveLength(0);
+
+				await pi.newSession();
+				await turn(pi, "after new", freshRoster);
+				const freshSessionFile = await sessionFile(pi);
+				expect(freshSessionFile).not.toBe(initialSessionFile);
+				await expect.poll(() => deadWeightRows(pi)).toHaveLength(1);
+				expect(deadWeightTools(pi, 0)).toEqual(
+					situationalTools.filter((name) => name !== "ast_grep_search"),
+				);
+
+				const beforeResumeSessionFile = freshSessionFile;
+				await pi.resume();
+				await turn(pi, "after resume", freshRoster);
+				const resumedSessionFile = await sessionFile(pi);
+				expect(resumedSessionFile).toBe(beforeResumeSessionFile);
+				await expect.poll(() => deadWeightRows(pi)).toHaveLength(2);
+				expect(deadWeightTools(pi, 1)).toEqual(situationalTools);
+				// The resumed process restarts the script, so its first turn
+				// activates ast_grep_search again; the fork below adopts that.
+				// Wait for the activation to run: a clone sent while the tool
+				// call is still in its hooks drops it (#4493's HEAD look made
+				// that window a git spawn wide).
+				await pi.awaitToolResult("pi_lens_activate_tools");
+				await pi.awaitAssistantTurn();
+
+				await pi.clone();
+				await turn(pi, "after fork", activatedRoster);
+				await expect.poll(() => deadWeightRows(pi)).toHaveLength(3);
+				expect(deadWeightTools(pi, 2)).toEqual(
+					situationalTools.filter((name) => name !== "ast_grep_search"),
+				);
+
+				await pi.quit();
+				await expect.poll(() => deadWeightRows(pi)).toHaveLength(4);
+				expect(deadWeightTools(pi, 3)).toEqual(situationalTools);
+				const rows = pi.lens
+					.latencyRows()
+					.filter((row) => row.phase === "session_scope_transition");
+				const expectedTransitions = [
+					"end:superseded",
+					"start:startup",
+					"shutdown:reload",
+					"start:reload",
+					"shutdown:new",
+					"start:new",
+					"shutdown:quit",
+					"end:superseded",
+					"start:startup",
+					"shutdown:fork",
+					"start:fork",
+					"shutdown:quit",
+				];
+				expect(
+					lifecycleRows(pi),
+					JSON.stringify({
+						rows,
+					}),
+				).toEqual(expectedTransitions);
+			},
+		);
+	}, 60_000);
+
+	// Recurrence prevented (#4513): pi 1.3 restores a resumed session's active
+	// tools from the transcript while pi-lens re-plans the set at
+	// `session_start`. A host that restores after that handler, or a plan that
+	// disagrees with the restore, would change the advertised tool list (and the
+	// prompt-cache prefix) on every resume.
+	it("keeps the activated lazy tool, and only it, when pi-lens remembers the activation across a resume", async () => {
+		const { activated, resumed } = await activateThenResume(false);
+		expect(resumed).toEqual(activated);
+	}, 60_000);
+
+	// pi 1.3 restores the transcript's loadout (ast_grep_search stays active);
+	// older hosts activate every registered tool. Either way pi-lens's plan
+	// decides: with no remembered activation the lazy tools go back to inactive.
+	it("deactivates the lazy tools the host restored or re-activated when pi-lens has no memory of them", async () => {
+		const { activated, resumed } = await activateThenResume(true);
+		expect(resumed).toEqual(
+			activated.filter((name) => !situationalTools.includes(name)),
+		);
+	}, 60_000);
+});

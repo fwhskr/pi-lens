@@ -18,6 +18,8 @@ import {
 import { recordLspMutation, type LspMutationContext } from "../lsp-mutation.js";
 import { withHostFileMutationQueues } from "../file-mutation-queue.js";
 import { incrementDegradationCount } from "../degradation-ledger.js";
+import { peekOwnedLspService } from "./service-singleton.js";
+import { FILE_CREATED, FILE_DELETED } from "./watch-queue.js";
 import { logLatency } from "../latency-logger.js";
 import {
 	detectLineEnding,
@@ -74,6 +76,8 @@ interface DeleteFileOp {
 interface AppliedWorkspaceFileDetail {
 	filePath: string;
 	range?: { start: number; end: number };
+	ranges?: Array<{ start: number; end: number }>;
+	authorshipUnknown?: boolean;
 	importsChanged?: boolean;
 }
 
@@ -112,6 +116,17 @@ export interface ApplyWorkspaceEditOptions {
 	 * mismatch refuses the whole edit with {@link StaleWorkspaceEditContentError}.
 	 */
 	expectedContent?: ReadonlyMap<string, string>;
+	/**
+	 * #4346: where the watched-files events of applied resource operations go.
+	 * A service applying its own edit passes itself; otherwise the process's
+	 * LSP service, when one exists (none is ever created for this).
+	 */
+	watchedFileSink?: WatchedFileSink;
+}
+
+/** The one service method a resource operation's watched-files event needs. */
+export interface WatchedFileSink {
+	notifyExternalFileChange(filePath: string, type: number): Promise<void>;
 }
 
 /**
@@ -1422,6 +1437,24 @@ async function preflightWorkspaceEdit(
 }
 
 /**
+ * #4346: a resource operation changes which paths exist, and a server that
+ * caches a failed lookup (Pyrefly, pyright) only drops it on a watched-files
+ * Created or Deleted. A file watcher would report these; pi-lens is that
+ * watcher for its own writes. With no sink and no service, nothing is sent and
+ * no service is created.
+ */
+async function announceResourceOperations(
+	changes: ReadonlyArray<{ filePath: string; type: number }>,
+	sink: WatchedFileSink | undefined,
+): Promise<void> {
+	const target = sink ?? peekOwnedLspService<WatchedFileSink>();
+	if (!target) return;
+	for (const change of changes) {
+		await target.notifyExternalFileChange(change.filePath, change.type);
+	}
+}
+
+/**
  * Applies a workspace edit. All URI, shape, version, resource-precondition and
  * text-bound checks happen in preflight before the first write. Once preflight
  * succeeds, an unexpected filesystem failure may still leave earlier mutations
@@ -1439,6 +1472,7 @@ export async function applyWorkspaceEdit(
 	let appliedOperationTotal = 0;
 	let operationIndex = 0;
 	const operationCounts = { textEdits: 0, create: 0, rename: 0, delete: 0 };
+	const resourceChanges: Array<{ filePath: string; type: number }> = [];
 	const planned = planWorkspaceEdit(edit);
 	let operationTotal = 0;
 	let prepared: Awaited<ReturnType<typeof preflightWorkspaceEdit>>;
@@ -1505,15 +1539,40 @@ export async function applyWorkspaceEdit(
 					}
 					const content = await fs.readFile(diskPath, "utf-8");
 					const updated = applyTextEditsToString(content, edits, "utf-16");
+					const changesLineCount = edits.some((edit) => {
+						const removedLines = edit.range.end.line - edit.range.start.line;
+						const insertedLines = (edit.newText.match(/\r\n|\r|\n/g) ?? [])
+							.length;
+						return removedLines !== insertedLines;
+					});
 					await fs.writeFile(diskPath, updated, "utf-8");
 					const start = Math.min(
 						...edits.map((item) => item.range.start.line + 1),
 					);
-					const end = Math.max(...edits.map((item) => item.range.end.line + 1));
+					const end = Math.max(
+						...edits.map(
+							(item) =>
+								item.range.end.line +
+								(item.range.end.character === 0 &&
+								item.range.end.line > item.range.start.line
+									? 0
+									: 1),
+						),
+					);
 					touchedFiles.add(filePath);
 					fileDetails.push({
 						filePath,
 						range: { start, end },
+						ranges: edits.map((item) => ({
+							start: item.range.start.line + 1,
+							end:
+								item.range.end.line +
+								(item.range.end.character === 0 &&
+								item.range.end.line > item.range.start.line
+									? 0
+									: 1),
+						})),
+						authorshipUnknown: changesLineCount,
 						importsChanged:
 							importsSignature(content) !== importsSignature(updated),
 					});
@@ -1529,10 +1588,12 @@ export async function applyWorkspaceEdit(
 					await fs.mkdir(path.dirname(diskPath), { recursive: true });
 					if (op.options?.overwrite) await fs.writeFile(diskPath, "", "utf-8");
 					else await fs.writeFile(diskPath, "", { flag: "wx" });
+					resourceChanges.push({ filePath: diskPath, type: FILE_CREATED });
 					touchedFiles.add(filePath);
 					fileDetails.push({
 						filePath,
 						range: { start: 1, end: 1 },
+						authorshipUnknown: true,
 						importsChanged: false,
 					});
 					markApplied(op);
@@ -1548,17 +1609,23 @@ export async function applyWorkspaceEdit(
 					if (op.options?.overwrite)
 						await fs.rm(newDisk, { recursive: true, force: true });
 					await fs.rename(oldDisk, newDisk);
+					resourceChanges.push(
+						{ filePath: oldDisk, type: FILE_DELETED },
+						{ filePath: newDisk, type: FILE_CREATED },
+					);
 					touchedFiles.add(oldPath);
 					touchedFiles.add(newPath);
 					fileDetails.push(
 						{
 							filePath: oldPath,
 							range: { start: 1, end: 1 },
+							authorshipUnknown: true,
 							importsChanged: true,
 						},
 						{
 							filePath: newPath,
 							range: { start: 1, end: 1 },
+							authorshipUnknown: true,
 							importsChanged: true,
 						},
 					);
@@ -1573,10 +1640,12 @@ export async function applyWorkspaceEdit(
 						recursive: op.options?.recursive === true,
 						force: false,
 					});
+					resourceChanges.push({ filePath: diskPath, type: FILE_DELETED });
 					touchedFiles.add(filePath);
 					fileDetails.push({
 						filePath,
 						range: { start: 1, end: 1 },
+						authorshipUnknown: true,
 						importsChanged: true,
 					});
 					markApplied(op);
@@ -1585,6 +1654,7 @@ export async function applyWorkspaceEdit(
 			}
 		});
 	} catch (err) {
+		await announceResourceOperations(resourceChanges, options.watchedFileSink);
 		const partial = makeResult();
 		if (options.mutationContext && options.observe !== false) {
 			recordLspMutation(options.mutationContext, {
@@ -1605,6 +1675,7 @@ export async function applyWorkspaceEdit(
 		}
 		throw err;
 	}
+	await announceResourceOperations(resourceChanges, options.watchedFileSink);
 	const applied = makeResult();
 	if (options.mutationContext && options.observe !== false) {
 		recordLspMutation(options.mutationContext, {

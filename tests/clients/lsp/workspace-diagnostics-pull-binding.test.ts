@@ -26,6 +26,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getProjectDataDir } from "../../../clients/file-utils.js";
 import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
 import {
 	cacheKeyFor,
@@ -88,7 +89,10 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 				diagnosticProviderKind: "object",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			requestWorkspaceDiagnostics: vi.fn(async () => [
 				{
 					filePath: file,
@@ -138,7 +142,10 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 				diagnosticProviderKind: "object",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			requestWorkspaceDiagnostics,
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			getDiagnostics: vi.fn(() => []),
@@ -156,8 +163,7 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 		// invalidation shape (recorded fingerprint no longer matches disk under
 		// a matching mtime).
 		const cachePath = path.join(
-			tmp,
-			".pi-lens",
+			getProjectDataDir(tmp),
 			"cache",
 			"lsp-workspace-diagnostics.json",
 		);
@@ -198,7 +204,10 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 				diagnosticProviderKind: "none",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			// touchFile's real merge logic (index.ts, not mocked) composes each
 			// spawned client's `getDiagnosticBinding` into the non-enumerable

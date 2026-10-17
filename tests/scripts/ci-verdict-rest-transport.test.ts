@@ -327,6 +327,30 @@ describe("restFetchCheckRunsPayload (#3497)", () => {
 		expect(payload.check_runs).toHaveLength(REAL_CHECK_RUNS.source.total_count);
 	});
 
+	// N2 (#3861): a 200 body that is not JSON is a contract violation, not an
+	// empty answer; the thrown error names the path and keeps the raw stderr.
+	it("a non-JSON 200 body throws a named error with the path and raw stderr", async () => {
+		const fetchImpl = async () =>
+			new Response("<<html>not json</html>", { status: 200 });
+		let message = "";
+		let stderr = "";
+		try {
+			await restFetchCheckRunsPayload("acme/repo", "sha", {
+				token: "tok",
+				fetchImpl,
+			});
+		} catch (error) {
+			message = (error as Error).message;
+			stderr = (error as { stderr?: string }).stderr ?? "";
+		}
+		expect(message).toContain(
+			"GitHub REST API returned invalid JSON for repos/acme/repo/commits/sha/check-runs?per_page=100&page=1",
+		);
+		expect(stderr).toContain(
+			"invalid JSON from repos/acme/repo/commits/sha/check-runs?per_page=100&page=1",
+		);
+	});
+
 	// The four acceptance-criterion fixtures: computeVerdict must reach the
 	// SAME exit code from a REST-shaped payload as it does from the
 	// equivalent gh-shaped one (already proven correct by the 132
@@ -805,9 +829,6 @@ describe("run() — REST transport end to end (#3497)", () => {
 		expect(stdoutLines).toContain("Transport: rest");
 		expect(stdoutLines.join("\n")).not.toContain("failed step");
 		expect(stdoutLines.join("\n")).not.toContain("could not read the job");
-		// #3779: the MUTATION line reads a PR comment through `gh` only; the REST
-		// transport adds no network path for it.
-		expect(stdoutLines.join("\n")).not.toContain("MUTATION");
 	});
 
 	it("still exits 70 when gh is missing and NO token is set (unchanged acceptance case)", async () => {
@@ -955,6 +976,20 @@ describe("run() — REST transport end to end (#3497)", () => {
 			fetchImpl,
 		});
 		expect(seenAuthHeaders).toEqual(["Bearer sekrit-token"]);
+	});
+});
+
+// #3861 J: a REST 200 with an EMPTY body is the documented empty answer (`{}`),
+// not a JSON contract violation; the `text.length === 0` early return keeps an
+// empty body from reaching `JSON.parse("")`.
+describe("restFetchCheckRunsPayload — an empty 200 body is an empty answer (#3861 J)", () => {
+	it("returns the empty payload for a 200 with no body", async () => {
+		const fetchImpl = async () => new Response("", { status: 200 });
+		const payload = await restFetchCheckRunsPayload("acme/repo", "sha-empty", {
+			token: "tok",
+			fetchImpl,
+		});
+		expect(payload).toEqual({ total_count: 0, check_runs: [] });
 	});
 });
 

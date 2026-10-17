@@ -155,6 +155,12 @@ import { CacheManager } from "../clients/cache-manager.js";
 import { snapshotAdvisoryProvenance } from "../clients/advisory-provenance.js";
 import { getLatencyLogPath } from "../clients/latency-logger.js";
 import { LENS_FLAGS } from "../clients/lens-flag-registry.js";
+import {
+	clearWidgetState,
+	recordDiagnostics,
+	recordRunner,
+	setSessionLanguages,
+} from "../clients/widget-state.js";
 import extension from "../index.js";
 import {
 	_resetForTests as resetBusPublishForTests,
@@ -290,8 +296,9 @@ const EXPECTED_HOOKS = [
 
 /**
  * turn_end and a `/fork` or `/reload` shutdown persist the session stores
- * (#3612) fire-and-forget (#2523): yield (no timer) until the sidecar's
- * atomic rename is visible, so it is read, and never lands after cleanup.
+ * (#3612) fire-and-forget (#2523): yield until a wall-clock deadline so the
+ * sidecar's atomic rename is visible, and never lands after cleanup. The
+ * deadline covers thread-pool latency; a yield-count cap does not (#4134).
  */
 async function sidecarWritten(cwd: string, sessionId: string): Promise<void> {
 	const sidecar = path.join(
@@ -299,7 +306,8 @@ async function sidecarWritten(cwd: string, sessionId: string): Promise<void> {
 		"sessions",
 		`${sessionId}.json`,
 	);
-	for (let i = 0; i < 5000 && !fs.existsSync(sidecar); i++)
+	const deadline = Date.now() + 10_000;
+	while (Date.now() < deadline && !fs.existsSync(sidecar))
 		await new Promise<void>((resolve) => setImmediate(resolve));
 	expect(fs.existsSync(sidecar), sidecar).toBe(true);
 }
@@ -708,6 +716,119 @@ describe("index.ts extension wiring", () => {
 				extension(pi.asExtensionAPI());
 				expect(pi.getTool("ast_grep_replace")).toBeUndefined();
 				expect(pi.getTool("pi_lens_activate_tools")).toBeDefined();
+			} finally {
+				if (prior === undefined) delete process.env.PI_LENS_CONFIG_PATH;
+				else process.env.PI_LENS_CONFIG_PATH = prior;
+				removeTempDirSync(tempDir);
+			}
+		});
+
+		it("reports the effective tool surface and rejects disabled activation", async () => {
+			const tempDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-health-tool-config-"),
+			);
+			const configPath = path.join(tempDir, "config.json");
+			fs.writeFileSync(
+				configPath,
+				JSON.stringify({
+					tools: {
+						ast_grep_replace: { enabled: false },
+						health: { enabled: false },
+					},
+				}),
+			);
+			const prior = process.env.PI_LENS_CONFIG_PATH;
+			process.env.PI_LENS_CONFIG_PATH = configPath;
+			try {
+				const pi = createPiMock();
+				extension(pi.asExtensionAPI());
+				const ctx = makeCtx();
+				await pi.runCommand("lens-health", "", ctx);
+				const health = ctx.notifications.map((n) => n.message).join("\n");
+				expect(health).toContain("Tools enabled:");
+				expect(health).toContain(
+					"Tools disabled: ast_grep_replace, health (2 total)",
+				);
+				expect(health).not.toContain(
+					"Tools disabled: ast_grep_replace, health and",
+				);
+				expect(health).toContain("Skills: managed by pi package filters");
+
+				const activation = pi.getTool("pi_lens_activate_tools") as
+					| {
+							execute: (
+								toolCallId: string,
+								params: Record<string, unknown>,
+								signal: AbortSignal | undefined,
+								onUpdate: unknown,
+								ctx: unknown,
+							) => Promise<{
+								isError?: boolean;
+								content?: Array<{ text?: string }>;
+							}>;
+					  }
+					| undefined;
+				expect(activation).toBeDefined();
+				const result = await activation?.execute(
+					"disabled-tool",
+					{ tools: ["ast_grep_replace"] },
+					undefined,
+					undefined,
+					ctx,
+				);
+				expect(result?.isError).toBe(true);
+				expect(result?.content?.[0]?.text).toContain("No valid tool names");
+			} finally {
+				if (prior === undefined) delete process.env.PI_LENS_CONFIG_PATH;
+				else process.env.PI_LENS_CONFIG_PATH = prior;
+				removeTempDirSync(tempDir);
+			}
+		});
+
+		it("bounds a long disabled-tool list on the health surface", async () => {
+			const tempDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-health-tool-cap-"),
+			);
+			const configPath = path.join(tempDir, "config.json");
+			const disabledTools = [
+				"ast_grep_search",
+				"ast_grep_replace",
+				"ast_grep_outline",
+				"lsp_navigation",
+				"lens_diagnostics",
+				"lens_diagnostic_mark",
+				"symbol_search",
+				"module_report",
+				"project_report",
+				"read_symbol",
+				"read_enclosing",
+				"effective_config",
+				"analyze",
+				"health",
+				"latency",
+				"project_scan",
+				"rebuild",
+			] as const;
+			fs.writeFileSync(
+				configPath,
+				JSON.stringify({
+					tools: Object.fromEntries(
+						disabledTools.map((name) => [name, { enabled: false }]),
+					),
+				}),
+			);
+			const prior = process.env.PI_LENS_CONFIG_PATH;
+			process.env.PI_LENS_CONFIG_PATH = configPath;
+			try {
+				const pi = createPiMock();
+				extension(pi.asExtensionAPI());
+				const ctx = makeCtx();
+				await pi.runCommand("lens-health", "", ctx);
+				const health = ctx.notifications.map((n) => n.message).join("\n");
+				expect(health).toContain(
+					"Tools disabled: ast_grep_search, ast_grep_replace, ast_grep_outline, lsp_navigation, lens_diagnostics, lens_diagnostic_mark, symbol_search, module_report and 9 more (17 total)",
+				);
+				expect(health).not.toContain("project_report");
 			} finally {
 				if (prior === undefined) delete process.env.PI_LENS_CONFIG_PATH;
 				else process.env.PI_LENS_CONFIG_PATH = prior;
@@ -1215,6 +1336,7 @@ describe("index.ts extension wiring", () => {
 				);
 				expect(pi.activeTools.has("ast_grep_search")).toBe(true);
 
+				// pi-mock bound: this lifecycle assertion does not re-run the factory or reproduce host ordering.
 				await pi.simulateSessionShutdownAndRebuild("new", ctx);
 
 				expect(pi.activeTools.has("ast_grep_search")).toBe(false);
@@ -1259,6 +1381,7 @@ describe("index.ts extension wiring", () => {
 				expect(pi.activeTools.has("ast_grep_search")).toBe(true);
 				await endTurnAndPersist(pi, ctx, tmp, "cache-quit");
 
+				// pi-mock bound: this lifecycle assertion does not re-run the factory or reproduce host ordering.
 				await pi.simulateSessionShutdownAndRebuild("quit", ctx);
 
 				// The host rebuilds all-active, as on every replacement; the
@@ -1399,20 +1522,27 @@ describe("index.ts extension wiring", () => {
 			});
 		});
 
-		// #205: resources_discover must point at the real skills/ dir, which lives
-		// at the package root in BOTH the source and the compiled dist/ layouts.
-		// The previous module-relative join landed on dist/skills/ (nonexistent) so
-		// skills silently failed to load.
-		it("resolves skillPaths to an existing skills/ directory at the package root", async () => {
+		// #1416: the `resources_discover` handler must NOT contribute skill
+		// paths. pi applies the settings package filters (`packages[].skills`:
+		// `[]`, `!pattern`, `-path`) only to the `pi.skills` manifest resources;
+		// pi merges a contributed path raw, so the old
+		// `skillPaths: [<packageRoot>/skills]` re-added every excluded skill
+		// (reported on 4.3.0 against pi 0.99.2 and 1.0.0).
+		it("contributes no skillPaths, leaving skill registration to the pi.skills manifest (#1416)", async () => {
 			resetDegradationLedger();
 			const pi = createPiMock();
 			extension(pi.asExtensionAPI());
 
 			const result = (await pi.emit("resources_discover")) as {
-				skillPaths: string[];
+				skillPaths?: string[];
 			};
-			expect(result?.skillPaths).toHaveLength(1);
-			const skillsDir = result.skillPaths[0];
+			expect(result?.skillPaths ?? []).toEqual([]);
+
+			// #205/#519: the package-root skills/ dir and the four namespaced
+			// skill dirs still live there (the manifest's `./skills`), so a
+			// manifest path that escaped the package or a rename-back still
+			// reds even though the hook no longer resolves it.
+			const skillsDir = path.resolve(import.meta.dirname, "..", "skills");
 			expect(skillsDir.replace(/\\/g, "/")).toMatch(/\/skills$/);
 			expect(skillsDir.replace(/\\/g, "/")).not.toMatch(/\/dist\/skills$/);
 			expect(fs.existsSync(skillsDir), `skills dir exists: ${skillsDir}`).toBe(
@@ -1447,10 +1577,10 @@ describe("index.ts extension wiring", () => {
 				).toBe(false);
 			}
 			// #2626: the standard layout (this repo's own skills/ beside
-			// package.json) must produce NO "skills-dir-missing" degradation —
-			// the negative case for the silent-zero-skills fix, driven through
-			// the real resources_discover handler rather than the resolver in
-			// isolation.
+			// package.json) must still produce NO "skills-dir-missing"
+			// degradation — the negative case for the silent-zero-skills fix,
+			// driven through the real resources_discover handler rather than the
+			// resolver in isolation.
 			expect(
 				getDegradationSummary().find(
 					(group) => group.kind === "skills-dir-missing",
@@ -1924,6 +2054,7 @@ describe("hook handler crash surfacing (#2884)", () => {
 			ctx,
 		);
 
+		// pi-mock bound: this lifecycle assertion does not re-run the factory or reproduce host ordering.
 		await pi.simulateSessionShutdownAndRebuild("reload", ctx);
 
 		expect(pi.activeTools.has("ast_grep_search")).toBe(true);
@@ -2117,5 +2248,99 @@ describe("hook handler crash surfacing (#2884)", () => {
 
 		expectCrashRecorded("turn_end");
 		expect(crashLedgerGroup()?.count).toBe(1);
+	});
+});
+
+// #3959: mount-seam witness — ui.compactWidget must travel from the flag through
+// the setWidget factory to component.render. The renderWidget unit tests cannot
+// kill a mutation that hardcodes { compact: ... } to true/false (review 2).
+describe("ui.compactWidget mount seam (#3959)", () => {
+	let mountSeq = 0;
+
+	function seedSummaryFixture(): string {
+		clearWidgetState();
+		const filePath = path.join(process.cwd(), "compact-widget-mount.ts");
+		setSessionLanguages(["css", "html", "json", "jsts", "markdown", "shell"]);
+		recordRunner(filePath, "type-safety", "failed", 1);
+		recordDiagnostics(filePath, [
+			{
+				severity: "error",
+				semantic: "blocking",
+				message: "blocking detail",
+				line: 2278,
+				rule: "typescript:2451",
+			},
+			{
+				severity: "warning",
+				message: "warning detail",
+				line: 497,
+				rule: "ts-react-antipatterns",
+			},
+		]);
+		return filePath;
+	}
+
+	// Walk the real extension → session_start → setWidget path to grab the
+	// factory and instantiate the component it returns.
+	async function mountWidget(flags: Record<string, boolean | string>) {
+		// Earlier tests leave a primary registration behind; without a reset this
+		// session_start is classified concurrent-secondary and skips mounting.
+		_resetSessionLifecycleForTests();
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-compact-widget-");
+		const savedHome = process.env.PI_LENS_HOME;
+		// Isolate the real ~/.pi-lens config: the widget defaults to visible and
+		// the flag is decided by the mock alone.
+		process.env.PI_LENS_HOME = tmpDir;
+		try {
+			const pi = createPiMock(flags);
+			extension(pi.asExtensionAPI());
+			const ctx = makeCtx({
+				cwd: process.cwd(),
+				sessionId: `compact-widget-mount-${++mountSeq}`,
+			});
+			await pi.emit("session_start", { reason: "startup" }, ctx);
+
+			const mount = ctx.widgetCalls.find((call) => call.key === "pi-lens");
+			expect(mount?.content).toBeTypeOf("function");
+			const factory = mount!.content as (
+				tui: { requestRender: () => void },
+				theme: { fg: (color: string, s: string) => string },
+			) => { render: (width: number) => string[] };
+			return factory(
+				{ requestRender: () => {} },
+				{ fg: (_color: string, s: string) => s },
+			);
+		} finally {
+			if (savedHome === undefined) delete process.env.PI_LENS_HOME;
+			else process.env.PI_LENS_HOME = savedHome;
+			cleanup();
+		}
+	}
+
+	it("renders one compact line when lens-compact-widget is enabled", async () => {
+		try {
+			const component = await mountWidget({ "lens-compact-widget": true });
+			// The session_start store restore during mounting clears widget state,
+			// so seed the fixture only after mounting.
+			seedSummaryFixture();
+			const lines = component.render(120);
+			expect(lines).toHaveLength(1);
+			expect(lines[0]).toContain("1E");
+			expect(lines[0]).toContain("1W");
+		} finally {
+			clearWidgetState();
+		}
+	});
+
+	it("keeps the multi-line widget when the flag is not set", async () => {
+		try {
+			const component = await mountWidget({});
+			const filePath = seedSummaryFixture();
+			const lines = component.render(120);
+			expect(lines.length).toBeGreaterThan(1);
+			expect(lines.join("\n")).toContain(path.basename(filePath));
+		} finally {
+			clearWidgetState();
+		}
 	});
 });

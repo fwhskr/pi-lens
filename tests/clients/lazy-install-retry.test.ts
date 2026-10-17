@@ -50,7 +50,7 @@ vi.mock("../../clients/lsp/config.js", () => ({
 	initLSPConfig: vi.fn().mockResolvedValue(undefined),
 	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
-vi.mock("../../clients/lsp/index.js", () => ({
+vi.mock("../../clients/lsp/capabilities.js", () => ({
 	getLSPService: vi.fn(() => makeLspServiceDouble()),
 }));
 
@@ -109,7 +109,7 @@ function makeSessionStartDeps(
 			isCurrentSession: () => true,
 			markStartupScanInFlight: () => {},
 			clearStartupScanInFlight: () => {},
-			complexityBaselines: new Map(),
+			complexityBaselines: new Set(),
 			resetForSession: () => {},
 			projectRoot: "",
 			projectRulesScan: { hasCustomRules: false, rules: [] },

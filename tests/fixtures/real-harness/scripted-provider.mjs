@@ -1,14 +1,21 @@
-import { readFileSync, appendFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { existsSync, readFileSync, appendFileSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // release-qa (#3805) drives a pi that is not this repo's devDependency, so it
-// names that pi's own pi-ai here; the default is the repo's dev baseline.
+// names that pi's own pi-ai here. The default is the repo's dev baseline,
+// resolved in release-qa's locatePiAiIndex order: pi-ai hoisted beside the host
+// (pi-coding-agent 1.0.1+), then nested under it (1.0.0 shipped a shrinkwrap,
+// #4004). A host that re-nests pi-ai must not red every real-harness test.
+const piAiCandidates = [
+	"../../../node_modules/@earendil-works/pi-ai/dist/index.js",
+	"../../../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.js",
+].map((relative) => new URL(relative, import.meta.url));
 const { createAssistantMessageEventStream } = await import(
 	process.env.REAL_PI_HARNESS_PI_AI_INDEX
 		? pathToFileURL(process.env.REAL_PI_HARNESS_PI_AI_INDEX).href
-		: new URL(
-				"../../../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.js",
-				import.meta.url,
+		: (
+				piAiCandidates.find((url) => existsSync(fileURLToPath(url))) ??
+				piAiCandidates[0]
 			).href
 );
 
@@ -64,9 +71,36 @@ function recordContextShapeDiagnostic() {
 	);
 }
 
+function expandScriptTokens(value) {
+	if (typeof value === "string") {
+		return value.replace(/\$\{([A-Z0-9_]+)\}/g, (match, name) =>
+			process.env[name] ?? match,
+		);
+	}
+	if (Array.isArray(value)) return value.map(expandScriptTokens);
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value).map(([key, child]) => [key, expandScriptTokens(child)]),
+		);
+	}
+	return value;
+}
+
+// The turn counter lives on the process, keyed by the script file: pi re-runs
+// the extension factory on an RPC `clone`/`fork`, `new_session` and `/reload`,
+// and a counter in the factory's closure restarted the script at turn 0 after
+// every such rebind, so no scenario could move the conversation and go on
+// (#4185 round 1, F3). One process runs one script file.
+const TURN_COUNTERS = Symbol.for("pi-lens.real-harness.scripted-turns");
+const turnCounters = (globalThis[TURN_COUNTERS] ??= new Map());
+
 export default function scriptedProvider(pi) {
 	const script = loadScript();
-	let turn = 0;
+	const nextTurn = () => {
+		const turn = turnCounters.get(scriptPath) ?? 0;
+		turnCounters.set(scriptPath, turn + 1);
+		return turn;
+	};
 	pi.registerProvider("scripted", {
 		name: "Scripted harness provider",
 		baseUrl: "https://scripted.invalid",
@@ -85,7 +119,9 @@ export default function scriptedProvider(pi) {
 		],
 		streamSimple(model, context, options) {
 			const stream = createAssistantMessageEventStream();
-			const action = script[turn++];
+			const turnIndex = nextTurn();
+			const turn = turnIndex + 1;
+			const action = expandScriptTokens(script[turnIndex]);
 			if (observationPath) {
 				const providerContextTools = providerTools(context);
 				if (providerContextTools === undefined) recordContextShapeDiagnostic();

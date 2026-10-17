@@ -36,6 +36,7 @@ type Fixture = (typeof LSP_FIXTURES)[number] & {
 	lspGateMarker?: string;
 	lspGateExempt?: string;
 	lensFull?: boolean;
+	createdModuleWitness?: unknown;
 	setup?: string | string[];
 	serverId?: string;
 	expectServerId?: string;
@@ -154,6 +155,18 @@ describe("LSP clean-gate population (#3217)", () => {
 		const lensFull = lensFullPopulation() as Fixture[];
 		expect(lensFull.map((fixture) => fixture.lang)).toEqual(["typescript"]);
 		expect(lensFull[0].lspGate).toBe(true);
+	});
+
+	// #4320/#4346: the created-module witness runs inside the clean gate, on
+	// the python fixture, whose server (pyright) caches a failed import lookup.
+	// Dropping the flag would silently retire the nightly's only end-to-end
+	// check that a created module clears its importer.
+	it("pins the created-module witness to the gated python fixture", () => {
+		const witnessed = fixtures.filter(
+			(fixture) => fixture.createdModuleWitness !== undefined,
+		);
+		expect(witnessed.map((fixture) => fixture.lang)).toEqual(["python"]);
+		expect(witnessed[0].lspGate).toBe(true);
 	});
 
 	// #2780's own guard, carried over from the deleted
@@ -323,6 +336,10 @@ describe("LSP clean-gate population (#3217)", () => {
 			expect(fixture.expectServerId, `${fixture.lang} expected server`).toBe(
 				fixture.serverId,
 			);
+			// The preferred Docker fixture deliberately leaves its fallback
+			// enabled now that fallback-family grouping is measured separately;
+			// acquisition still launches only the preferred member when it works.
+			if (fixture.lang === "dockerfile") continue;
 			expect(
 				fixture.disableServers,
 				`${fixture.lang} must disable fallback siblings`,
@@ -347,7 +364,7 @@ describe("LSP clean-gate population (#3217)", () => {
 		).toEqual([
 			"elixir is an unlabelled fallback-family row",
 			"elixir is neither pinned by a fixture nor admitted",
-			"fallback fixture count 6 !== registry members minus admissions 7",
+			"fallback fixture count 8 !== registry members minus admissions 9",
 		]);
 	});
 

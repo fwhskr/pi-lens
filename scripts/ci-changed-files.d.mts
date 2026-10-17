@@ -1,11 +1,22 @@
 export declare const PR_FILES_API_CAP: number;
+export declare const PR_SMOKE_PATHS: string[];
 export declare function classifyChangedFiles(paths: string[]): {
 	code: boolean;
 	formal: boolean;
+	smoke: boolean;
 	reason: string;
 };
 export declare function pathsFromPrFiles(
 	files: Array<{ filename: string; previous_filename?: string }>,
+): string[];
+export declare function ghPrFiles(
+	repo: string,
+	pr: string,
+	exec?: (
+		file: string,
+		args: string[],
+		options: { encoding: string; timeout: number; maxBuffer: number },
+	) => string,
 ): string[];
 export declare function parseArgs(argv: string[]): {
 	event: string;

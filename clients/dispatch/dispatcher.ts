@@ -58,6 +58,7 @@ import {
 import { createAvailabilityProbeFlight } from "../availability-probe-flight.js";
 import type { FactStore } from "./fact-store.js";
 import { applyDispositions } from "../diagnostic-dispositions.js";
+import { linesOfRanges, rangesOfLines } from "../line-alignment.js";
 import { applyInlineSuppressions } from "./inline-suppressions.js";
 import { getToolPlan } from "./plan.js";
 import { resolveRunnerPath } from "./runner-context.js";
@@ -67,10 +68,25 @@ import {
 	observeRunnerLatency,
 } from "./collect-later-tier.js";
 import { deferRunnerFindings } from "./pending-runner-findings.js";
+import {
+	ADOPTED_ROOT_RUNNER_ALLOWLIST,
+	filterGroupsForAdoptedRoot,
+} from "./adopted-root-runners.js";
 
-import { applyRulePolicy, rulePolicyMapFromConfig } from "./rule-policy.js";
+import { laneCopyStandsFor, semanticRank } from "./lane-copies.js";
+import {
+	applyRulePolicy,
+	resolvedRulePolicyMap,
+	rulePolicyMapFromConfig,
+} from "./rule-policy.js";
 import { getToolProfile } from "./tool-profile.js";
-import { hasUsableResult, isRunnerSkipReason } from "./types.js";
+import { classifyPreExisting, preEditSeedFactKey } from "./pre-edit-seed.js";
+import {
+	hasUsableResult,
+	isRunnerClaimSource,
+	isRunnerSkipReason,
+	reachedNoVerdict,
+} from "./types.js";
 
 const dispatcherProbeFlights = createAvailabilityProbeFlight<
 	Awaited<ReturnType<typeof probeToolAsync>>
@@ -85,12 +101,19 @@ import type {
 	RunnerGroup,
 	RunnerRegistry as RunnerRegistryContract,
 	RunnerResult,
+	RunnerClaimSource,
 	RunnerSkipReason,
 } from "./types.js";
 import {
 	DELTA_UNUSED_PROMOTION_NOTE,
 	formatDiagnostics,
 } from "./utils/format-utils.js";
+import { registerRunnerId } from "./known-runner-ids.js";
+import {
+	combinePrimaryUnavailableCauses,
+	PRIMARY_UNAVAILABLE_CAUSE,
+	type PrimaryUnavailableCause,
+} from "../lsp/diagnostic-binding.js";
 
 // --- Runner Registry ---
 
@@ -100,6 +123,11 @@ export class RunnerRegistry implements RunnerRegistryContract {
 	register(runner: RunnerDefinition): void {
 		if (this.runners.has(runner.id)) return;
 		this.runners.set(runner.id, runner);
+		// The registry is the runner-id identity source (#3968): every id that
+		// enters any registry is the set `lsp.servers.<id>.covers` validation
+		// projects from (`clients/dispatch/known-runner-ids.ts`, an import
+		// leaf so the config loader can ask without importing this graph).
+		registerRunnerId(runner.id);
 	}
 
 	get(id: string): RunnerDefinition | undefined {
@@ -330,6 +358,10 @@ export function createDispatchContext(
 	telemetryProvider?: string,
 	/** #3568: the session of a post-write dispatch, for its deferred runners. */
 	sessionGeneration?: GenerationHandle,
+	/** Stable session identity for deferred runner delivery. */
+	sessionId?: string,
+	/** Root ownership selected by the shared analysis-root seam. */
+	analysisRootMode?: import("../analysis-root.js").AnalysisRootMode,
 ): DispatchContext {
 	const absoluteFilePath = resolveRunnerPath(cwd, filePath);
 	const normalizedProjectRoot = normalizeMapKey(
@@ -362,6 +394,7 @@ export function createDispatchContext(
 				})
 			: undefined;
 	const projectConfig = loadPiLensProjectConfig(normalizedCwd);
+	const rulePolicy = resolvedRulePolicyMap(normalizedProjectRoot);
 
 	return {
 		filePath: normalizedFilePath,
@@ -369,6 +402,7 @@ export function createDispatchContext(
 		cwd: normalizedCwd,
 		kind,
 		fileRole,
+		analysisRootMode,
 		generatedEvidence: generatedDetail?.evidence,
 		generatedLineShapeMean: generatedDetail?.lineShapeMean,
 		pi,
@@ -376,10 +410,12 @@ export function createDispatchContext(
 		deltaMode: !pi.getFlag("no-delta"),
 		facts,
 		projectConfig,
+		rulePolicy,
 		blockingOnly,
 		modifiedRanges,
 		writeIndex,
 		sessionGeneration,
+		sessionId,
 		telemetryModel,
 		telemetryProvider,
 		toolCwdMemo: {},
@@ -405,6 +441,15 @@ export function createDispatchContext(
 // --- Delta Mode Logic ---
 
 /**
+ * The session fact holding a file's delta baseline (absolute, normalized
+ * path; the #2489 note in `dispatchForFile`). The #4483 pre-edit capture reads
+ * it to tell a file's first dispatch from a later one.
+ */
+export function deltaBaselineFactKey(filePath: string): string {
+	return `session.baseline.${filePath}`;
+}
+
+/**
  * Filter diagnostics to only show NEW issues (delta mode)
  */
 function filterDelta<T extends { id: string }>(
@@ -419,14 +464,6 @@ function filterDelta<T extends { id: string }>(
 	const newItems = after.filter((d) => !beforeSet.has(keyFn(d)));
 
 	return { new: newItems, fixed };
-}
-
-function semanticRank(semantic: OutputSemantic): number {
-	if (semantic === "blocking") return 4;
-	if (semantic === "warning") return 3;
-	if (semantic === "fixed") return 2;
-	if (semantic === "silent") return 1;
-	return 0;
 }
 
 function toolPriority(tool: string, defectClass: string): number {
@@ -587,8 +624,14 @@ export interface RunnerLatency {
 	/** The runner's own `failureKind`, when it set one (#3781). */
 	failureKind?: string;
 	skipReason?: RunnerSkipReason;
+	/** WHO supplied the `covered-by-primary` claim (#3968 F2). */
+	claimSource?: RunnerClaimSource;
 	unconfirmedServerIds?: readonly string[];
 	deferredServerIds?: readonly string[];
+	/** #4403: the runner's own `primaryUnavailableCause`. */
+	primaryUnavailableCause?: PrimaryUnavailableCause;
+	/** #4403: the runner's own `disabledPrimaryServerIds`. */
+	disabledPrimaryServerIds?: readonly string[];
 }
 
 export interface DispatchLatencyReport {
@@ -606,7 +649,9 @@ export interface DispatchLatencyReport {
 
 /**
  * Build the synthetic coverage notice for this dispatch, or `undefined` when
- * the runners covered the file.
+ * the runners covered the file. #4403: with it, `unconfirmedStatus`, set
+ * whenever the primary group gave no usable result for the file even when the
+ * latch withholds the notice, so the caller never renders that write clean.
  *
  * `dedupe` is the push/pull axis, always supplied by the sole caller
  * (`dispatchForFile`). `true` is the pi push surface, where the session-scoped
@@ -620,16 +665,16 @@ function buildCoverageNotice(
 	ctx: DispatchContext,
 	runnerLatencies: RunnerLatency[],
 	dedupe: boolean,
-): Diagnostic | undefined {
-	if (!ctx.kind) return undefined;
+): { notice?: Diagnostic; unconfirmedStatus?: string } {
+	if (!ctx.kind) return {};
 	const lspEnabled = !ctx.pi.getFlag("no-lsp");
 	const primary = getPrimaryDispatchGroup(ctx.kind, lspEnabled);
-	if (!primary || primary.runnerIds.length === 0) return undefined;
+	if (!primary || primary.runnerIds.length === 0) return {};
 
 	const relevant = runnerLatencies.filter((r) =>
 		primary.runnerIds.includes(r.runnerId),
 	);
-	if (relevant.length === 0) return undefined;
+	if (relevant.length === 0) return {};
 
 	// #1867 catalog shape 4: this is correlation, not classification. The LSP
 	// touch already decided which scanner publications were absent for these
@@ -676,7 +721,7 @@ function buildCoverageNotice(
 		// wording for the rest of the session.
 		const onceKey = `${ctx.kind}:${ctx.filePath}:${dedupeSet(silentServerIds)}|${dedupeSet(deferredServerIds)}`;
 		if (dedupe) {
-			if (coverageNoticeSeen.has(onceKey)) return undefined;
+			if (coverageNoticeSeen.has(onceKey)) return {};
 			coverageNoticeSeen.add(onceKey);
 		}
 		const coverageParts: string[] = [];
@@ -691,12 +736,14 @@ function buildCoverageNotice(
 			);
 		}
 		return {
-			id: `coverage-partial:${ctx.kind}:${path.basename(ctx.filePath)}`,
-			message: coverageParts.join("\n"),
-			filePath: ctx.filePath,
-			severity: "warning",
-			semantic: "warning",
-			tool: "pi-lens",
+			notice: {
+				id: `coverage-partial:${ctx.kind}:${path.basename(ctx.filePath)}`,
+				message: coverageParts.join("\n"),
+				filePath: ctx.filePath,
+				severity: "warning",
+				semantic: "warning",
+				tool: "pi-lens",
+			},
 		};
 	}
 
@@ -706,7 +753,7 @@ function buildCoverageNotice(
 	// primary produced no usable result and must not suppress the notice
 	// (#3867). `hasUsableResult` owns that rule in dispatch/types.ts.
 	const primaryHasCoverage = relevant.some(hasUsableResult);
-	if (primaryHasCoverage) return undefined;
+	if (primaryHasCoverage) return {};
 
 	// A primary still in flight (collect-later) may deliver findings at turn
 	// end, so it withholds the notice. A skipped or broken primary produced
@@ -714,7 +761,7 @@ function buildCoverageNotice(
 	const primaryStillInFlight = relevant.some(
 		(r) => r.status === "pending" || r.status === "deferred",
 	);
-	if (primaryStillInFlight) return undefined;
+	if (primaryStillInFlight) return {};
 
 	const plan = getToolPlan(ctx.kind);
 	const fallbackRunnerIds = new Set(
@@ -738,27 +785,76 @@ function buildCoverageNotice(
 		"fact-rules",
 		"opengrep",
 	]);
-	const anyLinterHasCoverage = runnerLatencies.some(
+
+	// These fallback runners provide type coverage when the primary group is
+	// unavailable. Keep this explicit until runner metadata owns this capability.
+	const TYPE_CAPABLE_FALLBACK_RUNNERS = new Set(["mypy"]);
+	const anyFallbackHasCoverage = runnerLatencies.some(
 		(r) =>
 			fallbackRunnerIds.has(r.runnerId) &&
 			!STRUCTURAL_RUNNERS.has(r.runnerId) &&
-			hasUsableResult(r),
+			hasUsableResult(r) &&
+			(!plan?.capabilities.includes("types") ||
+				TYPE_CAPABLE_FALLBACK_RUNNERS.has(r.runnerId)),
 	);
-	if (anyLinterHasCoverage) return undefined;
+	if (anyFallbackHasCoverage) return {};
+
+	// #4403: no primary checked this file. When the runner knows why, the
+	// status line says it; otherwise it says what the notice says.
+	const cause = combinePrimaryUnavailableCauses(
+		relevant.flatMap((r) => r.primaryUnavailableCause ?? []),
+	);
+	const unconfirmedStatus = cause
+		? `no language server answered (${PRIMARY_UNAVAILABLE_CAUSE[cause]})`
+		: "not fully checked (a language tool is missing, timed out, or failed to run)";
+
+	if (cause === "disabled" || cause === "disabledFallback") {
+		// #4403: the operator turned the primary off on purpose. That is not a
+		// tool that is missing or failed, and it holds for every file the
+		// server serves, so it gets one note per server per session, then the
+		// status line alone. Round 4 (N1): the same when the primary's
+		// `fallbackFor` alternate stands in and does not answer either.
+		const disabledIds = [
+			...new Set(relevant.flatMap((r) => r.disabledPrimaryServerIds ?? [])),
+		].sort((a, b) => Number(a > b) - Number(a < b));
+		const onceKeys = disabledIds.map((id) => `disabled-primary:${id}`);
+		if (dedupe) {
+			if (onceKeys.every((key) => coverageNoticeSeen.has(key)))
+				return { unconfirmedStatus };
+			for (const key of onceKeys) coverageNoticeSeen.add(key);
+		}
+		return {
+			notice: {
+				id: `coverage-disabled:${ctx.kind}:${disabledIds.join(",")}`,
+				message:
+					cause === "disabled"
+						? `Pi-lens ${ctx.kind} analysis unconfirmed — Primary LSP (${disabledIds.join(", ")}) is disabled in config by lsp.disabledServers, so no language server checks these files this session (not a clean result).`
+						: `Pi-lens ${ctx.kind} analysis unconfirmed — Primary LSP (${disabledIds.join(", ")}) is disabled in config by lsp.disabledServers and its fallback did not answer, so no language server checked these files (not a clean result).`,
+				filePath: ctx.filePath,
+				severity: "warning",
+				semantic: "warning",
+				tool: "pi-lens",
+			},
+			unconfirmedStatus,
+		};
+	}
 
 	const onceKey = `${ctx.kind}:${ctx.filePath}`;
 	if (dedupe) {
-		if (coverageNoticeSeen.has(onceKey)) return undefined;
+		if (coverageNoticeSeen.has(onceKey)) return { unconfirmedStatus };
 		coverageNoticeSeen.add(onceKey);
 	}
 
 	return {
-		id: `coverage-unavailable:${ctx.kind}:${path.basename(ctx.filePath)}`,
-		message: `Pi-lens ${ctx.kind} analysis unavailable — a language tool is missing, timed out, or failed to run, or the LSP server isn't ready yet, so this file was not fully checked (not a clean result).`,
-		filePath: ctx.filePath,
-		severity: "warning",
-		semantic: "warning",
-		tool: "pi-lens",
+		notice: {
+			id: `coverage-unavailable:${ctx.kind}:${path.basename(ctx.filePath)}`,
+			message: `Pi-lens ${ctx.kind} analysis unavailable — a language tool is missing, timed out, or failed to run, or the LSP server isn't ready yet, so this file was not fully checked (not a clean result).`,
+			filePath: ctx.filePath,
+			severity: "warning",
+			semantic: "warning",
+			tool: "pi-lens",
+		},
+		unconfirmedStatus,
 	};
 }
 
@@ -840,6 +936,43 @@ interface GroupResult {
 	diagnostics: Diagnostic[];
 	latencies: RunnerLatency[];
 	hadBlocker: boolean;
+	/** #4484 r2: findings the runners' edit-range gates withheld (`outOfEditScope`). */
+	outOfEditScope: Diagnostic[];
+	/** #4484 r2: runners and servers that reached no verdict in this group. */
+	inconclusiveRunnerIds: string[];
+	inconclusiveServerIds: string[];
+	/** #4484 round 3: the inconclusive runners still in flight (collect-later). */
+	collectLaterRunnerIds: string[];
+	/** #4484 round 6: runners whose verdict covers only the edit's ranges. */
+	editScopedRunnerIds: string[];
+	/** #4484 round 7: runners that reached a verdict, and the lanes covered skips defer to. */
+	answeredRunnerIds: string[];
+	/** #4509: `ran` marks a covered run (it read the bytes), not a covered skip. */
+	coveredRunners: {
+		runnerId: string;
+		lane: { runnerId: string; serverId?: string };
+		ran: boolean;
+	}[];
+}
+
+/**
+ * #4484 round 3 (R4): `ctx` for one runner, its `modifiedRanges` widened by
+ * the lines an earlier write owed it (`DispatchContext.owedRanges`). A
+ * whole-file dispatch (no ranges) already covers them.
+ */
+export function runnerDispatchContext(
+	ctx: DispatchContext,
+	runnerId: string,
+): DispatchContext {
+	const owed = ctx.owedRanges?.get(runnerId);
+	if (!owed?.length || !ctx.modifiedRanges) return ctx;
+	return {
+		...ctx,
+		modifiedRanges: rangesOfLines([
+			...linesOfRanges(ctx.modifiedRanges),
+			...linesOfRanges(owed),
+		]),
+	};
 }
 
 /**
@@ -862,6 +995,13 @@ async function runGroup(
 	const diagnostics: Diagnostic[] = [];
 	const latencies: RunnerLatency[] = [];
 	let hadBlocker = false;
+	const outOfEditScope: Diagnostic[] = [];
+	const inconclusiveRunnerIds: string[] = [];
+	const inconclusiveServerIds: string[] = [];
+	const collectLaterRunnerIds: string[] = [];
+	const editScopedRunnerIds: string[] = [];
+	const answeredRunnerIds: string[] = [];
+	const coveredRunners: GroupResult["coveredRunners"] = [];
 
 	// Filter runners by kind if specified
 	const runnerIds = group.filterKinds
@@ -962,6 +1102,9 @@ async function runGroup(
 			} catch (error) {
 				ctx.log(`Runner ${runner.id} precondition failed: ${error}`);
 				shouldRun = false;
+				// #4484 round 3: a precondition that threw never decided the runner
+				// does not apply, so the skip reaches no verdict (R1).
+				inconclusiveRunnerIds.push(runner.id);
 			}
 		}
 		if (!shouldRun) {
@@ -987,6 +1130,8 @@ async function runGroup(
 		}
 
 		const projectRoot = ctx.projectRoot ?? ctx.cwd;
+		// #4484 round 3: this runner's range, with the lines owed to it.
+		const runnerCtx = runnerDispatchContext(ctx, runner.id);
 		// Only post-write dispatches participate. Project scans and direct API
 		// callers must retain their existing synchronous semantics.
 		const observedTier =
@@ -995,7 +1140,7 @@ async function runGroup(
 				: classifyObservedRunner(projectRoot, runner.id);
 		if (observedTier === "collect-later") {
 			const markedAtMs = Date.now();
-			const deferred = runRunner(ctx, runner, semantic).then((result) => {
+			const deferred = runRunner(runnerCtx, runner, semantic).then((result) => {
 				const durationMs = Date.now() - markedAtMs;
 				const tier = observeRunnerLatency({
 					projectRoot,
@@ -1033,7 +1178,11 @@ async function runGroup(
 					status: result.status,
 					diagnosticCount: result.diagnostics.length,
 					semantic: result.semantic ?? semantic,
-					metadata: { tier: "collect-later", delivered: "turn_end" },
+					metadata: {
+						tier: "collect-later",
+						delivered: "turn_end",
+						...failureRowMetadata(result),
+					},
 				});
 				return result;
 			});
@@ -1046,6 +1195,7 @@ async function runGroup(
 				writeIndex: ctx.writeIndex,
 				promise: deferred,
 				session: ctx.sessionGeneration,
+				sessionId: ctx.sessionId,
 			});
 			// A deferred runner is still an observed runner. Keep it visible in
 			// both the edit latency report and the widget until its turn-end result
@@ -1060,6 +1210,9 @@ async function runGroup(
 				semantic: semantic,
 			});
 			recordRunner(ctx.filePath, runner.id, "pending", 0, 0, ctx.writeIndex);
+			// #4484 r2: a run still in flight has observed nothing yet.
+			inconclusiveRunnerIds.push(runner.id);
+			collectLaterRunnerIds.push(runner.id);
 			logLatency({
 				type: "runner",
 				filePath: ctx.filePath,
@@ -1073,7 +1226,7 @@ async function runGroup(
 			continue;
 		}
 
-		const result = await runRunner(ctx, runner, semantic);
+		const result = await runRunner(runnerCtx, runner, semantic);
 		onRunnerResult?.(runnerId, result);
 		const runnerEnd = Date.now();
 		const duration = runnerEnd - runnerStart;
@@ -1114,6 +1267,13 @@ async function runGroup(
 			result.status === "skipped" && isRunnerSkipReason(result.skipReason)
 				? result.skipReason
 				: undefined;
+		// WHO claimed, for `covered-by-primary` (#3968 F2). Admitted only on
+		// actual skips and only through the closed-taxonomy guard, like
+		// skipReason, so free text cannot enter durable latency metadata.
+		const claimSource =
+			result.status === "skipped" && isRunnerClaimSource(result.claimSource)
+				? result.claimSource
+				: undefined;
 
 		latencies.push({
 			runnerId,
@@ -1129,11 +1289,20 @@ async function runGroup(
 			...(skipReason !== undefined && {
 				skipReason,
 			}),
+			...(claimSource !== undefined && {
+				claimSource,
+			}),
 			...(result.unconfirmedServerIds !== undefined && {
 				unconfirmedServerIds: result.unconfirmedServerIds,
 			}),
 			...(result.deferredServerIds !== undefined && {
 				deferredServerIds: result.deferredServerIds,
+			}),
+			...(result.primaryUnavailableCause !== undefined && {
+				primaryUnavailableCause: result.primaryUnavailableCause,
+			}),
+			...(result.disabledPrimaryServerIds !== undefined && {
+				disabledPrimaryServerIds: result.disabledPrimaryServerIds,
 			}),
 		});
 		logLatency({
@@ -1155,24 +1324,45 @@ async function runGroup(
 						}))
 					: undefined,
 			metadata:
-				result.status === "failed" && result.failureKind
-					? {
-							failureKind: result.failureKind,
-							failureMessage: result.failureMessage,
-						}
-					: skipReason
-						? { skipReason }
-						: undefined,
+				failureRowMetadata(result) ??
+				(skipReason
+					? { skipReason, ...(claimSource !== undefined && { claimSource }) }
+					: undefined),
 		});
-		recordRunner(
-			ctx.filePath,
-			runnerId,
-			result.status,
-			result.diagnostics.length,
-			duration,
-			ctx.writeIndex,
-		);
+		// #4483: a pre-edit capture reads bytes the host is about to replace,
+		// so its counts never reach the widget's runner state.
+		if (!ctx.preEditCapture)
+			recordRunner(
+				ctx.filePath,
+				runnerId,
+				result.status,
+				result.diagnostics.length,
+				duration,
+				ctx.writeIndex,
+			);
 
+		// #4484 r2: every finding names the runner that observed it, so a
+		// recorded blocker is retired only by a conclusive run of its own source.
+		for (const d of result.diagnostics) d.runnerId ??= runnerId;
+		for (const d of result.outOfEditScope ?? []) {
+			d.runnerId ??= runnerId;
+			outOfEditScope.push(d);
+		}
+		if (reachedNoVerdict(result)) inconclusiveRunnerIds.push(runnerId);
+		else {
+			answeredRunnerIds.push(runnerId);
+			if (result.coveredBy)
+				coveredRunners.push({
+					runnerId,
+					lane: result.coveredBy,
+					ran: result.skipReason !== "covered-by-primary",
+				});
+			if (result.editScopedVerdict === true) editScopedRunnerIds.push(runnerId);
+		}
+		inconclusiveServerIds.push(
+			...(result.unconfirmedServerIds ?? []),
+			...(result.deferredServerIds ?? []),
+		);
 		diagnostics.push(...result.diagnostics);
 
 		const resultSemantic = result.semantic ?? semantic;
@@ -1189,7 +1379,18 @@ async function runGroup(
 		}
 	}
 
-	return { diagnostics, latencies, hadBlocker };
+	return {
+		diagnostics,
+		latencies,
+		hadBlocker,
+		outOfEditScope,
+		inconclusiveRunnerIds,
+		inconclusiveServerIds,
+		collectLaterRunnerIds,
+		editScopedRunnerIds,
+		answeredRunnerIds,
+		coveredRunners,
+	};
 }
 
 // --- Main Dispatch Function ---
@@ -1207,6 +1408,45 @@ export async function dispatchForFile(
 	options?: { dedupeCoverageNotice?: boolean },
 ): Promise<DispatchResult> {
 	const _overallStart = Date.now();
+	if (ctx.analysisRootMode === "adopted") {
+		// #4242 phase A (per-file linters): an adopted root runs ONLY the explicit
+		// admission list of config-free, code-free runners, and only from global or
+		// pi-lens-managed binaries. The default is refused, so a newly registered
+		// runner stays off an adopted root until `ADOPTED_ROOT_RUNNER_ALLOWLIST`
+		// admits it. Whole-project scanners and test runners are not in the plan
+		// for a per-file dispatch, and turn-end tests stay off via the foreign
+		// checkout gate.
+		const planned = groups.flatMap((g) => g.runnerIds);
+		groups = filterGroupsForAdoptedRoot(groups);
+		const admitted = new Set(groups.flatMap((g) => g.runnerIds));
+		logLatency({
+			type: "phase",
+			filePath: ctx.filePath,
+			phase: "dispatch_adopted_root_allowlist",
+			durationMs: 0,
+			metadata: {
+				admissionList: ADOPTED_ROOT_RUNNER_ALLOWLIST.join(","),
+				admitted: groups.flatMap((g) => g.runnerIds).join(","),
+				refused: planned
+					.flatMap((id) => (admitted.has(id) ? [] : [id]))
+					.join(","),
+				noAdmittedRunner: groups.length === 0,
+			},
+		});
+		if (groups.length === 0) {
+			return {
+				diagnostics: [],
+				blockers: [],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "",
+				blockerOutput: "",
+				hasBlockers: false,
+			};
+		}
+	}
 	if (ctx.fileRole === "generated") {
 		// The generated short-circuit (refs #2346): never ran before this fix
 		// for name-less machine-emitted files (a scraped/minified page has no
@@ -1261,6 +1501,7 @@ export async function dispatchForFile(
 			groupCount: groups.length,
 			kind: ctx.kind,
 			runners: allRunnerIds.join(","),
+			...(ctx.preEditCapture && { preEditCapture: true }),
 		},
 	});
 
@@ -1311,7 +1552,7 @@ export async function dispatchForFile(
 				"dispatchForFile requires an absolute ctx.filePath to key the delta baseline (refs #2489)",
 		});
 	}
-	const baselineAbsKey = `session.baseline.${ctx.filePath}`;
+	const baselineAbsKey = deltaBaselineFactKey(ctx.filePath);
 	const previousBaseline =
 		ctx.deltaMode && baselinePathSafe
 			? ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineAbsKey)
@@ -1321,20 +1562,78 @@ export async function dispatchForFile(
 	);
 	const baselineWarningCount = baselineWarnings?.length ?? 0;
 
+	const outOfEditScope: Diagnostic[] = [];
+	const inconclusiveRunnerIds = new Set<string>();
+	const inconclusiveServerIds = new Set<string>();
+	const collectLaterRunnerIds = new Set<string>();
+	const editScopedRunnerIds: string[] = [];
+	const answeredRunnerIds = new Set<string>();
+	const coveredRunners: GroupResult["coveredRunners"] = [];
 	for (const {
 		diagnostics: groupDiags,
 		latencies,
 		hadBlocker,
+		outOfEditScope: groupOutOfScope,
+		inconclusiveRunnerIds: groupRunnerIds,
+		inconclusiveServerIds: groupServerIds,
+		collectLaterRunnerIds: groupCollectLater,
+		editScopedRunnerIds: groupEditScoped,
+		answeredRunnerIds: groupAnswered,
+		coveredRunners: groupCovered,
 	} of groupResults) {
 		runnerLatencies.push(...latencies);
+		outOfEditScope.push(...groupOutOfScope);
+		for (const id of groupRunnerIds) inconclusiveRunnerIds.add(id);
+		for (const id of groupServerIds) inconclusiveServerIds.add(id);
+		for (const id of groupCollectLater) collectLaterRunnerIds.add(id);
+		editScopedRunnerIds.push(...groupEditScoped);
+		for (const id of groupAnswered) answeredRunnerIds.add(id);
+		coveredRunners.push(...groupCovered);
 
 		allDiagnostics.push(...groupDiags);
 		if (hadBlocker) stopped = true;
 	}
+	// #4484 round 7: a covered skip is a verdict only when the lane it defers
+	// to answered: its runner reached a verdict, and its server confirmed.
+	// #4509: a covered run read the bytes, so its verdict stands either way.
+	// Where its answering lane delivers one of its findings (same line and
+	// rule, at least as severe: `laneCopyStandsFor`), the lane's copy stands
+	// for it, so the one finding is listed once.
+	const voidedCovers = new Set<string>();
+	const laneCopyByRunner = new Map<string, (d: Diagnostic) => boolean>();
+	for (const { runnerId, lane, ran } of coveredRunners) {
+		const silent =
+			!answeredRunnerIds.has(lane.runnerId) ||
+			(lane.serverId !== undefined && inconclusiveServerIds.has(lane.serverId));
+		if (ran) {
+			if (silent) continue;
+			laneCopyByRunner.set(
+				runnerId,
+				laneCopyStandsFor(
+					allDiagnostics.flatMap((d) =>
+						d.runnerId === lane.runnerId &&
+						(lane.serverId === undefined || d.serverId === lane.serverId)
+							? [d]
+							: [],
+					),
+				),
+			);
+			continue;
+		}
+		if (!silent) continue;
+		voidedCovers.add(runnerId);
+		inconclusiveRunnerIds.add(runnerId);
+	}
+	const deliveredDiagnostics =
+		laneCopyByRunner.size === 0
+			? allDiagnostics
+			: allDiagnostics.flatMap((d) =>
+					laneCopyByRunner.get(d.runnerId ?? "")?.(d) ? [] : [d],
+				);
 
 	// Apply delta mode ONCE across the full diagnostic set.
 	// This avoids partial-baseline corruption when processing multiple groups.
-	const dedupedDiagnostics = dedupeOverlappingDiagnostics(allDiagnostics);
+	const dedupedDiagnostics = dedupeOverlappingDiagnostics(deliveredDiagnostics);
 	const fileContent =
 		ctx.facts.getFileFact<string>(ctx.filePath, "file.content") ?? "";
 	// Project rule policy (`.pi-lens.json` `rules.<id>.disable`/`select`).
@@ -1348,9 +1647,11 @@ export async function dispatchForFile(
 	// the same root here keeps the two surfaces in agreement. `ctx.projectConfig`
 	// itself is untouched — thresholds and mutation flags keep their existing
 	// language-root resolution.
-	const rulePolicy = rulePolicyMapFromConfig(
-		loadPiLensProjectConfig(ctx.projectRoot ?? ctx.cwd).rules,
-	);
+	const rulePolicy =
+		ctx.rulePolicy ??
+		rulePolicyMapFromConfig(
+			loadPiLensProjectConfig(ctx.projectRoot ?? ctx.cwd).rules,
+		);
 	// The output-only filter pipeline: LSP/docker overlap suppression + inline
 	// `pi-lens-ignore` + agent/user dispositions + project rule policy. Applied
 	// AFTER dedupe so the pi renderer, widget, and delta all see one filtered
@@ -1381,10 +1682,31 @@ export async function dispatchForFile(
 			ctx.filePath,
 			fileContent,
 		);
-		return applyRulePolicy(disposition, rulePolicy);
+		return applyRulePolicy(disposition, rulePolicy, {
+			root: ctx.projectRoot ?? ctx.cwd,
+			filePath: ctx.filePath,
+		});
 	};
 	let visibleDiagnostics = applyOutputFilters(dedupedDiagnostics);
 	let resolvedCount = 0;
+	// #4484 r2: what this observation still holds that neither delivers nor
+	// enters the record alone. An edit-range gate decides delivery only, so the
+	// blocking findings it withheld (through the same output filters) keep a
+	// recorded blocker of the same identity pending. They stay out of the
+	// baseline and the delta.
+	const stillObserved: Diagnostic[] =
+		outOfEditScope.length > 0
+			? applyOutputFilters(outOfEditScope).flatMap((d) =>
+					d.semantic === "blocking" ? [d] : [],
+				)
+			: [];
+	// #4484: the delta decides only what the agent is told is NEW, never
+	// whether a blocker is still pending. The blocking findings it holds back
+	// as already seen are still in this observation, so they go back beside
+	// the delta: the inline-blocker record, the store and the commit gate read
+	// them, and the record clears only when they and the delta's blockers are
+	// both gone.
+	let heldBackBlockers: Diagnostic[] = [];
 	if (ctx.deltaMode && previousBaseline) {
 		// Silencing a rule is not fixing it. The stored baseline is deliberately
 		// unfiltered (below), so compare against a fully-filtered view of it
@@ -1397,8 +1719,62 @@ export async function dispatchForFile(
 			applyOutputFilters(previousBaseline),
 			(d) => d.id,
 		);
+		const isNew = new Set(filtered.new);
+		heldBackBlockers = visibleDiagnostics.filter(
+			(d) => d.semantic === "blocking" && !isNew.has(d),
+		);
+		// #4484 r2: an unused value is a blocker only while the delta calls it
+		// new. Held back as already seen, it is still observed, promoted as it
+		// was when it was recorded, so the record keeps it pending.
+		stillObserved.push(
+			...promoteDeltaUnusedToBlockers(
+				visibleDiagnostics.flatMap((d) =>
+					!isNew.has(d) &&
+					d.semantic !== "blocking" &&
+					isUnusedValueDiagnostic(d)
+						? [d]
+						: [],
+				),
+			),
+		);
 		visibleDiagnostics = promoteDeltaUnusedToBlockers(filtered.new);
 		resolvedCount = filtered.fixed.length;
+	}
+
+	// #4483: a blocking linter finding the file held before its first edit
+	// this session (the seed `tool_call` captured) is pre-existing: not a
+	// blocker, not held back, reported on its own. Matched by identity and
+	// line text, so it stays pre-existing when lines move; the seed shrinks to
+	// what this run still observes, or keeps entries of runners with no verdict.
+	const seedKey = preEditSeedFactKey(ctx.filePath);
+	const preEditSeed =
+		ctx.deltaMode && baselinePathSafe
+			? ctx.facts.getBoundedSessionFact<Diagnostic[]>(seedKey)
+			: undefined;
+	const seedContent = ctx.facts.getFileFact<string>(
+		ctx.filePath,
+		"file.content",
+	);
+	let preExisting: Diagnostic[] = [];
+	if (preEditSeed && seedContent !== undefined) {
+		const classified = classifyPreExisting(
+			preEditSeed,
+			[
+				...visibleDiagnostics.filter((d) => d.semantic === "blocking"),
+				...heldBackBlockers,
+			],
+			seedContent,
+			new Set(
+				[...answeredRunnerIds].filter((id) => !inconclusiveRunnerIds.has(id)),
+			),
+		);
+		if (classified.preExisting.length > 0) {
+			const held = new Set(classified.preExisting);
+			visibleDiagnostics = visibleDiagnostics.filter((d) => !held.has(d));
+			heldBackBlockers = heldBackBlockers.filter((d) => !held.has(d));
+			preExisting = classified.preExisting;
+		}
+		ctx.facts.setBoundedSessionFact(seedKey, classified.nextSeed);
 	}
 
 	// Persist full current snapshot for next run (not delta-filtered subset).
@@ -1441,7 +1817,7 @@ export async function dispatchForFile(
 
 	const inlineBlockers = blockers;
 	const inlineFixed = fixedItems;
-	const coverageNotice = buildCoverageNotice(
+	const { notice: coverageNotice, unconfirmedStatus } = buildCoverageNotice(
 		ctx,
 		runnerLatencies,
 		options?.dedupeCoverageNotice ?? true,
@@ -1517,6 +1893,18 @@ export async function dispatchForFile(
 			// baseline read ever runs and cannot carry either value.
 			baselineHit: previousBaseline !== undefined,
 			baselineWarningCount,
+			// #4484: blockers still observed that the delta did not call new.
+			heldBackBlockers: heldBackBlockers.length,
+			// #4483: whether a pre-edit seed was read, and the blocking linter
+			// findings it reported as pre-existing.
+			preEditSeed: preEditSeed !== undefined,
+			preExisting: preExisting.length,
+			...(ctx.preEditCapture && { preEditCapture: true }),
+			// #4484 r2: findings that only keep a recorded blocker pending, and
+			// the sources whose silence is no evidence.
+			stillObserved: stillObserved.length,
+			inconclusiveRunners: inconclusiveRunnerIds.size,
+			inconclusiveServers: inconclusiveServerIds.size,
 		},
 	});
 
@@ -1531,6 +1919,22 @@ export async function dispatchForFile(
 		output,
 		blockerOutput,
 		hasBlockers: blockers.length > 0,
+		...(heldBackBlockers.length > 0 && { heldBackBlockers }),
+		...(preExisting.length > 0 && { preExisting }),
+		...(stillObserved.length > 0 && { stillObserved }),
+		...(editScopedRunnerIds.some((id) => !voidedCovers.has(id)) && {
+			editScopedRunnerIds: editScopedRunnerIds.flatMap((id) =>
+				voidedCovers.has(id) ? [] : [id],
+			),
+		}),
+		...((inconclusiveRunnerIds.size > 0 || inconclusiveServerIds.size > 0) && {
+			inconclusiveSources: {
+				runnerIds: [...inconclusiveRunnerIds],
+				serverIds: [...inconclusiveServerIds],
+				collectLaterRunnerIds: [...collectLaterRunnerIds],
+			},
+		}),
+		...(unconfirmedStatus !== undefined && { unconfirmedStatus }),
 	};
 }
 
@@ -1571,6 +1975,21 @@ function normalizeDiagnosticFilePath(
 	}
 
 	return resolveRunnerPath(ctx.cwd, rawPath || ctx.filePath);
+}
+
+/**
+ * The `failureKind` of a failed run, for the latency.log runner row (#3796).
+ * Inline and collect-later rows share it, so the log analyzer reads one place.
+ */
+function failureRowMetadata(
+	result: RunnerResult,
+): { failureKind: string; failureMessage: string | undefined } | undefined {
+	return result.status === "failed" && result.failureKind
+		? {
+				failureKind: result.failureKind,
+				failureMessage: result.failureMessage,
+			}
+		: undefined;
 }
 
 async function runRunner(

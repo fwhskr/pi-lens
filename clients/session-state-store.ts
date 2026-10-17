@@ -12,6 +12,7 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { writeFileAtomicAsync } from "./atomic-write.js";
+import { freshnessFromMtime } from "./freshness.js";
 import { getProjectDataDir } from "./file-utils.js";
 import { readJsonCacheAsync } from "./json-cache-read.js";
 import type { PersistedReadGuardState } from "./read-guard.js";
@@ -30,6 +31,8 @@ export interface PersistedSessionState {
 	savedAt: number;
 	/** Each declared session store's snapshot, by store name (`session-scope.ts`). */
 	stores: Record<string, unknown>;
+	/** Set by {@link fromDisk} on a migrated file only; never written (#3873). */
+	migratedFrom?: 1;
 }
 
 /**
@@ -59,6 +62,7 @@ function fromDisk(parsed: unknown): PersistedSessionState | undefined {
 		sessionId: String(v1.sessionId),
 		savedAt: Number(v1.savedAt),
 		stores: { widget: v1.widget, "read-guard": v1.readGuard },
+		migratedFrom: 1,
 	};
 }
 
@@ -130,7 +134,13 @@ export async function dropStaleFiles(
 			try {
 				const st = await fs.stat(file.filePath);
 				// mtime within a small skew of savedAt counts as unchanged.
-				return st.mtimeMs <= savedAt + 1 ? file : undefined;
+				return freshnessFromMtime({
+					mtimeMs: st.mtimeMs,
+					referenceMs: savedAt,
+					toleranceMs: 1,
+				}).verdict === "fresh"
+					? file
+					: undefined;
 			} catch {
 				return undefined; // gone → drop
 			}

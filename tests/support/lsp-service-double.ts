@@ -1,5 +1,5 @@
 import { vi } from "vitest";
-import type { LSPService } from "../../clients/lsp/index.js";
+import type { LSPService } from "../../clients/lsp/capabilities.js";
 
 /**
  * Shared `LSPService` test double — #2582.
@@ -48,6 +48,7 @@ export function makeLspServiceDouble(
 		getAllDiagnostics: vi.fn(async () => new Map()),
 		readCachedDiagnosticsForServers: vi.fn(async () => new Map()),
 		getDiagnostics: vi.fn(() => []),
+		getDiagnosticsHealth: vi.fn(() => undefined),
 		getWarmClientForFile: vi.fn(async () => undefined),
 		getOpenDocumentPaths: vi.fn(() => []),
 		getAliveClientCount: vi.fn(() => 0),
@@ -62,6 +63,7 @@ export function makeLspServiceDouble(
 		getOperationSupport: vi.fn(() => undefined),
 		isDocumentOpen: vi.fn(() => false),
 		notifyExternalFileChange: vi.fn(async () => undefined),
+		announceCreatedFiles: vi.fn(() => undefined),
 		getBrokenStatus: vi.fn(() => undefined),
 	};
 

@@ -63,6 +63,7 @@ function makeServer(id: string, ext: string, root: string): TestServer {
 		name: id,
 		extensions: [ext],
 		idleEviction: "transparent",
+		role: "language",
 		root: async () => root,
 		spawn: vi.fn(async () => ({ process: {}, source: "test" })),
 	};
@@ -103,6 +104,7 @@ function makeClient(serverId: string, root: string) {
 		getRawCapabilityKeys: () => [],
 		getLaunchVariant: () => undefined,
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(
 				(
 					filePath: string,

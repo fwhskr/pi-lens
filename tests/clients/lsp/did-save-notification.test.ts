@@ -38,6 +38,7 @@ import {
 	createLSPClient,
 	handleNotifyChange,
 	handleNotifyOpen,
+	handleNotifySave,
 	type LSPClientState,
 } from "../../../clients/lsp/client.js";
 import { stopLSP } from "../../../clients/lsp/launch.js";
@@ -424,6 +425,73 @@ function notifyRecorder(client: Awaited<ReturnType<typeof createLSPClient>>) {
 	};
 }
 
+/**
+ * #3405 r1: `notify.save` is the save for bytes the server already holds — the
+ * service sends it when it debounced a saved touch's push (an unsaved push of
+ * the same bytes landed just before). Recurrence: a cold `lsp_diagnostics`
+ * query lost its save that way (clangd 22.1.0 received didOpen, never didSave).
+ */
+describe("a save with no content push (#3405 r1)", () => {
+	let state: LSPClientState;
+
+	beforeEach(() => {
+		state = createMockState();
+		state.saveOptions = { includeText: true };
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	const openUnsaved = (content = "const x = 1;\n") =>
+		handleNotifyOpen(state, TEST_FILE, content, "typescript", false, true);
+
+	it("sends only didSave, without text, for a document the server holds", async () => {
+		await openUnsaved();
+		vi.mocked(state.connection.sendNotification).mockClear();
+		await expect(handleNotifySave(state, TEST_FILE)).resolves.toBe(true);
+		// No re-push: clangd does not republish identical bytes, and a re-push
+		// clears the cached answer the touch then waits on.
+		expect(sentMethods(state)).toEqual(["textDocument/didSave"]);
+		// No text even under includeText: a push queued before this entry may
+		// have replaced the bytes its caller read.
+		expect(sentParams(state, "textDocument/didSave")).toEqual({
+			textDocument: { uri: TEST_URI },
+		});
+	});
+
+	it("hands its save to an unsent push instead of replacing it", async () => {
+		await openUnsaved();
+		vi.mocked(state.connection.sendNotification).mockClear();
+		const push = openUnsaved("const x = 2;\n");
+		const save = handleNotifySave(state, TEST_FILE);
+		await Promise.all([push, save]);
+		// The newer bytes still go, and they carry the save: one didChange, one
+		// didSave, in that order.
+		expect(sentMethods(state)).toEqual([
+			"textDocument/didChange",
+			"textDocument/didSave",
+		]);
+		expect(sentParams(state, "textDocument/didSave")).toEqual({
+			textDocument: { uri: TEST_URI },
+			text: "const x = 2;\n",
+		});
+		await expect(push).resolves.toBe(true);
+	});
+
+	it("sends nothing to a server that declared no save", async () => {
+		state.saveOptions = undefined;
+		await openUnsaved();
+		vi.mocked(state.connection.sendNotification).mockClear();
+		await expect(handleNotifySave(state, TEST_FILE)).resolves.toBe(false);
+		expect(sentMethods(state)).toEqual([]);
+	});
+
+	it("sends nothing for a document the server does not hold", async () => {
+		await expect(handleNotifySave(state, TEST_FILE)).resolves.toBe(false);
+		expect(sentMethods(state)).toEqual([]);
+	});
+});
+
 describe("didSave through the real createLSPClient init path (#3405)", () => {
 	it("a server advertising save: true receives didSave after didOpen", async () => {
 		const proc = await spawnFakeLspServer({
@@ -505,6 +573,95 @@ describe("didSave through the real createLSPClient init path (#3405)", () => {
 			expect(recorder.methods).toContain("textDocument/didOpen");
 			expect(recorder.methods).not.toContain("textDocument/didSave");
 			expect(recorder.saves).toEqual([]);
+		} finally {
+			await client.shutdown().catch(() => {});
+			await stopLSP(proc).catch(() => {});
+		}
+	}, 15_000);
+
+	// The production consequence the issue is about, not the notification alone:
+	// a server whose WHOLE diagnose pass is save-triggered publishes ONLY from
+	// its didSave branch (`FAKE_LSP_PUBLISH_ON_SAVE`), so the diagnostics pi-lens
+	// reads are reachable exactly when the save is. Expert is that member; the
+	// fixture stands in for it because the local box has no Elixir (#3405).
+	it("reads the save-only server's diagnostics after a save touch", async () => {
+		const proc = await spawnFakeLspServer({
+			cwd: process.cwd(),
+			env: {
+				...process.env,
+				FAKE_LSP_SAVE: "true",
+				FAKE_LSP_PUBLISH_ON_SAVE: "1",
+				FAKE_LSP_ECHO_DID_SAVE: "1",
+				FAKE_LSP_NO_DIAGNOSTIC_PROVIDER: "1",
+			},
+		});
+		const client = await createLSPClient({
+			serverId: "fake-save-publish",
+			process: proc,
+			root: process.cwd(),
+		});
+		try {
+			const recorder = notifyRecorder(client);
+			const filePath = path.join(os.tmpdir(), "pi-lens-did-save-publish.ts");
+			// 6th argument `saved: true` is the post-write sync's declaration.
+			await client.notify.open(
+				filePath,
+				"const x = 1;\n",
+				"typescript",
+				undefined,
+				true,
+				true,
+			);
+			// The fixture sends the publish BEFORE this echo, and a stdio stream is
+			// FIFO, so a settled echo proves the client has already stored it.
+			await recorder.untilSave();
+			await client.waitForDiagnostics(filePath, 5000);
+			expect(client.getDiagnostics(filePath).map((d) => d.code)).toEqual([
+				"P3405",
+			]);
+		} finally {
+			await client.shutdown().catch(() => {});
+			await stopLSP(proc).catch(() => {});
+		}
+	}, 15_000);
+
+	it("reads no diagnostics from the same server when the touch is not a save", async () => {
+		const proc = await spawnFakeLspServer({
+			cwd: process.cwd(),
+			env: {
+				...process.env,
+				FAKE_LSP_SAVE: "true",
+				FAKE_LSP_PUBLISH_ON_SAVE: "1",
+				FAKE_LSP_ECHO_DID_SAVE: "1",
+				FAKE_LSP_ECHO_NOTIFY_METHODS: "1",
+				FAKE_LSP_NO_DIAGNOSTIC_PROVIDER: "1",
+			},
+		});
+		const client = await createLSPClient({
+			serverId: "fake-save-publish-none",
+			process: proc,
+			root: process.cwd(),
+		});
+		try {
+			const recorder = notifyRecorder(client);
+			const filePath = path.join(
+				os.tmpdir(),
+				"pi-lens-did-save-publish-none.ts",
+			);
+			await client.notify.open(
+				filePath,
+				"const x = 1;\n",
+				"typescript",
+				undefined,
+				true,
+				false,
+			);
+			await recorder.until("textDocument/didOpen");
+			// A reply issued after the notify proves the server drained it, so the
+			// absent publish below is evidence, not a race.
+			await client.pingLiveness?.(5000);
+			expect(recorder.methods).not.toContain("textDocument/didSave");
+			expect(client.getDiagnostics(filePath)).toEqual([]);
 		} finally {
 			await client.shutdown().catch(() => {});
 			await stopLSP(proc).catch(() => {});

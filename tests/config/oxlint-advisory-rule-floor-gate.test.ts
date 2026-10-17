@@ -57,7 +57,11 @@ describe("oxlint advisory rule-count floor guard (#2700 review round 2, F2)", ()
 	it("the real job step defines a RULE_FLOOR and compares $rules against it", () => {
 		const run = readStepRun(loadWorkflow());
 		expect(run).toMatch(/RULE_FLOOR=\d+/);
-		expect(run).toMatch(/"\$rules"\s+-lt\s+"\$RULE_FLOOR"/);
+		// #4518: the compare is the shared helper's, not a shell `-lt`.
+		expect(run).toMatch(
+			/assert-evaluated\.mjs --count "oxlint-rules=\$\{rules\}" --floor "\$RULE_FLOOR"/,
+		);
+		expect(run).not.toMatch(/-lt\s+"\$RULE_FLOOR"/);
 	});
 
 	it("breaching the floor emits a named ::error:: annotation and fails the step", () => {
@@ -103,9 +107,16 @@ describe("oxlint advisory rule-count floor guard (#2700 review round 2, F2)", ()
 					XDG_DATA_HOME: resolve(REPO_ROOT, ".probe-home/xdg"),
 				},
 				timeout: 30_000,
+				// Node refuses to spawn a `.cmd` shim without a shell (CVE-2024-27980),
+				// so a bare `npm.cmd` spawn on Windows returned `status: null` with no
+				// output (#4019).
+				shell: process.platform === "win32",
 			},
 		);
-		expect(advisory.status, advisory.stdout + advisory.stderr).toBe(0);
+		expect(
+			advisory.status,
+			`${advisory.error ?? ""}${advisory.stdout}${advisory.stderr}`,
+		).toBe(0);
 		expect(Number(count(advisory.stdout))).toBeGreaterThanOrEqual(100);
 		expect(count(JSON.stringify({ rules: { a: "deny", b: "warn" } }))).toBe(
 			"2",

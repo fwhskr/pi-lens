@@ -77,7 +77,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
+import { McpStdioClient } from "./lib/mcp-stdio-client.mjs";
 import { parseTable } from "./lib/md-matrix.mjs";
+import { startRpcSession } from "./rpc-load-check.mjs";
 
 // ===========================================================================
 // Pure core — parsing, outcome rules, arithmetic, rendering.
@@ -91,8 +93,14 @@ import { parseTable } from "./lib/md-matrix.mjs";
  * `index.ts`'s `resources_discover` handler (#205) — pi-lens registering its
  * own skills — as opposed to a `pi.skills` manifest entry pi resolved itself.
  * Read off live pi 0.80.10 and 0.85.1 responses, both identical.
+ *
+ * #1416: pi-lens no longer contributes skill paths from that handler. pi
+ * applies settings package filters (`packages[].skills`) only to manifest
+ * resources and merges a contributed path raw, so the old contribution
+ * re-added every excluded skill. Skills must now come from the manifest, so
+ * this label is the one the skills row asserts is ABSENT.
  */
-const EXPECTED_SKILL_REGISTRAR = "extension:index";
+const EXTENSION_HANDLER_REGISTRAR = "extension:index";
 /** How many skills pi-lens ships: one SKILL.md per dir under `skills`. */
 const MIN_SHIPPED_SKILLS = 4;
 
@@ -476,10 +484,13 @@ export function classifyRunFailure(observed) {
  *   - at least four skills registered at all (#2587's headline);
  *   - every one resolved INSIDE the installed package (a foreign tree adopted
  *     from a parent directory would otherwise read as success);
- *   - every one registered by `extension:index` — pi-lens's own
- *     `resources_discover` handler (#205) rather than the `pi.skills` manifest.
- *     #2587 is the proof that one registrar can be broken for four releases
- *     while the other silently covers for it.
+ *   - NONE registered by `extension:index` — pi-lens's own
+ *     `resources_discover` handler (#205). #1416: that handler used to
+ *     contribute the whole `<packageRoot>/skills` directory, which pi merged
+ *     raw and thereby undid the settings package filters
+ *     (`packages[].skills`). The `pi.skills` manifest is the only registrar
+ *     now; `extension:index` reappearing means the handler (or another raw
+ *     contributor) came back.
  *
  * Lived inline in the probe, so deleting the third condition — the F2 fix
  * itself — left every test green (MP-D).
@@ -492,8 +503,8 @@ export function classifySkillsRegistration(commands, installedPkgDir) {
 	const inPackage = skills.filter((c) =>
 		String(c.sourceInfo?.path ?? "").startsWith(String(installedPkgDir ?? "")),
 	);
-	const byHandler = skills.filter(
-		(c) => c.sourceInfo?.source === EXPECTED_SKILL_REGISTRAR,
+	const viaHandler = skills.filter(
+		(c) => c.sourceInfo?.source === EXTENSION_HANDLER_REGISTRAR,
 	);
 	const registrars = [
 		...new Set(skills.map((c) => String(c.sourceInfo?.source ?? "(none)"))),
@@ -503,11 +514,11 @@ export function classifySkillsRegistration(commands, installedPkgDir) {
 		`${skills.map((c) => c.name).join(", ") || "(none)"}; ` +
 		`${inPackage.length} resolved inside the installed package; ` +
 		`registrar(s): ${registrars.join(", ") || "(none)"} ` +
-		`(${byHandler.length}/${skills.length} via ${EXPECTED_SKILL_REGISTRAR})`;
+		`(${viaHandler.length} via ${EXTENSION_HANDLER_REGISTRAR}, must be 0)`;
 	const ok =
 		skills.length >= MIN_SHIPPED_SKILLS &&
 		inPackage.length === skills.length &&
-		byHandler.length === skills.length;
+		viaHandler.length === 0;
 	return { status: ok ? "pass" : "fail", detail: shows, shows };
 }
 
@@ -1323,7 +1334,10 @@ function driveCodemodeRpc({ piBin, cwd, env, providerPath, capMs }) {
  * @param {any} ctx
  */
 export async function runCodemodeNestedProbe(ctx) {
-	const piVersionText = describePi(ctx.piBin, ctx.env);
+	const { display: piDisplay, versionText: piVersionText } = describePi(
+		ctx.piBin,
+		ctx.env,
+	);
 	const piAiIndex = locatePiAiIndex(ctx.piBin, ctx.env);
 	const plan = planCodemodeRow({ piVersionText, piAiIndex });
 	if (!plan.reachable) {
@@ -1420,7 +1434,7 @@ export async function runCodemodeNestedProbe(ctx) {
 		ext: "json",
 		content: JSON.stringify(
 			{
-				pi: piVersionText,
+				pi: piDisplay,
 				settings: read(settingsPath),
 				runOk: run.ok,
 				runReason: run.reason ?? null,
@@ -1717,7 +1731,6 @@ const REPO_ROOT = path.resolve(
 const DEFAULT_POLL_CAP_MS = 120_000;
 const NPM_TIMEOUT_MS = 600_000;
 const RPC_TIMEOUT_MS = 60_000;
-const MCP_CALL_TIMEOUT_MS = 180_000;
 
 export function parseArgs(argv) {
 	const opts = {
@@ -2013,28 +2026,23 @@ function setUpFixture(projectDir) {
  */
 function captureGetCommands({ piBin, cwd, env, timeoutMs = RPC_TIMEOUT_MS }) {
 	return new Promise((resolve) => {
-		let child;
+		let pi;
 		try {
-			child = spawn(piBin, ["--mode", "rpc", "--no-session"], {
+			pi = startRpcSession(piBin, {
+				args: ["--mode", "rpc", "--no-session"],
 				cwd,
-				stdio: ["pipe", "pipe", "pipe"],
 				env,
 			});
 		} catch (err) {
 			resolve({ ok: false, reason: `spawn failed: ${err?.message || err}` });
 			return;
 		}
-		const extensionErrors = [];
-		const stderr = [];
-		let buf = "";
 		let settled = false;
 		const finish = (value) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			try {
-				child.kill("SIGKILL");
-			} catch {}
+			pi.kill();
 			resolve(value);
 		};
 		const timer = setTimeout(
@@ -2042,166 +2050,35 @@ function captureGetCommands({ piBin, cwd, env, timeoutMs = RPC_TIMEOUT_MS }) {
 				finish({
 					ok: false,
 					reason: `no get_commands response within ${timeoutMs}ms`,
-					extensionErrors,
-					stderr: stderr.join(""),
+					extensionErrors: pi.extensionErrors,
+					stderr: pi.stderrTail.join(""),
 				}),
 			timeoutMs,
 		);
-		child.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
-		child.stdout.on("data", (chunk) => {
-			buf += chunk.toString();
-			let i = buf.indexOf("\n");
-			while (i >= 0) {
-				const line = buf.slice(0, i).replace(/\r$/, "");
-				buf = buf.slice(i + 1);
-				i = buf.indexOf("\n");
-				if (!line.trim()) continue;
-				let message;
-				try {
-					message = JSON.parse(line);
-				} catch {
-					continue;
-				}
-				if (
-					(message.type === "event" && message.event === "extension_error") ||
-					message.type === "extension_error"
-				) {
-					extensionErrors.push(message);
-				}
-				if (message.type === "response" && message.command === "get_commands") {
-					finish({
-						ok: true,
-						commands: message.data?.commands ?? [],
-						extensionErrors,
-						raw: message,
-					});
-				}
+		pi.onMessage((message) => {
+			if (message.type === "response" && message.command === "get_commands") {
+				finish({
+					ok: true,
+					commands: message.data?.commands ?? [],
+					extensionErrors: pi.extensionErrors,
+					raw: message,
+				});
 			}
 		});
-		child.on("error", (err) =>
+		pi.child.on("error", (err) =>
 			finish({ ok: false, reason: `pi error: ${err?.message || err}` }),
 		);
-		child.on("exit", (code) =>
+		pi.onExit((code) =>
 			finish({
 				ok: false,
 				reason: `pi exited early (code ${code})`,
-				extensionErrors,
-				stderr: stderr.join(""),
+				extensionErrors: pi.extensionErrors,
+				stderr: pi.stderrTail.join(""),
 			}),
 		);
 		// Extensions register asynchronously; ask once they have had a moment.
-		setTimeout(() => {
-			try {
-				child.stdin.write(`${JSON.stringify({ type: "get_commands" })}\n`);
-			} catch {}
-		}, 3000);
+		setTimeout(() => pi.send({ type: "get_commands" }), 3000);
 	});
-}
-
-/** A newline-delimited JSON-RPC client for the pi-lens MCP stdio server. */
-class McpSession {
-	constructor(serverJs, cwd, env) {
-		this.child = spawn(process.execPath, [serverJs], {
-			cwd,
-			stdio: ["pipe", "pipe", "pipe"],
-			env,
-		});
-		this.pending = new Map();
-		this.nextId = 1;
-		this.stderr = [];
-		this.buf = "";
-		this.child.stderr.on("data", (chunk) => this.stderr.push(chunk.toString()));
-		this.child.stdout.on("data", (chunk) => {
-			this.buf += chunk.toString();
-			let i = this.buf.indexOf("\n");
-			while (i >= 0) {
-				const line = this.buf.slice(0, i).trim();
-				this.buf = this.buf.slice(i + 1);
-				i = this.buf.indexOf("\n");
-				if (!line) continue;
-				let message;
-				try {
-					message = JSON.parse(line);
-				} catch {
-					continue;
-				}
-				const waiter = this.pending.get(message.id);
-				if (waiter) {
-					this.pending.delete(message.id);
-					waiter.resolve(message);
-				}
-			}
-		});
-		this.exited = new Promise((resolve) => {
-			this.child.on("exit", (code) => {
-				for (const [, waiter] of this.pending) {
-					waiter.resolve({ error: { message: `server exited (${code})` } });
-				}
-				this.pending.clear();
-				resolve(code);
-			});
-		});
-	}
-
-	request(method, params, timeoutMs = MCP_CALL_TIMEOUT_MS) {
-		const id = this.nextId++;
-		return new Promise((resolve) => {
-			const timer = setTimeout(() => {
-				this.pending.delete(id);
-				resolve({ error: { message: `timeout after ${timeoutMs}ms` } });
-			}, timeoutMs);
-			this.pending.set(id, {
-				resolve: (message) => {
-					clearTimeout(timer);
-					resolve(message);
-				},
-			});
-			try {
-				this.child.stdin.write(
-					`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
-				);
-			} catch (err) {
-				clearTimeout(timer);
-				this.pending.delete(id);
-				resolve({ error: { message: `write failed: ${err?.message || err}` } });
-			}
-		});
-	}
-
-	notify(method, params) {
-		try {
-			this.child.stdin.write(
-				`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`,
-			);
-		} catch {}
-	}
-
-	/** The first text block of a tools/call result, or an error marker. */
-	async callToolText(name, args, timeoutMs) {
-		const response = await this.request(
-			"tools/call",
-			{ name, arguments: args },
-			timeoutMs,
-		);
-		if (response.error) {
-			return { ok: false, text: `JSON-RPC error: ${response.error.message}` };
-		}
-		const text = response.result?.content?.[0]?.text ?? "";
-		return { ok: response.result?.isError !== true, text: String(text) };
-	}
-
-	async close() {
-		try {
-			this.child.kill("SIGTERM");
-		} catch {}
-		await Promise.race([
-			this.exited,
-			new Promise((resolve) => setTimeout(resolve, 5000)),
-		]);
-		try {
-			this.child.kill("SIGKILL");
-		} catch {}
-	}
 }
 
 /**
@@ -2291,7 +2168,7 @@ function rowHomeEnv(ctx, name, extra = {}) {
  * unreachable server reads FAIL.
  */
 async function openScopedMcpSession(serverJs, cwd, env) {
-	const session = new McpSession(serverJs, cwd, env);
+	const session = new McpStdioClient(serverJs, cwd, env);
 	const init = await session.request(
 		"initialize",
 		{
@@ -3128,7 +3005,7 @@ async function main() {
 			"QA target": exportedCommit
 				? `${installSource} (packed from exported ${exportedCommit})`
 				: installSource,
-			pi: describePi(opts.pi, env),
+			pi: describePi(opts.pi, env).display,
 			baseline: path.relative(REPO_ROOT, opts.baseline).replaceAll("\\", "/"),
 			"scratch root": scratchRoot,
 			"polling cap": `${opts.pollCapMs}ms`,
@@ -3170,14 +3047,25 @@ function listInstalledFiles(root) {
 	return out;
 }
 
+/**
+ * `display` is the human-readable line (binary path first); `versionText` is
+ * only what `piBin --version` printed, empty when it could not be read. Version
+ * checks use `versionText`, never `display`, whose path can embed an x.y.z.
+ *
+ * @returns {{ display: string, versionText: string }}
+ */
 function describePi(piBin, env) {
 	try {
-		return `${piBin} ${execFileSync(piBin, ["--version"], {
+		const versionText = execFileSync(piBin, ["--version"], {
 			encoding: "utf8",
 			env,
-		}).trim()}`;
+		}).trim();
+		return { display: `${piBin} ${versionText}`, versionText };
 	} catch (err) {
-		return `${piBin} (version unreadable: ${err?.message || err})`;
+		return {
+			display: `${piBin} (version unreadable: ${err?.message || err})`,
+			versionText: "",
+		};
 	}
 }
 

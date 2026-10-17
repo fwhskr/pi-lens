@@ -21,12 +21,15 @@ const diagsResult = (
 	diags: unknown[],
 	extra: {
 		inconclusive?: boolean;
+		inconclusiveServerIds?: string[];
+		inconclusiveReason?: "notify-write" | "diagnostics-wait" | "mixed";
 		// #1470: the narrowed confirmation an aux cut off by the grace timer
 		// produces — the touch is NOT inconclusive, but it no longer speaks for
 		// the named servers.
 		confirmation?: "confirmed" | "partial";
 		unconfirmedServerIds?: string[];
 		deferredServerIds?: string[];
+		binding?: { boundToCurrentDisk: boolean | "unknown" };
 	} = {},
 ) => ({ diags, ...extra });
 const readFileContent = vi.fn(() => "const x = 1;\n");
@@ -44,7 +47,7 @@ vi.mock("../../../../clients/dispatch/runners/utils/lazy-installer.js", () => ({
 	tryLazyInstall,
 }));
 
-vi.mock("../../../../clients/lsp/index.js", () => ({
+vi.mock("../../../../clients/lsp/capabilities.js", () => ({
 	getLSPService: () =>
 		makeLspServiceDouble({
 			supportsLSP,
@@ -513,6 +516,112 @@ describe("runner status/semantic edge cases", () => {
 			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
 			expect(result.status).toBe("skipped");
 			expect(result.diagnostics).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("preserves answered auxiliary findings beside an inconclusive primary (#4219)", async () => {
+		// #4219: marksman can miss the diagnostics deadline while typos has already
+		// published real findings for the same bytes. The inconclusive verdict must
+		// not erase those answered diagnostics before the dispatcher can deliver them.
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-4219-");
+		try {
+			const filePath = path.join(env.tmpDir, "README.md");
+			fs.writeFileSync(filePath, "A known mispeling and a seperat typo.\n");
+
+			supportsLSP.mockReturnValue(true);
+			touchFile.mockResolvedValue(
+				diagsResult(
+					[
+						{
+							severity: 2,
+							message: "mispeling → misspelling",
+							source: "typos",
+							range: {
+								start: { line: 0, character: 7 },
+								end: { line: 0, character: 16 },
+							},
+						},
+						{
+							severity: 2,
+							message: "seperat → separate",
+							source: "typos",
+							range: {
+								start: { line: 0, character: 25 },
+								end: { line: 0, character: 32 },
+							},
+						},
+					],
+					{
+						inconclusive: true,
+						inconclusiveServerIds: ["marksman"],
+						inconclusiveReason: "diagnostics-wait",
+					},
+				),
+			);
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.diagnostics).toHaveLength(2);
+			expect(result.diagnostics.map((d) => d.tool)).toEqual(["typos", "typos"]);
+			expect(result.status).toBe("succeeded");
+			expect(result.unconfirmedServerIds).toEqual(["marksman"]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("drops stale primary findings beside fresh answered findings (#4231)", async () => {
+		// #4231: a timed-out primary can retain its previous diagnostics. The
+		// runner must not turn that stale last-known error into a blocking result
+		// merely because an auxiliary answered for the new file content.
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-4231-");
+		try {
+			const filePath = path.join(env.tmpDir, "README.md");
+			fs.writeFileSync(filePath, "A fresh typo.\n");
+
+			supportsLSP.mockReturnValue(true);
+			touchFile.mockResolvedValue(
+				diagsResult(
+					[
+						{
+							severity: 1,
+							message: "stale primary error",
+							serverId: "marksman",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 1 },
+							},
+						},
+						{
+							severity: 2,
+							message: "fresh auxiliary finding",
+							serverId: "typos",
+							source: "typos",
+							range: {
+								start: { line: 0, character: 2 },
+								end: { line: 0, character: 7 },
+							},
+						},
+					],
+					{
+						inconclusive: true,
+						inconclusiveServerIds: ["marksman"],
+						inconclusiveReason: "diagnostics-wait",
+						binding: { boundToCurrentDisk: false },
+					},
+				),
+			);
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.diagnostics).toHaveLength(1);
+			expect(result.diagnostics[0]?.tool).toBe("typos");
+			expect(result.status).toBe("succeeded");
+			expect(result.unconfirmedServerIds).toEqual(["marksman"]);
 		} finally {
 			env.cleanup();
 		}
@@ -1242,6 +1351,218 @@ describe("runner status/semantic edge cases", () => {
 			expect(
 				result.diagnostics.every((d) => d.fixSuggestion?.includes("Fix it")),
 			).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+/**
+ * #4481 — which blockers the per-edit pass scopes to the lines a write
+ * changed. Only line-local rule runners (ast-grep, tree-sitter) are scoped: a
+ * structural rule matches the lines it flags, so on a file's first write (no
+ * delta baseline yet) its blocker on an unchanged line is pre-existing.
+ * Language servers and linters stay unscoped by design: an edit causes a type
+ * error at the callers of a changed signature, or an unused-declaration lint
+ * at a line it never touched (maintainer decision, 2026-10-15). Each case
+ * drives the real dispatcher and runner, blocking-only with the ranges a host
+ * `edit` produces; only the LSP service and the linter process are doubles.
+ */
+describe("per-edit blocker scope (#4481)", () => {
+	/** The write changed line 2 only; every finding on line 1 is outside it. */
+	const CHANGED = [{ start: 2, end: 2 }];
+
+	beforeEach(() => {
+		safeSpawnAsync.mockReset();
+		touchFile.mockReset();
+		codeAction.mockReset();
+		codeAction.mockResolvedValue([]);
+		readFileContent.mockReset();
+		readFileContent.mockReturnValue("const a: string = 1;\nconst b = 2;\n");
+		supportsLSP.mockReturnValue(true);
+		warmAttach.diagnostics.mockReset();
+		warmAttach.diagnostics.mockResolvedValue(undefined);
+	});
+
+	function lspDiag(
+		line: number,
+		source?: string,
+		severity = 1,
+		endLine = line,
+	) {
+		return {
+			severity,
+			message: source ? `${source} finding` : "Type error",
+			range: {
+				start: { line: line - 1, character: 0 },
+				end: { line: endLine - 1, character: 1 },
+			},
+			code: source ? "no-unknown-returns" : "2322",
+			...(source && { source }),
+		};
+	}
+
+	async function dispatchLsp(diags: unknown[], blockingOnly = true) {
+		const { createDispatchContext, dispatchForFile, RunnerRegistry } =
+			await import("../../../../clients/dispatch/dispatcher.js");
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-edit-scope-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const a: string = 1;\nconst b = 2;\n");
+			touchFile.mockResolvedValue(diagsResult(diags));
+			const registry = new RunnerRegistry();
+			registry.register(runner);
+			return await dispatchForFile(
+				createDispatchContext(
+					filePath,
+					env.tmpDir,
+					{ getFlag: (flag: string) => flag === "lens-lsp" },
+					new FactStore(),
+					blockingOnly,
+					CHANGED,
+				),
+				[{ mode: "all", runnerIds: ["lsp"] }],
+				registry,
+			);
+		} finally {
+			env.cleanup();
+		}
+	}
+
+	// Recurrence: #4481 through the ast-grep LSP lane — the same rule catalog
+	// as ast-grep-napi, delivered by `ast-grep lsp` when its binary is present.
+	it("drops an ast-grep LSP blocker on an unchanged line", async () => {
+		const result = await dispatchLsp([lspDiag(1, "ast-grep")]);
+
+		expect(result.blockers.filter((d) => d.tool === "ast-grep")).toEqual([]);
+		// #4484 round 2: withheld from delivery, still observed. Recurrence: the
+		// lane dropped it, so the record lost a blocker an edit elsewhere left.
+		expect(result.stillObserved).toEqual([
+			expect.objectContaining({ tool: "ast-grep", line: 1, runnerId: "lsp" }),
+		]);
+	});
+
+	// Recurrence: #4482 review r1 F1 — the real ast-grep LSP reports
+	// `array-callback-return` from line 1 to line 3; an edit inside it (line 2)
+	// caused it, and a start-line gate dropped it.
+	it("keeps an ast-grep LSP blocker whose span contains the edit", async () => {
+		const result = await dispatchLsp([lspDiag(1, "ast-grep", 1, 3)]);
+
+		expect(result.blockers).toEqual([
+			expect.objectContaining({ tool: "ast-grep", line: 1 }),
+		]);
+	});
+
+	// Recurrence: a span gate that read the wrong end (or widened every span)
+	// would bring back the #4481 STOP on an untouched multi-line match.
+	it("drops a multi-line ast-grep LSP blocker wholly outside the edit", async () => {
+		const result = await dispatchLsp([lspDiag(3, "ast-grep", 1, 4)]);
+
+		expect(result.blockers.filter((d) => d.tool === "ast-grep")).toEqual([]);
+	});
+
+	// Recurrence: an ast-grep LSP gate that drops in-range findings too would
+	// hide a blocker the write itself introduced.
+	it("keeps an ast-grep LSP blocker on a changed line", async () => {
+		const result = await dispatchLsp([lspDiag(2, "ast-grep")]);
+
+		expect(result.blockers).toEqual([
+			expect.objectContaining({ tool: "ast-grep", line: 2 }),
+		]);
+	});
+
+	// Recurrence: a gate that dropped every out-of-range ast-grep finding would
+	// erase its warning tier from lens_diagnostics, not only its STOP.
+	it("keeps an ast-grep LSP warning on an unchanged line", async () => {
+		const result = await dispatchLsp([lspDiag(1, "ast-grep", 2)]);
+
+		expect(result.warnings).toEqual([
+			expect.objectContaining({ tool: "ast-grep", line: 1 }),
+		]);
+	});
+
+	// Recurrence: a gate keyed off the ranges alone would drop blockers from a
+	// full (non-blocking) pass that carries the write's ranges.
+	it("keeps an unchanged-line ast-grep LSP blocker outside the blocking-only pass", async () => {
+		const result = await dispatchLsp([lspDiag(1, "ast-grep")], false);
+
+		expect(result.blockers).toEqual([
+			expect.objectContaining({ tool: "ast-grep", line: 1 }),
+		]);
+	});
+
+	// Recurrence: a range gate added to a semantic runner would hide errors the
+	// edit caused, such as a type error at the caller of a changed signature.
+	it("keeps a language-server blocker on an unchanged line", async () => {
+		const result = await dispatchLsp([lspDiag(1)]);
+
+		expect(result.blockers).toEqual([
+			expect.objectContaining({ tool: "lsp", line: 1, semantic: "blocking" }),
+		]);
+	});
+
+	// Recurrence: a range gate added to a linter would hide a finding the edit
+	// caused at a line it never touched (an unused declaration after its last
+	// use is deleted, no-undef after a declaration is removed).
+	it("keeps a linter blocker on an unchanged line", async () => {
+		const { createDispatchContext, dispatchForFile, RunnerRegistry } =
+			await import("../../../../clients/dispatch/dispatcher.js");
+		const runner = (
+			await import("../../../../clients/dispatch/runners/rubocop.js")
+		).default;
+		const env = setupTestEnvironment("pi-lens-rb-edit-scope-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.rb");
+			fs.writeFileSync(filePath, "value = 1\nputs 'hi'\n");
+			safeSpawnAsync
+				.mockResolvedValueOnce({
+					error: null,
+					status: 0,
+					stdout: "rubocop",
+					stderr: "",
+				})
+				.mockResolvedValueOnce({
+					error: null,
+					status: 1,
+					stdout: JSON.stringify({
+						files: [
+							{
+								path: filePath,
+								offenses: [
+									{
+										severity: "error",
+										message: "Useless assignment to variable - `value`.",
+										cop_name: "Lint/UselessAssignment",
+										correctable: false,
+										location: { line: 1, column: 1 },
+									},
+								],
+							},
+						],
+					}),
+					stderr: "",
+				});
+			const registry = new RunnerRegistry();
+			registry.register(runner);
+
+			const result = await dispatchForFile(
+				createDispatchContext(
+					filePath,
+					env.tmpDir,
+					{ getFlag: () => false },
+					new FactStore(),
+					true,
+					CHANGED,
+				),
+				[{ mode: "all", runnerIds: ["rubocop"] }],
+				registry,
+			);
+
+			expect(result.blockers).toEqual([
+				expect.objectContaining({ tool: "rubocop", line: 1 }),
+			]);
 		} finally {
 			env.cleanup();
 		}

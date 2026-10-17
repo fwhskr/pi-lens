@@ -38,7 +38,10 @@ type MockRenameClient = {
 	isDocumentOpen: ReturnType<typeof vi.fn>;
 	getDocumentUri: ReturnType<typeof vi.fn>;
 	closeDocument: ReturnType<typeof vi.fn>;
-	notify: { open: ReturnType<typeof vi.fn> };
+	notify: {
+		open: ReturnType<typeof vi.fn>;
+		watchedFileChange: ReturnType<typeof vi.fn>;
+	};
 	willRenameFiles: ReturnType<typeof vi.fn>;
 	getOperationSupport: ReturnType<typeof vi.fn>;
 	didRenameFiles: ReturnType<typeof vi.fn>;
@@ -51,7 +54,7 @@ function makeClient(root: string): MockRenameClient {
 		isDocumentOpen: vi.fn(() => false),
 		getDocumentUri: vi.fn(() => undefined),
 		closeDocument: vi.fn(async () => undefined),
-		notify: { open: vi.fn(async () => undefined) },
+		notify: { open: vi.fn(async () => undefined), watchedFileChange: vi.fn() },
 		willRenameFiles: vi.fn(async () => null),
 		getOperationSupport: vi.fn(() => ({
 			willRenameFiles: true,
@@ -59,6 +62,22 @@ function makeClient(root: string): MockRenameClient {
 		})),
 		didRenameFiles: vi.fn(async () => undefined),
 	};
+}
+
+/** Returns as soon as `promise` settles, or after `ms` if it never does. */
+async function settleWithin(
+	promise: Promise<unknown>,
+	ms: number,
+): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<void>((resolve) => {
+		timer = setTimeout(resolve, ms);
+	});
+	try {
+		await Promise.race([promise, deadline]);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 function addClient(
@@ -116,7 +135,7 @@ describe("LSPService.renameFile with a wedged notify (#1621)", () => {
 
 			// Well inside vitest's default per-test timeout, but comfortably
 			// beyond even TWO sequential 80ms notify budgets (close, then resync).
-			await new Promise((resolve) => setTimeout(resolve, 1000));
+			await settleWithin(renamePromise, 1000);
 			expect(settled, "renameFile must settle within its notify budget").toBe(
 				true,
 			);
@@ -162,7 +181,7 @@ describe("LSPService.renameFile with a wedged notify (#1621)", () => {
 					return result;
 				});
 
-			await new Promise((resolve) => setTimeout(resolve, 1000));
+			await settleWithin(renamePromise, 1000);
 			expect(settled, "renameFile must settle within its notify budget").toBe(
 				true,
 			);

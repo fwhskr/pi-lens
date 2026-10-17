@@ -7,6 +7,10 @@ import { writeFileAtomic } from "./atomic-write.js";
 import { BoundedFifoMap } from "./bounded-cache.js";
 import { getProjectDataDir } from "./file-utils.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
+import {
+	readGzipStageWorkerResult,
+	reapStageFile,
+} from "./gzip-stage-write.js";
 import { withGenerationLockSync } from "./generation-lock.js";
 import { isStaleStageFile } from "./instance-reaper.js";
 import { readJsonCache } from "./json-cache-read.js";
@@ -26,7 +30,13 @@ import type { RuleScanResult } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import type { StartupScanContext } from "./startup-scan.js";
 import {
+	notePersistWorkerMessageFault,
+	readWorkerHeapStatistics,
+	type PersistWorkerHeapStatistics,
+} from "./persist-worker-stats.js";
+import {
 	deserializeWordIndex,
+	recordPersistedWordIndexWireBytes,
 	serializeWordIndex,
 	type SerializedWordIndex,
 } from "./word-index.js";
@@ -1008,6 +1018,8 @@ interface PendingSnapshotBody {
 	dedupeFingerprints: string[];
 	/** Main-thread serialize time of the worker dispatch (#3789); the worker's own is 0. */
 	serializeMs?: number;
+	/** UTF-8 length of the word index's JSON, taken while encoding the body. */
+	wordIndexWireBytes?: number | undefined;
 }
 
 interface SnapshotPersistRecord {
@@ -1049,6 +1061,33 @@ let _snapshotPromotionSeamForTests: (() => Promise<void>) | undefined;
 let _lastSnapshotPersistErrorForTests: string | undefined;
 let _snapshotExiting = false;
 let _snapshotWorkerBodyWritesForTests = 0;
+
+let _snapshotPersistWorkerHeapStatistics: PersistWorkerHeapStatistics | null =
+	null;
+
+/**
+ * Refreshes a bounded, last-known view; Worker#getHeapStatistics is async.
+ * The sampler does not await the result (the reading lags one sample); tests
+ * await it instead of polling ticks.
+ */
+export function refreshProjectSnapshotPersistWorkerHeapStatistics(): Promise<void> {
+	const worker = _snapshotPersistWorker;
+	if (!worker || typeof worker.getHeapStatistics !== "function") {
+		return Promise.resolve();
+	}
+	return readWorkerHeapStatistics(worker)
+		.then((stats) => {
+			// An answer that lands after the worker's exit or death clear belongs
+			// to a dead isolate; every clear also drops the worker reference.
+			if (_snapshotPersistWorker === worker)
+				_snapshotPersistWorkerHeapStatistics = stats;
+		})
+		.catch(() => {});
+}
+
+export function getProjectSnapshotPersistWorkerHeapStatistics(): PersistWorkerHeapStatistics | null {
+	return _snapshotPersistWorkerHeapStatistics;
+}
 
 function snapshotWorkerEnabled(): boolean {
 	// The synchronous fallback writer is a legitimate degraded mode (hosts that
@@ -1552,12 +1591,63 @@ function promoteSnapshotBody(
 function serializeSnapshotBody(snapshot: ProjectSnapshot): {
 	bytes: Uint8Array<ArrayBuffer>;
 	serializeMs: number;
+	wordIndexWireBytes?: number | undefined;
 } {
 	const started = performance.now();
-	const bytes = new TextEncoder().encode(
-		JSON.stringify(storedSnapshot(snapshot)),
+	const stored = storedSnapshot(snapshot) as { wordIndex?: unknown };
+	const spliced =
+		stored.wordIndex === undefined ? undefined : spliceWordIndexBody(stored);
+	const bytes =
+		spliced?.bytes ?? new TextEncoder().encode(JSON.stringify(stored));
+	return {
+		bytes,
+		serializeMs: performance.now() - started,
+		wordIndexWireBytes: spliced?.wordIndexWireBytes,
+	};
+}
+
+/** Stands in for the word index while the rest of the body is stringified. */
+const WORD_INDEX_PLACEHOLDER = `\u0000pi-lens-word-index-${process.pid}-${Date.now()}\u0000`;
+const WORD_INDEX_KEY_JSON = '"wordIndex":';
+const WORD_INDEX_PLACEHOLDER_JSON = `${WORD_INDEX_KEY_JSON}${JSON.stringify(
+	WORD_INDEX_PLACEHOLDER,
+)}`;
+
+/**
+ * Encode the stored body with the word index stringified on its own, so its
+ * UTF-8 length is known without reading the body in JavaScript (#4129). The
+ * index is stringified once, the rest of the body once with a placeholder in
+ * its slot; native `indexOf` finds the placeholder and `encodeInto` writes the
+ * three pieces into one buffer, byte-identical to encoding
+ * `JSON.stringify(stored)`. Returns undefined when the placeholder is absent
+ * (a `toJSON` that rewrites the body), and the caller encodes the plain
+ * stringify. The placeholder carries a NUL, the pid and the module load time,
+ * and its quoted `"wordIndex":` form cannot occur inside a JSON string (quotes
+ * are escaped there), so the first match is the top-level slot.
+ */
+function spliceWordIndexBody(stored: {
+	wordIndex?: unknown;
+}): { bytes: Uint8Array<ArrayBuffer>; wordIndexWireBytes: number } | undefined {
+	const marker = WORD_INDEX_PLACEHOLDER_JSON;
+	const head = JSON.stringify({ ...stored, wordIndex: WORD_INDEX_PLACEHOLDER });
+	const at = head.indexOf(marker);
+	if (at < 0) return undefined;
+	const prefix = head.slice(0, at + WORD_INDEX_KEY_JSON.length);
+	const suffix = head.slice(at + marker.length);
+	const wordIndex = JSON.stringify(stored.wordIndex);
+	const prefixBytes = Buffer.byteLength(prefix);
+	const wordIndexWireBytes = Buffer.byteLength(wordIndex);
+	const bytes = new Uint8Array(
+		prefixBytes + wordIndexWireBytes + Buffer.byteLength(suffix),
 	);
-	return { bytes, serializeMs: performance.now() - started };
+	const encoder = new TextEncoder();
+	encoder.encodeInto(prefix, bytes.subarray(0, prefixBytes));
+	encoder.encodeInto(
+		wordIndex,
+		bytes.subarray(prefixBytes, prefixBytes + wordIndexWireBytes),
+	);
+	encoder.encodeInto(suffix, bytes.subarray(prefixBytes + wordIndexWireBytes));
+	return { bytes, wordIndexWireBytes };
 }
 
 function writeSnapshotBodyOnMainThread(
@@ -1588,7 +1678,10 @@ function writeSnapshotBodyOnMainThread(
 		});
 	}
 	try {
-		const { bytes, serializeMs } = serializeSnapshotBody(pending.snapshot);
+		const { bytes, serializeMs, wordIndexWireBytes } = serializeSnapshotBody(
+			pending.snapshot,
+		);
+		pending.wordIndexWireBytes = wordIndexWireBytes;
 		const rawBytes = bytes.byteLength;
 		const fingerprint = fingerprintProjectSnapshotJson(
 			bytes,
@@ -1640,6 +1733,10 @@ function writeSnapshotBodyOnMainThread(
 			},
 		);
 		if (!promoted) return;
+		recordPersistedWordIndexWireBytes(
+			pending.snapshot.wordIndex,
+			pending.wordIndexWireBytes,
+		);
 		reconcileAuthoritativeAfterWrite(pending, rawBytes);
 		logSnapshotPersistSuccess(pending, fingerprint, {
 			rawBytes,
@@ -1678,15 +1775,37 @@ function dispatchMainThreadWriteThroughSeam(
 	writeSnapshotBodyOnMainThread(pending, reason);
 }
 
+/**
+ * Remove a stage file from inside the worker `message` listener without ever
+ * throwing out of it (#4400): the caller's next step (the main-thread fallback,
+ * or completing the key) must still run. A failure is one ledger count per
+ * subject, not one record per message.
+ */
+function reapSnapshotStage(stagePath: string, subject: string): void {
+	const failure = reapStageFile(stagePath);
+	if (failure === undefined) return;
+	incrementDegradationCount({
+		kind: "project-snapshot-stage-reap-failed",
+		subject,
+		reason: `snapshot stage reap failed: ${failure.message}`,
+	});
+}
+
 function handleSnapshotWorkerResult(
 	result: ProjectSnapshotPersistWorkerResult,
 ): void {
 	const pending = _snapshotWorkerRequests.get(result.id);
 	if (!pending) {
-		fs.rmSync(result.stagePath, { force: true });
+		// Late result for a request the host no longer tracks: the echoed path is
+		// the only name left, and it is wire data (#4400).
+		if (typeof result.stagePath === "string") {
+			reapSnapshotStage(result.stagePath, result.stagePath);
+		}
 		return;
 	}
 	_snapshotWorkerRequests.delete(result.id);
+	// #4400: the host sent `pending.stagePath`, so every cleanup and promotion
+	// below uses its own record, never the worker's echo of it.
 	if (
 		result.error ||
 		result.rawBytes === undefined ||
@@ -1695,7 +1814,7 @@ function handleSnapshotWorkerResult(
 		result.writeMs === undefined ||
 		result.semanticFingerprint === undefined
 	) {
-		fs.rmSync(result.stagePath, { force: true });
+		reapSnapshotStage(pending.stagePath, pending.gzPath);
 		dispatchMainThreadWriteThroughSeam(
 			pending,
 			result.error ?? "invalid worker result",
@@ -1711,7 +1830,7 @@ function handleSnapshotWorkerResult(
 	) {
 		// The stale stage is part of the promotion transaction: remove it before
 		// returning so a superseded save cannot leave an orphan behind.
-		fs.rmSync(result.stagePath, { force: true });
+		reapSnapshotStage(pending.stagePath, pending.gzPath);
 		completeSnapshotPersist(pending);
 		return;
 	}
@@ -1761,7 +1880,7 @@ function handleSnapshotWorkerResult(
 	try {
 		const promoted = promoteSnapshotBody(
 			pending,
-			{ stagePath: result.stagePath },
+			{ stagePath: pending.stagePath },
 			{
 				fingerprint: result.semanticFingerprint,
 				generatedAt: pending.snapshot.generatedAt,
@@ -1772,6 +1891,10 @@ function handleSnapshotWorkerResult(
 			completeSnapshotPersist(pending);
 			return;
 		}
+		recordPersistedWordIndexWireBytes(
+			pending.snapshot.wordIndex,
+			pending.wordIndexWireBytes,
+		);
 		reconcileAuthoritativeAfterWrite(pending, result.rawBytes);
 		logSnapshotPersistSuccess(pending, result.semanticFingerprint, {
 			rawBytes: result.rawBytes,
@@ -1782,7 +1905,7 @@ function handleSnapshotWorkerResult(
 		});
 		completeSnapshotPersist(pending);
 	} catch (err) {
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rm(pending.stagePath, { force: true }, () => {});
 		dispatchMainThreadWriteThroughSeam(
 			pending,
 			err instanceof Error ? err.message : String(err),
@@ -1826,6 +1949,7 @@ function dispatchSnapshotPersist(pending: PendingSnapshotBody): void {
 		return;
 	}
 	pending.serializeMs = serialized.serializeMs;
+	pending.wordIndexWireBytes = serialized.wordIndexWireBytes;
 	const id = ++_snapshotWorkerRequestId;
 	_snapshotWorkerRequests.set(id, pending);
 	const request: ProjectSnapshotPersistWorkerRequest = {
@@ -1854,6 +1978,7 @@ function dispatchSnapshotPersist(pending: PendingSnapshotBody): void {
 
 function handleSnapshotWorkerDeath(reason: string): void {
 	_snapshotPersistWorker = undefined;
+	_snapshotPersistWorkerHeapStatistics = null;
 	_snapshotWorkerDisabled = true;
 	const requests = [..._snapshotWorkerRequests.values()];
 	_snapshotWorkerRequests.clear();
@@ -1902,18 +2027,35 @@ function getSnapshotPersistWorker(): Worker | undefined {
 		// binds the sync handler directly, so scheduling is byte-identical when
 		// no test seam is installed (the async-handler variant of this shifted
 		// promotion timing under full-suite load and flaked the round-trip test).
-		worker.on("message", (result: ProjectSnapshotPersistWorkerResult) => {
-			if (_snapshotPromotionSeamForTests) {
-				void _snapshotPromotionSeamForTests().then(() =>
-					handleSnapshotWorkerResult(result),
-				);
-				return;
+		// #4402: the message is wire data (#4400). It passes the shape check or is
+		// dropped and counted, and a throw below is counted here instead of
+		// leaving the listener, which would end the host.
+		worker.on("message", (message: unknown) => {
+			try {
+				const result = readGzipStageWorkerResult(message);
+				if (typeof result === "string") {
+					notePersistWorkerMessageFault("project-snapshot", "rejected", result);
+					return;
+				}
+				if (_snapshotPromotionSeamForTests) {
+					void _snapshotPromotionSeamForTests()
+						.then(() => handleSnapshotWorkerResult(result))
+						.catch((err: unknown) =>
+							notePersistWorkerMessageFault("project-snapshot", "threw", err),
+						);
+					return;
+				}
+				handleSnapshotWorkerResult(result);
+			} catch (err) {
+				notePersistWorkerMessageFault("project-snapshot", "threw", err);
 			}
-			handleSnapshotWorkerResult(result);
 		});
 		worker.on("error", (err: Error) => handleSnapshotWorkerDeath(err.message));
 		worker.on("exit", (code) => {
-			if (_snapshotPersistWorker === worker) _snapshotPersistWorker = undefined;
+			if (_snapshotPersistWorker === worker) {
+				_snapshotPersistWorker = undefined;
+				_snapshotPersistWorkerHeapStatistics = null;
+			}
 			// Any body still queued when the worker exits was abandoned mid-flight
 			// (a crash, a `terminate()`, or host recycling) — it will never be
 			// promoted by this worker, so fall it back to the sync writer rather
@@ -2167,6 +2309,7 @@ export function resetProjectSnapshotPersistWorkerForTests(): void {
 	_snapshotGenerationGateEnabledForTests = true;
 	_snapshotPromotionSeamForTests = undefined;
 	_snapshotPersistWorker = undefined;
+	_snapshotPersistWorkerHeapStatistics = null;
 	_snapshotWorkerRequests.clear();
 	_snapshotGenerationStates.clear();
 	_successfulSnapshotPersists.clear();

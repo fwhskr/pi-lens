@@ -86,8 +86,10 @@ vi.mock("../../clients/review-graph/service.js", async (importOriginal) => ({
 	formatImpactCascade: mocks.formatImpactCascade,
 }));
 
-vi.mock("../../clients/lsp/index.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../clients/lsp/index.js")>()),
+vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/lsp/capabilities.js")
+	>()),
 	getLSPService: mocks.getLSPService,
 }));
 
@@ -216,12 +218,16 @@ async function mark(params: Record<string, unknown>, root = env.tmpDir) {
 	return result;
 }
 
-/** `getAllDiagnostics` entries, keyed the way the producer keys them. */
+/**
+ * `getAllDiagnostics` entries, keyed the way the producer keys them. Stamped
+ * after the cascade starts: since #4486 a snapshot that predates the edit
+ * is not served, and these tests are about the policy, not the freshness.
+ */
 function diagMap(entries: Array<[string, LSPDiagnostic[]]>) {
 	return new Map(
 		entries.map(([file, diags]) => [
 			normalizeMapKey(file),
-			{ diags, ts: Date.now() },
+			{ diags, ts: Date.now() + 1000 },
 		]),
 	);
 }
@@ -661,8 +667,8 @@ describe("in-lane cascade neighbour diagnostics take the finding policy (#3157)"
 	it("tells the AGENT when the input bound left findings unevaluated (all 80 marked)", async () => {
 		// Round 3 N1: the round-2 input bound reproduced F1 one threshold up. With
 		// 100 ERRORs and the first 80 marked, the bound cuts at 80, the policy drops
-		// all 80, `kept` is empty, and `formatCascadeResult`'s `if
-		// (!diagnosticsBlock) return ""` fires BEFORE any sentence — so 20 genuine
+		// all 80, `kept` is empty, and `formatCascadeResult`'s (now
+		// `composeCascadeSection`'s) `if (!diagnosticsBlock) return ""` fires BEFORE any sentence — so 20 genuine
 		// unevaluated ERRORs reached the agent as silence. `inputTruncated` on the
 		// latency row is an OPERATOR surface; the misled actor is the agent.
 		fs.writeFileSync(

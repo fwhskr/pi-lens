@@ -22,8 +22,9 @@ import {
 } from "../../deps/ast-grep-napi.js";
 import { buildEffectiveAstGrepCatalog } from "../ast-grep-catalog.js";
 import { isRuleIgnoredForPath } from "../rule-ignores.js";
+import { ruleIgnoredForPath, type RulePolicyMap } from "../rule-policy.js";
 import { logLatency } from "../../latency-logger.js";
-import { hasAuxiliaryLspPublishedForRoot } from "../../lsp/index.js";
+import { hasAuxiliaryLspPublishedForRoot } from "../../lsp/capabilities.js";
 import {
 	clearPendingAuxiliaryCoverage,
 	hasPendingAuxiliaryCoverage,
@@ -40,7 +41,8 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { findingsResult } from "../types.js";
+import { findingsResult, spanOverlapsModifiedRanges } from "../types.js";
+import { ruleCanMatchText } from "./ast-grep-literal-anchors.js";
 import {
 	calculateRuleComplexity,
 	isOverlyBroadPattern,
@@ -535,6 +537,23 @@ export interface AstGrepEvaluateOptions {
 	maxTotalDiagnostics?: number;
 	/** Workspace root that owns project-local rules; defaults to `cwd`. */
 	projectRoot?: string;
+	/** Shared config rule policy for scan-time path admission. */
+	rulePolicy?: RulePolicyMap;
+	/**
+	 * The lines the write changed, set only on the per-edit blocking pass
+	 * (#4481). An `error`-severity match whose line span does not overlap them
+	 * is skipped before it counts toward a cap, as the tree-sitter runner does.
+	 * A relational match anchored on a sibling node can still be skipped when
+	 * the edit touched only the sibling; that is a named residual. Absent or
+	 * empty means the whole file.
+	 */
+	modifiedRanges?: DispatchContext["modifiedRanges"];
+	/**
+	 * #4484 r2: sink for the matches the `modifiedRanges` gate withheld. The
+	 * gate decides delivery only; a withheld match is still observed and keeps
+	 * a recorded blocker pending. Capped per rule like the delivered matches.
+	 */
+	outOfEditScope?: Diagnostic[];
 	/**
 	 * Optional sink for a rule that napi's native engine rejected outright
 	 * (malformed shape, unresolved `matches: <name>` reference, invalid kind,
@@ -551,7 +570,8 @@ export interface AstGrepEvaluateOptions {
 	 * parsed as JavaScript and `language: JavaScript` rules run against those
 	 * bodies, mirroring the ast-grep CLI/LSP (ast-grep 0.45.1 injects every
 	 * script body regardless of `type`/`src`; verified by direct CLI repro).
-	 * Absent on a non-HTML file this is unused and irrelevant.
+	 * The literal prefilter (#4496) reads it on every file, so it must be the
+	 * exact text `rootNode` was parsed from.
 	 */
 	content?: string;
 	/** Loaded addon, required with `content` to parse script bodies (#2347). */
@@ -1070,6 +1090,8 @@ export function evaluateAstGrepRules(
 			// same object instance the catalog recorded, since both read the
 			// identical `rules` arrays off `catalog.sources`.
 			if (catalog.effectiveRules.get(rule.id)?.rule !== rule) continue;
+			if (ruleIgnoredForPath(rule.id, filePath, ignoreRoot, options.rulePolicy))
+				continue;
 			if (blockingOnly && rule.severity !== "error") continue;
 			// Per-rule path carve-out (#965): a rule that's noise on CLI scripts or
 			// a project's own logging sink (e.g. no-console-except-error firing
@@ -1154,6 +1176,13 @@ export function evaluateAstGrepRules(
 			}
 
 			if (!rule.rule) continue;
+			// #4496: the file lacks a literal every match needs.
+			if (
+				options.content !== undefined &&
+				!ruleCanMatchText(rule, options.content)
+			) {
+				continue;
+			}
 
 			try {
 				// A `language: JavaScript` rule on an HTML file with inline
@@ -1164,9 +1193,12 @@ export function evaluateAstGrepRules(
 				// file's line-start table, all in UTF-16 code units (#2347); the
 				// file-root scope is the node's own range, so its derived
 				// id/diagnostic stay byte-identical to the pre-#2347 path.
+				// `endLine` is the match's 0-based last FILE line, mapped the same
+				// way, for the per-edit span gate below (#4481 r2).
 				const scopes: Array<{
 					root: { findAll(config: never): unknown[] };
 					position(match: unknown): { line: number; column: number };
+					endLine(match: unknown): number;
 				}> = runsInsideHtmlScript
 					? htmlInjections.map((injection) => ({
 							root: injection.root,
@@ -1183,6 +1215,15 @@ export function evaluateAstGrepRules(
 									injection.startIndex + start.index,
 								);
 							},
+							endLine(match) {
+								const end = (
+									match as { range(): { end: { index: number } } }
+								).range().end;
+								return filePositionForIndex(
+									fileLineStarts,
+									injection.startIndex + end.index,
+								).line;
+							},
 						}))
 					: [
 							{
@@ -1194,6 +1235,11 @@ export function evaluateAstGrepRules(
 										}
 									).range().start;
 									return { line: start.line, column: start.column };
+								},
+								endLine(match) {
+									return (
+										match as { range(): { end: { line: number } } }
+									).range().end.line;
 								},
 							},
 						];
@@ -1218,7 +1264,12 @@ export function evaluateAstGrepRules(
 					match: unknown;
 					position: { line: number; column: number };
 				}> = [];
+				const withheld: Array<{ position: { line: number; column: number } }> =
+					[];
 				let rejectLogged = false;
+				const editScoped =
+					options.modifiedRanges !== undefined &&
+					normalizeRuleSeverity(rule.severity) === "error";
 				for (const scope of scopes) {
 					let found: unknown[];
 					try {
@@ -1236,14 +1287,28 @@ export function evaluateAstGrepRules(
 					}
 					for (const match of found) {
 						if (collected.length >= maxMatchesPerRule) break;
-						collected.push({ match, position: scope.position(match) });
+						const position = scope.position(match);
+						if (
+							editScoped &&
+							!spanOverlapsModifiedRanges(
+								position.line + 1,
+								scope.endLine(match) + 1,
+								options.modifiedRanges,
+							)
+						) {
+							if (withheld.length < maxMatchesPerRule)
+								withheld.push({ position });
+							continue;
+						}
+						collected.push({ match, position });
 					}
 					if (collected.length >= maxMatchesPerRule) break;
 				}
 
-				for (const { position } of collected) {
-					if (diagnostics.length >= maxTotalDiagnostics) break;
-
+				const toDiagnostic = (position: {
+					line: number;
+					column: number;
+				}): Diagnostic => {
 					// #1777: carry the rule's own tier through. The old collapse
 					// (`=== "error" ? "error" : "warning"`) erased hint and info,
 					// so the quiet tier the #1727 anti-slop rules ship at did not
@@ -1260,7 +1325,7 @@ export function evaluateAstGrepRules(
 					);
 					const ruleFix = explicitRuleFixSuggestion(rule);
 
-					diagnostics.push({
+					return {
 						id: `ast-grep-napi-${position.line}-${rule.id}`,
 						message: `[${rule.metadata?.category || "slop"}] ${rule.message || rule.id}`,
 						filePath,
@@ -1278,7 +1343,14 @@ export function evaluateAstGrepRules(
 							semantic === "blocking"
 								? (ruleFix ?? defaultFixSuggestion(defectClass, rule.id))
 								: ruleFix,
-					});
+					};
+				};
+				for (const { position } of collected) {
+					if (diagnostics.length >= maxTotalDiagnostics) break;
+					diagnostics.push(toDiagnostic(position));
+				}
+				for (const { position } of withheld) {
+					options.outOfEditScope?.push(toDiagnostic(position));
 				}
 
 				if (diagnostics.length >= maxTotalDiagnostics) break;
@@ -1320,7 +1392,14 @@ const astGrepNapiRunner: RunnerDefinition = {
 		const astGrepLspPublished = astGrepLspEnabled
 			? await hasAuxiliaryLspPublishedForRoot("ast-grep", ctx.filePath)
 			: false;
-		if (astGrepLspEnabled && astGrepLspPublished) {
+		// #4509: a recorded napi blocker is judged only by a napi run. The
+		// server's copy has another identity, so under Gate B nothing could
+		// retire one it cannot place (a fixed line after a cut-off edit, an
+		// unaligned write). napi runs instead and names the server
+		// (`coveredBy` below), whose copy stands for napi's on each line the
+		// server flagged (the dispatcher).
+		const coveredByServer = astGrepLspEnabled && astGrepLspPublished;
+		if (coveredByServer && !ctx.recordedRunnerIds?.has("ast-grep-napi")) {
 			// #2324 F2/R2-C: "has this server EVER published for this file" can go
 			// stale — a LATER touch's aux-grace wait can find the server silent
 			// for the CURRENT content while an OLDER revision's publication still
@@ -1331,7 +1410,11 @@ const astGrepNapiRunner: RunnerDefinition = {
 			// synchronous Gate-B check returns, so it cannot have marked
 			// anything yet. Re-running napi here would risk the F3 duplicate
 			// this fix closes, so the loss is made observable instead.
-			if (hasPendingAuxiliaryCoverage(ctx.filePath, "ast-grep")) {
+			const coveragePending = hasPendingAuxiliaryCoverage(
+				ctx.filePath,
+				"ast-grep",
+			);
+			if (coveragePending) {
 				incrementDegradationCount({
 					kind: "aux-runner-findings-lost",
 					subject: "ast-grep",
@@ -1340,7 +1423,28 @@ const astGrepNapiRunner: RunnerDefinition = {
 					reason: `Gate B skipped napi: pending late-auxiliary pair from an EARLIER touch remains undelivered while prior publication satisfies per-file gate (file: ${ctx.filePath})`,
 				});
 			}
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			// #4484 round 4: the ast-grep server answers for this file, so the
+			// skip states why; a bare skip would read as no verdict and keep
+			// napi's recorded blockers after they are fixed. Round 5: only when
+			// no earlier touch's coverage is pending. Then the server is silent
+			// for these bytes, nothing read them, and the skip is no verdict.
+			// Round 6: with a ranged dispatch the server's gate withholds what
+			// lies outside the edit, so the verdict covers only the edit.
+			return {
+				status: "skipped",
+				diagnostics: [],
+				semantic: "none",
+				// Round 7: the verdict holds only if the server's host answered.
+				...(coveragePending
+					? {}
+					: {
+							skipReason: "covered-by-primary",
+							coveredBy: { runnerId: "lsp", serverId: "ast-grep" },
+						}),
+				...(ctx.blockingOnly && ctx.modifiedRanges?.length
+					? { editScopedVerdict: true }
+					: {}),
+			};
 		}
 
 		const sgModule = await loadSg();
@@ -1398,8 +1502,8 @@ const astGrepNapiRunner: RunnerDefinition = {
 
 		// #2336: napi is standing in for the ast-grep auxiliary LSP exactly when
 		// that server is expected but has not published for this root. Gate B
-		// above already returned for the published case, so reaching here with
-		// the auxiliary enabled IS the substitute role.
+		// above returned for the published case unless napi holds a recorded
+		// blocker (#4509: then it runs as the server's peer, not its substitute).
 		const runningAsLspSubstitute = astGrepLspEnabled && !astGrepLspPublished;
 
 		if (runningAsLspSubstitute) {
@@ -1448,6 +1552,7 @@ const astGrepNapiRunner: RunnerDefinition = {
 		// either the LSP is publishing (Gate B skipped napi already) or the user
 		// retired ast-grep with `no-ast-grep`. Paying the cost only when napi is
 		// the sole ast-grep surface buys coverage that nothing else provides.
+		const outOfEditScope: Diagnostic[] = [];
 		const diagnostics = evaluateAstGrepRules(
 			ctx.filePath,
 			rootNode,
@@ -1456,6 +1561,12 @@ const astGrepNapiRunner: RunnerDefinition = {
 			{
 				blockingOnly: runningAsLspSubstitute ? false : ctx.blockingOnly,
 				projectRoot: ctx.projectRoot,
+				rulePolicy: ctx.rulePolicy,
+				// #4481: keyed off the per-edit pass, not the substitute floor
+				// above, so a pre-existing blocker on an unchanged line never
+				// STOPs the write in either role.
+				modifiedRanges: ctx.blockingOnly ? ctx.modifiedRanges : undefined,
+				outOfEditScope,
 				log: (message: string) => ctx.log(message),
 				content,
 				sgModule,
@@ -1494,10 +1605,16 @@ const astGrepNapiRunner: RunnerDefinition = {
 		} else if (diagnostics.length > 0) {
 			semantic = "warning";
 		}
-		return findingsResult(diagnostics, {
-			status: hasBlocking ? "failed" : "succeeded",
-			semantic,
-		});
+		return {
+			...findingsResult(diagnostics, {
+				status: hasBlocking ? "failed" : "succeeded",
+				semantic,
+			}),
+			...(outOfEditScope.length > 0 && { outOfEditScope }),
+			...(coveredByServer && {
+				coveredBy: { runnerId: "lsp", serverId: "ast-grep" },
+			}),
+		};
 	},
 };
 

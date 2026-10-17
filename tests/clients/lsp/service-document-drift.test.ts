@@ -54,7 +54,7 @@ function makeFakeProcess() {
 function makeServer(
 	root: string,
 	id = "typescript",
-	role: "primary" | "auxiliary" = "primary",
+	role: "language" | "auxiliary" = "language",
 	extensions = [".ts"],
 ) {
 	return {
@@ -97,6 +97,7 @@ function makeClient(
 		diagnosticsVersion: 0,
 		getDiagnostics: vi.fn(() => []),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async (filePath: string, content: string) => {
 				await behaviour.onOpen?.(filePath, content);
 				openDocuments.add(path.resolve(filePath));
@@ -212,7 +213,7 @@ describe("LSPService disk-drift backstop (#1783)", () => {
 		await fs.writeFile(changed, "package sample\n", "utf-8");
 		await fs.writeFile(importer, "from dependency import value\n", "utf-8");
 		const client = makeClient(openDocuments, {}, "python");
-		const server = makeServer(dir, "python", "primary", [".go", ".py"]);
+		const server = makeServer(dir, "python", "language", [".go", ".py"]);
 		getServersForFileWithConfig.mockReturnValue([server]);
 		loadReverseDependencyIndexFromSnapshot.mockReturnValue({} as any);
 		getReverseDepsFromIndex.mockReturnValue([importer]);
@@ -466,7 +467,7 @@ describe("LSPService disk-drift backstop (#1783)", () => {
 			const primary = makeClient(primaryOpen);
 			const aux = makeClient(auxOpen);
 			getServersForFileWithConfig.mockReturnValue([
-				makeServer(dir, "typescript", "primary"),
+				makeServer(dir, "typescript", "language"),
 				makeServer(dir, "opengrep", "auxiliary"),
 			]);
 			createLSPClient
@@ -547,7 +548,7 @@ describe("LSPService disk-drift backstop (#1783)", () => {
 				throw new Error("notify write rejected");
 			});
 			getServersForFileWithConfig.mockReturnValue([
-				makeServer(dir, "typescript", "primary"),
+				makeServer(dir, "typescript", "language"),
 				makeServer(dir, "opengrep", "auxiliary"),
 			]);
 			createLSPClient
@@ -620,7 +621,7 @@ describe("LSPService disk-drift backstop (#1783)", () => {
 					},
 				});
 				getServersForFileWithConfig.mockReturnValue([
-					makeServer(dir, "typescript", "primary"),
+					makeServer(dir, "typescript", "language"),
 					makeServer(dir, "opengrep", "auxiliary"),
 				]);
 				createLSPClient
@@ -685,7 +686,7 @@ describe("LSPService disk-drift backstop (#1783)", () => {
 			const primary = makeClient(primaryOpen);
 			const aux = makeClient(auxOpen);
 			getServersForFileWithConfig.mockReturnValue([
-				makeServer(dir, "typescript", "primary"),
+				makeServer(dir, "typescript", "language"),
 				makeServer(dir, "opengrep", "auxiliary"),
 			]);
 			createLSPClient

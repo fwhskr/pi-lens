@@ -14,6 +14,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "./test-utils.js";
 import { waitFor } from "./interleaving-kit.js";
 import { gatedPromise } from "../support/fault-injection.js";
+import {
+	resetProjectTrust,
+	setProjectTrustState,
+} from "../../clients/project-trust.js";
 
 vi.mock("../../clients/safe-spawn.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/safe-spawn.js")>()),
@@ -25,11 +29,9 @@ import {
 	_resetPackageManagerCache,
 	allAvailableGlobalBinDirs,
 	detectNodePackageManager,
-	execArgs,
 	findGlobalBinary,
+	findLocalBinAt,
 	findNodeToolBinary,
-	formatRunScript,
-	globalInstallArgs,
 	installArgs,
 	pmBinary,
 	resolveNodePackageManager,
@@ -113,6 +115,7 @@ function setPlatform(platform: NodeJS.Platform): void {
 }
 
 beforeEach(() => {
+	setProjectTrustState("trusted");
 	_resetPackageManagerCache();
 	vi.mocked(safeSpawnAsync).mockReset();
 	queryResponder = null;
@@ -120,6 +123,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	resetProjectTrust();
 	if (savedPlatform) {
 		Object.defineProperty(process, "platform", savedPlatform);
 		savedPlatform = undefined;
@@ -211,11 +215,6 @@ describe("command builders", () => {
 		expect(runScriptArgs("build")).toEqual(["run", "build"]);
 	});
 
-	it("formatRunScript renders a bare display command", () => {
-		expect(formatRunScript("pnpm", "build")).toBe("pnpm run build");
-		expect(formatRunScript("bun", "test")).toBe("bun run test");
-	});
-
 	it("installArgs uses install for npm and add for the rest", () => {
 		expect(installArgs("npm", "biome")).toEqual(["install", "biome"]);
 		expect(installArgs("pnpm", "biome")).toEqual(["add", "biome"]);
@@ -269,50 +268,6 @@ describe("command builders", () => {
 		]);
 	});
 
-	it("globalInstallArgs spells the global install per manager", () => {
-		expect(globalInstallArgs("npm", "typescript-language-server")).toEqual([
-			"install",
-			"-g",
-			"typescript-language-server",
-		]);
-		expect(globalInstallArgs("pnpm", "typescript-language-server")).toEqual([
-			"add",
-			"-g",
-			"typescript-language-server",
-		]);
-		expect(globalInstallArgs("bun", "typescript-language-server")).toEqual([
-			"add",
-			"-g",
-			"typescript-language-server",
-		]);
-		// yarn classic uses `global add`.
-		expect(globalInstallArgs("yarn", "typescript-language-server")).toEqual([
-			"global",
-			"add",
-			"typescript-language-server",
-		]);
-	});
-
-	it("execArgs maps to each manager's package runner", () => {
-		setPlatform("linux"); // pin platform — the Windows spelling is asserted below
-		expect(execArgs("npm", "pkg")).toEqual({
-			command: "npx",
-			args: ["--no", "pkg"],
-		});
-		expect(execArgs("bun", "pkg", ["--stdio"])).toEqual({
-			command: "bun",
-			args: ["x", "pkg", "--stdio"],
-		});
-		expect(execArgs("pnpm", "pkg")).toEqual({
-			command: "pnpm",
-			args: ["dlx", "pkg"],
-		});
-		expect(execArgs("yarn", "pkg")).toEqual({
-			command: "yarn",
-			args: ["dlx", "pkg"],
-		});
-	});
-
 	it("pmBinary is the bare name on Unix", () => {
 		setPlatform("linux");
 		expect(pmBinary("npm")).toBe("npm");
@@ -325,7 +280,6 @@ describe("command builders", () => {
 		expect(pmBinary("pnpm")).toBe("pnpm.cmd");
 		expect(pmBinary("yarn")).toBe("yarn.cmd");
 		expect(pmBinary("bun")).toBe("bun.exe");
-		expect(execArgs("npm", "pkg").command).toBe("npx.cmd");
 	});
 });
 
@@ -669,6 +623,32 @@ describe("findGlobalBinary", () => {
 });
 
 describe("findNodeToolBinary", () => {
+	it("refuses a project-local binary when trust is unknown or untrusted", () => {
+		const root = tmpDir();
+		const bin = path.join(root, "node_modules", ".bin", "eslint");
+		fs.mkdirSync(path.dirname(bin), { recursive: true });
+		fs.writeFileSync(bin, "#!/bin/sh\n");
+
+		for (const trust of ["unknown", "untrusted"] as const) {
+			setProjectTrustState(trust);
+			const result = findLocalBinAt("eslint", root);
+			expect(result).toMatchObject({
+				kind: "refused-by-trust",
+				trust,
+				tool: "eslint",
+			});
+		}
+	});
+
+	it("allows a project-local binary when trust is trusted", () => {
+		const root = tmpDir();
+		const bin = path.join(root, "node_modules", ".bin", "eslint");
+		fs.mkdirSync(path.dirname(bin), { recursive: true });
+		fs.writeFileSync(bin, "#!/bin/sh\n");
+		setProjectTrustState("trusted");
+		expect(findLocalBinAt("eslint", root)).toBe(bin);
+	});
+
 	it("prefers a local node_modules/.bin, walking up from cwd", async () => {
 		setPlatform("linux");
 		onlyAvailable(); // no global manager — proves the local hit wins

@@ -16,6 +16,16 @@ export declare function formatAbsentRequiredReason(
 	sha: string,
 	minutes?: number,
 ): string;
+export declare function formatAbsentRunReason(args: {
+	state: string;
+	id: number | null;
+	ageMinutes: number | null;
+	sha: string;
+}): string;
+export declare function formatAbsentRunUnknownReason(
+	sha: string,
+	minutes?: number,
+): string;
 export declare function formatForkApprovalReason(
 	repository: string,
 	runs: { id: number }[],
@@ -50,6 +60,10 @@ export interface VerdictRow {
 	url: string | null;
 	detailsUrl?: string | null;
 	gating: boolean;
+	/** #4090: set when every run of this name came from a non-PR/push event. */
+	triggerEvent?: string;
+	/** #4090: set when a cancelled run's row is superseded by an open newer run. */
+	supersededByRun?: number | string;
 }
 
 export interface FailedJobDetail {
@@ -71,6 +85,22 @@ export interface AbsentContext {
 	actionRequiredRuns: { id: number }[];
 	autoMerge: boolean;
 	absentMinutes: number | null;
+	headRun?: {
+		state: string;
+		id: number | null;
+		ageMinutes: number | null;
+	} | null;
+}
+
+export interface MergeQueueEntry {
+	state: string | null;
+	position: number | null;
+}
+
+export interface QueueContext {
+	entry?: MergeQueueEntry;
+	failedRuns?: { id: number; url: string }[];
+	failedRows?: VerdictRow[];
 }
 
 export interface Verdict {
@@ -103,6 +133,7 @@ export declare function computeVerdict(
 	} | null,
 	absentContext?: AbsentContext | (() => AbsentContext | null) | null,
 	noiseRowIds?: Set<number | null> | null,
+	queueContext?: QueueContext | (() => QueueContext | null) | null,
 ): Verdict;
 
 export declare function formatVerdictTable(rows: VerdictRow[]): string;
@@ -154,6 +185,7 @@ export declare function pollVerdict(args: {
 		  })
 		| null;
 	absentContext?: AbsentContext | (() => AbsentContext | null) | null;
+	queueContext?: QueueContext | (() => QueueContext | null) | null;
 	sleepImpl?: (ms: number) => Promise<void>;
 	now?: () => number;
 	onRetry?: (line: string) => void;
@@ -196,6 +228,25 @@ export declare function fetchActionRequiredRuns(
 	failOpen?: boolean,
 ): { id: number }[];
 
+export declare function fetchHeadRuns(
+	repository: string,
+	sha: string,
+	ghExec?: GhExec,
+	timeoutMs?: number,
+	failOpen?: boolean,
+): {
+	actionRequiredRuns: { id: number }[];
+	headRun: {
+		state: string;
+		id: number | null;
+		startedAtMs: number | null;
+	};
+	/** #4090: check suite id to the event of its workflow run. */
+	suiteEvents: Map<number | string, string>;
+	/** #4090: cancelled run's check suite id to the open newer run's id. */
+	supersededSuites: Map<number | string, number | string>;
+};
+
 export declare function fetchAutoMergeAge(
 	target: string | number,
 	repository: string,
@@ -204,6 +255,21 @@ export declare function fetchAutoMergeAge(
 	timeoutMs?: number,
 	knownPushedMs?: number | null,
 ): { autoMerge: boolean; pushedMs: number | null };
+
+export declare function readMergeQueueState(
+	target: string | number,
+	repository: string,
+	ghExec?: GhExec,
+	timeoutMs?: number,
+): { enabled: boolean; entry: MergeQueueEntry | null } | null;
+
+export declare function fetchFailedQueueRuns(
+	target: string | number,
+	repository: string,
+	pushedMs: number | null,
+	ghExec?: GhExec,
+	timeoutMs?: number,
+): { failedRuns: { id: number; url: string }[]; failedRows: VerdictRow[] };
 
 export declare function fetchRerunState(
 	repository: string,
@@ -390,30 +456,8 @@ export declare function formatFailureLines(
 export declare function formatGatingSplit(
 	rows: VerdictRow[],
 	failingRows?: VerdictRow[],
+	details?: Pick<FailedJobDetail, "rowId" | "summary">[],
 ): string[];
-
-export declare function formatMutationLine(
-	comments: Array<{ id: number; body?: string; user?: { login?: string } }>,
-	prHead: string,
-	rows?: Array<{
-		name: string;
-		status: string | null;
-		conclusion?: string | null;
-	}>,
-): string;
-
-export declare function readMutationLine(options: {
-	repository: string;
-	target: string | number;
-	sha: string;
-	rows?: Array<{
-		name: string;
-		status: string | null;
-		conclusion?: string | null;
-	}>;
-	ghExec?: (args: string[], options?: Record<string, unknown>) => string;
-	timeoutMs?: number;
-}): string;
 
 export interface OpenPr {
 	number: number;

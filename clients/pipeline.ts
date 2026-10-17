@@ -12,15 +12,19 @@
  *   7. Cascade diagnostics (other files with errors, LSP only)
  */
 
-import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
-import * as nodeCrypto from "node:crypto";
 import * as path from "node:path";
 import type { PiLensFlagSource } from "./lens-config.js";
+import { hashFileBytes, stampContentBytes } from "./content-stamp.js";
 import {
 	findNearestContaining,
 	normalizeEphemeralMapKey,
+	normalizeMapKey,
 } from "./path-utils.js";
+import {
+	inlineBlockerLines,
+	inlineBlockerSources,
+} from "./inline-blocker-fields.js";
 import {
 	recordFromDispatchDiagnostic,
 	type ActionableWarningRecord,
@@ -37,6 +41,21 @@ import {
 import { writeOrderToken } from "./write-ordering-guard.js";
 import { getDiagnosticLogger } from "./diagnostic-logger.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
+import { ANY_POSITION, retainRecordedFindings } from "./finding-identity.js";
+import {
+	type AnalysisAnchor,
+	alignLines,
+	boundedAnchor,
+	type LineMap,
+	lineHashesOf,
+	lineHashOf,
+	linesOfRanges,
+	linesOwedByContent,
+	owedContentOf,
+	owedRangesAfterDispatch,
+	rangesOfLines,
+	stampLineHashes,
+} from "./line-alignment.js";
 import { loadDispatchIntegration } from "./dispatch/lazy.js";
 import { toRunnerDisplayPath } from "./dispatch/runner-context.js";
 import {
@@ -53,7 +72,12 @@ import {
 	resolveToolCommandWithInstallFallback,
 } from "./dispatch/runners/utils/runner-helpers.js";
 import { findDetektConfig } from "./dispatch/runners/detekt.js";
-import type { Diagnostic, PiAgentAPI } from "./dispatch/types.js";
+import {
+	type Diagnostic,
+	type InconclusiveSources,
+	type PiAgentAPI,
+	spanOverlapsModifiedRanges,
+} from "./dispatch/types.js";
 import {
 	formatDiagnostics,
 	formatPromotionNotes,
@@ -66,6 +90,8 @@ import {
 } from "./file-utils.js";
 import type { FormatService } from "./format-service.js";
 import type { GenerationHandle } from "./generation-guard.js";
+import { resolveAnalysisRoot, type AnalysisRootMode } from "./analysis-root.js";
+import { emitBounded } from "./bounded-telemetry.js";
 import { logLatency } from "./latency-logger.js";
 import type { PostAutofixNotice } from "./post-autofix-notice.js";
 import { emitLensAnalysisComplete } from "./lens-events.js";
@@ -244,6 +270,8 @@ async function diffProjectSnapshot(
 // --- Types ---
 
 export interface PipelineContext {
+	/** Root classification is carried from the single analysis-root seam. */
+	analysisRootMode?: AnalysisRootMode;
 	/** Live tool_result signal for aggregate formatter and dispatch bounds. */
 	signal?: AbortSignal;
 	filePath: string;
@@ -261,6 +289,19 @@ export interface PipelineContext {
 	 */
 	allowAutonomousWriters?: boolean;
 	modifiedRanges?: { start: number; end: number }[];
+	/**
+	 * #4484 round 2: the file's recorded inline blockers before this run, read
+	 * when the dispatch returns. A recorded blocker leaves the record only when
+	 * a conclusive observation from its own source shows it gone.
+	 */
+	priorInlineBlockers?: () => readonly Diagnostic[] | undefined;
+	/**
+	 * #4484 round 3: the anchor of the file's last applied inline verdict,
+	 * read before the dispatch. It places each recorded blocker's line in the
+	 * current bytes (R2) and names the lines a run without a verdict still
+	 * owes, which join this run's range (R4).
+	 */
+	priorAnalysisAnchor?: () => AnalysisAnchor | undefined;
 	telemetry?: {
 		model: string;
 		sessionId: string;
@@ -407,8 +448,29 @@ export interface PipelineResult {
 	 * re-render of an unmarked record is byte-identical to the stored summary.
 	 */
 	inlineBlockerDiagnostics?: Diagnostic[];
-	/** Content baseline captured from the pipeline read used to render blockers. */
+	/**
+	 * Content baseline of the bytes the analysis read (#3574): the inline blocker
+	 * record's `recordedHash` when the result carries blockers, and what a clean
+	 * result without authorship is compared against before it may clear such a
+	 * record (#4137 round 3). Absent when the file was unreadable or over the
+	 * baseline cap.
+	 */
 	inlineBlockerFileContent?: { size: number; sha256: string };
+	/**
+	 * #4484: how many blockers this run's observation still holds after the
+	 * deleted-path gate, new or held back by the delta, whether or not the run
+	 * may deliver them. `clearInlineBlockers` refuses a clear while it is
+	 * non-zero, so a run without authorship (#3226) cannot retire a record
+	 * about a blocker that is still there.
+	 */
+	currentBlockerCount?: number;
+	/**
+	 * #4484 round 3: the anchor the inline verdict this run hands on is about
+	 * (the analysed bytes' line hashes and the lines still owed). The caller
+	 * stores it only when that verdict applied. Absent when the bytes are over
+	 * the hash cap and no line is owed.
+	 */
+	analysisAnchor?: AnalysisAnchor;
 	/** Fixable warning diagnostics introduced by this pipeline run. */
 	actionableWarnings?: ActionableWarningRecord[];
 	/** Non-fixable code-quality warnings introduced/touched by this pipeline run. */
@@ -914,6 +976,7 @@ export async function runAutofix(
 	deps: Pick<PipelineDeps, "biomeClient" | "ruffClient" | "fixedThisTurn">,
 	getFlagSource?: PipelineContext["getFlagSource"],
 	writeHold?: FileMutationHold,
+	sessionRoot = cwd,
 ): Promise<{
 	fixedCount: number;
 	autofixTools: string[];
@@ -929,6 +992,26 @@ export async function runAutofix(
 	restoring?: Promise<FixRunLoss> | undefined;
 	skipReason?: string;
 }> {
+	if (resolveAnalysisRoot(filePath, sessionRoot) === "adopted") {
+		emitBounded(
+			"adopted_root_writer_skipped",
+			`${filePath}:autofix`,
+			{
+				filePath,
+				durationMs: 0,
+				metadata: { writer: "autofix" },
+			},
+			{ ledgerKind: "adopted-root-writer-skipped", risingEdgePer: "identity" },
+		);
+		return {
+			fixedCount: 0,
+			autofixTools: [],
+			attemptedTools: [],
+			changedFiles: [],
+			needsContentRefresh: false,
+			skipReason: "adopted_root",
+		};
+	}
 	const { biomeClient, ruffClient, fixedThisTurn } = deps;
 	const noAutofix = getFlag("no-autofix", filePath);
 	let fixedCount = 0;
@@ -1320,14 +1403,16 @@ export async function resyncHeldLspDocument(
  * Escape must not stop it). It never stamps the read guard or a `FileTime`,
  * so the formatter's bytes stay unseen by the agent. The row names what
  * happened to F; a throw is one bounded `hook-handler-crash` and no rethrow:
- * nothing awaits this.
+ * nothing awaits this. A `format_late_resync_chained` row (#3873) marks the
+ * give-up at chain time, for both callers, so a never-settling formatter is
+ * countable by file.
  */
 export function chainLateFormatResync(
 	settled: Promise<unknown>,
 	which: "deferred" | "inband",
 	row: { toolName: string; filePath: string; startedAt: number },
 	dbg: PipelineContext["dbg"],
-): void {
+): Promise<void> {
 	const inband = which === "inband";
 	const logLate = (outcome: string) => {
 		const common = {
@@ -1342,7 +1427,19 @@ export function chainLateFormatResync(
 		if (inband) logLatency({ ...common, phase: "inband_format_late_resync" });
 		else logLatency({ ...common, phase: "deferred_format_late_resync" });
 	};
-	void settled
+	// #3873 F1: the give-up itself, one row per file at chain time. The late
+	// rows below come only when the formatter settles; a formatter that never
+	// does, or an Escape, left no per-file record of the give-up at all.
+	// Bound: one per abandoned formatter run.
+	logLatency({
+		type: "phase",
+		phase: "format_late_resync_chained",
+		toolName: row.toolName,
+		filePath: row.filePath,
+		durationMs: Date.now() - row.startedAt,
+		metadata: { which },
+	});
+	return settled
 		.then(async () => {
 			logLate(await resyncHeldLspDocument(row.filePath));
 		})
@@ -1546,13 +1643,22 @@ type DispatchResult = Awaited<
 		(typeof import("./dispatch/integration.js"))["dispatchLintWithResult"]
 	>
 >;
+/**
+ * The line a write with nothing else to say ends with. #4403: "clean" only
+ * when the file's primary group checked it; otherwise one line naming why not
+ * (`DispatchResult.unconfirmedStatus`), so a write after the once-only
+ * coverage notice does not read as a clean result.
+ */
 function buildAllClearOutput(
-	_dispatchResult: DispatchResult,
+	dispatchResult: DispatchResult,
 	elapsed: number,
 	filePath: string,
 ): string {
 	const kind = detectFileKind(filePath);
 	const langLabel = kind ? getFileKindLabel(kind) : path.extname(filePath);
+	if (kind && dispatchResult.unconfirmedStatus !== undefined) {
+		return `\u26a0 ${langLabel} unconfirmed — ${dispatchResult.unconfirmedStatus} · ${elapsed}ms`;
+	}
 	const parts: string[] = [];
 
 	if (kind) {
@@ -1561,6 +1667,43 @@ function buildAllClearOutput(
 
 	parts.push(`${elapsed}ms`);
 	return `checkmark ${parts.join(" · ")}`.replace("checkmark", "\u2713");
+}
+
+/**
+ * #4484: the one line a write gets for blockers that are still on the file
+ * but not new to it (the delta held them back). Bounded: at most five line
+ * numbers, then a count.
+ */
+function formatStillUnfixedLine(
+	blockers: readonly Diagnostic[],
+	filePath: string,
+): string {
+	const lines = [...new Set(inlineBlockerLines(blockers, filePath))];
+	const shown = lines.slice(0, 5).map((line) => `L${line}`);
+	if (lines.length > shown.length)
+		shown.push(`+${lines.length - shown.length} more`);
+	const where = shown.length > 0 ? ` (${shown.join(", ")})` : "";
+	const count = blockers.length;
+	return `🔴 Still unfixed: ${count} blocker${count === 1 ? "" : "s"} reported earlier${where}.`;
+}
+
+/**
+ * #4483: the one line a write gets for linter errors the file already held
+ * before its first edit this session (`DispatchResult.preExisting`). They do
+ * not stop the agent or shut the commit gate. Bounded like the still-unfixed
+ * line: at most five line numbers, then a count.
+ */
+function formatPreExistingLine(
+	findings: readonly Diagnostic[],
+	filePath: string,
+): string {
+	const lines = [...new Set(inlineBlockerLines(findings, filePath))];
+	const shown = lines.slice(0, 5).map((line) => `L${line}`);
+	if (lines.length > shown.length)
+		shown.push(`+${lines.length - shown.length} more`);
+	const where = shown.length > 0 ? ` (${shown.join(", ")})` : "";
+	const count = findings.length;
+	return `ℹ Pre-existing: ${count} linter error${count === 1 ? "" : "s"} already in this file before its first edit this session${where}; not blocking.`;
 }
 
 export interface FormatPhaseResult {
@@ -1596,6 +1739,7 @@ export async function runFormatPhase(
 	budgetMs = HOOK_WALL_BUDGET_MS.tool_result_edit,
 	hook: LedgerHookKey = "tool_result_edit",
 	writeHold?: FileMutationHold,
+	sessionRoot?: string,
 ): Promise<FormatPhaseResult> {
 	let formatChanged = false;
 	let formattersUsed: string[] = [];
@@ -1604,78 +1748,96 @@ export async function runFormatPhase(
 	let fileContent: string | undefined;
 	let abandoned: Promise<void> | undefined;
 
-	const formatService = getFormatService();
-	try {
-		formatService.recordRead(filePath);
-		// #3506: the formatter rewrites the file in place (see runAutofix). It
-		// enters the hold once its command is resolved (#3558), and one the
-		// budget gave up on keeps its entry until its child settles.
-		const result = await formatService.formatFile(filePath, {
-			signal,
-			budgetMs,
-			hook,
-			...(writeHold ? { writeHold } : {}),
-		});
-		abandoned = result.abandoned;
-		// An unavailable tool is NOT a formatter that ran (#2413): keep it out of
-		// `formattersUsed` (which drives change bookkeeping / turn summaries) and
-		// out of `formatFailures` (which requeues). Record it once, distinctly.
-		for (const f of result.formatters) {
-			if (f.outcome !== "unavailable") continue;
-			if (f.error?.includes("project tool agreement could not be established"))
-				continue;
-			const reason = f.error ?? "formatter executable not found";
-			formatUnavailable.push({ formatter: f.name, reason });
-			recordDegradationOnce({
-				kind: "formatter-unavailable",
-				subject: `${f.name}:${path.basename(filePath)}`,
-				reason,
+	const adopted =
+		sessionRoot !== undefined &&
+		resolveAnalysisRoot(filePath, sessionRoot) === "adopted";
+	if (adopted)
+		emitBounded(
+			"adopted_root_writer_skipped",
+			`${filePath}:format`,
+			{
+				filePath,
+				durationMs: 0,
+				metadata: { writer: "format" },
+			},
+			{ ledgerKind: "adopted-root-writer-skipped", risingEdgePer: "identity" },
+		);
+	if (!adopted) {
+		const formatService = getFormatService();
+		try {
+			formatService.recordRead(filePath);
+			// #3506: the formatter rewrites the file in place (see runAutofix). It
+			// enters the hold once its command is resolved (#3558), and one the
+			// budget gave up on keeps its entry until its child settles.
+			const result = await formatService.formatFile(filePath, {
+				signal,
+				budgetMs,
+				hook,
+				...(writeHold ? { writeHold } : {}),
 			});
-		}
-		formattersUsed = result.formatters
-			.filter((f) => f.outcome !== "unavailable")
-			.map((f) => f.name);
-		if (result.anyChanged) {
-			formatChanged = true;
-			dbg(
-				"autoformat: " +
-					result.formatters
-						.map(
-							(f) => f.name + "(" + (f.changed ? "changed" : "unchanged") + ")",
-						)
-						.join(", "),
-			);
-		}
-		if (!result.allSucceeded) {
-			const failures = result.formatters.filter((f) => !f.success);
-			for (const failure of failures) {
+			abandoned = result.abandoned;
+			// An unavailable tool is NOT a formatter that ran (#2413): keep it out of
+			// `formattersUsed` (which drives change bookkeeping / turn summaries) and
+			// out of `formatFailures` (which requeues). Record it once, distinctly.
+			for (const f of result.formatters) {
+				if (f.outcome !== "unavailable") continue;
+				if (
+					f.error?.includes("project tool agreement could not be established")
+				)
+					continue;
+				const reason = f.error ?? "formatter executable not found";
+				formatUnavailable.push({ formatter: f.name, reason });
 				recordDegradationOnce({
-					kind: "formatter-failure",
-					subject: `${failure.name}:${path.basename(filePath)}`,
-					reason: failure.error ?? "unknown error",
+					kind: "formatter-unavailable",
+					subject: `${f.name}:${path.basename(filePath)}`,
+					reason,
 				});
 			}
-			formatFailures.push(
-				...failures.map((f) => `${f.name}: ${f.error ?? "unknown error"}`),
-			);
-			dbg(
-				"autoformat: " +
-					failures
-						.map((f) => f.name + " failed: " + (f.error ?? "unknown error"))
-						.join("; "),
-			);
+			formattersUsed = result.formatters
+				.filter((f) => f.outcome !== "unavailable")
+				.map((f) => f.name);
+			if (result.anyChanged) {
+				formatChanged = true;
+				dbg(
+					"autoformat: " +
+						result.formatters
+							.map(
+								(f) =>
+									f.name + "(" + (f.changed ? "changed" : "unchanged") + ")",
+							)
+							.join(", "),
+				);
+			}
+			if (!result.allSucceeded) {
+				const failures = result.formatters.filter((f) => !f.success);
+				for (const failure of failures) {
+					recordDegradationOnce({
+						kind: "formatter-failure",
+						subject: `${failure.name}:${path.basename(filePath)}`,
+						reason: failure.error ?? "unknown error",
+					});
+				}
+				formatFailures.push(
+					...failures.map((f) => `${f.name}: ${f.error ?? "unknown error"}`),
+				);
+				dbg(
+					"autoformat: " +
+						failures
+							.map((f) => f.name + " failed: " + (f.error ?? "unknown error"))
+							.join("; "),
+				);
+			}
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			recordDegradationOnce({
+				kind: "formatter-failure",
+				subject: `format-service:${path.basename(filePath)}`,
+				reason: message,
+			});
+			formatFailures.push(message);
+			dbg(`autoformat error: ${err}`);
 		}
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		recordDegradationOnce({
-			kind: "formatter-failure",
-			subject: `format-service:${path.basename(filePath)}`,
-			reason: message,
-		});
-		formatFailures.push(message);
-		dbg(`autoformat error: ${err}`);
 	}
-
 	const fileReadStamp = performance.now();
 	const fileReadAtMs = Date.now();
 	let fileBytes: Buffer | undefined;
@@ -1752,6 +1914,233 @@ function buildEnrichedBlockerOutput(
 
 // --- Main Pipeline ---
 
+/**
+ * #4484: the recorded blockers this run leaves standing beyond what it
+ * observed as blocking (R3 in PR #4491's round-3 table). A recorded blocker
+ * matched by a blocker this run delivers or holds back, of the same identity
+ * at the blocker's position (`positionOf`), is already in `observed`; the
+ * observed copies matched this way are returned as `matched`. One matched only
+ * by `stillObserved` stays as its observed copy. One no finding matches stays,
+ * at its position when it has one, only when its runner or server reached no
+ * verdict; that carry is counted per file. Round 6: a runner whose verdict
+ * covers only the edit (`editScopedRunnerIds`) answers only for a blocker
+ * inside it: its line was edited or deleted, or its line now lies in
+ * `editRanges`. One outside, or unplaced, stays as for no verdict.
+ * #4509 (N3): a kept recorded blocker this write could not place is marked
+ * `positionStale`.
+ */
+function carryRecordedBlockers(
+	prior: readonly Diagnostic[],
+	observed: readonly Diagnostic[],
+	dispatchResult: Pick<
+		DispatchResult,
+		"stillObserved" | "inconclusiveSources" | "editScopedRunnerIds"
+	>,
+	filePath: string,
+	positionOf: (d: Diagnostic) => number | undefined | typeof ANY_POSITION,
+	matchesAnywhere: (prior: Diagnostic, observed: Diagnostic) => boolean,
+	editRanges: readonly { start: number; end: number }[] | undefined,
+): { carried: Diagnostic[]; matched: ReadonlySet<Diagnostic> } {
+	if (prior.length === 0) return { carried: [], matched: new Set() };
+	const runnerIds = new Set(dispatchResult.inconclusiveSources?.runnerIds);
+	const serverIds = new Set(dispatchResult.inconclusiveSources?.serverIds);
+	const editScoped = new Set(dispatchResult.editScopedRunnerIds);
+	const insideEdit = (d: Diagnostic) => {
+		const at = d.line === undefined ? ANY_POSITION : positionOf(d);
+		return (
+			at === undefined ||
+			(typeof at === "number" && spanOverlapsModifiedRanges(at, at, editRanges))
+		);
+	};
+	const observedNow = new Set(observed);
+	const recorded = new Set(prior);
+	const { kept } = retainRecordedFindings(
+		prior,
+		[...observed, ...(dispatchResult.stillObserved ?? [])],
+		{
+			positionOf,
+			matchesAnywhere,
+			keepUnobserved: (d) =>
+				(d.runnerId !== undefined && runnerIds.has(d.runnerId)) ||
+				(d.serverId !== undefined && serverIds.has(d.serverId)) ||
+				(d.runnerId !== undefined &&
+					editScoped.has(d.runnerId) &&
+					!insideEdit(d)),
+		},
+	);
+	const matched = new Set(kept.flatMap((d) => (observedNow.has(d) ? [d] : [])));
+	const carried = kept.flatMap((d) => {
+		if (observedNow.has(d)) return [];
+		if (!recorded.has(d)) return [d];
+		const at = positionOf(d);
+		// #4509 (N3): kept without a place in these bytes, its line number is
+		// from older bytes; say so instead of leaving a later write to infer it
+		// from one line's hash.
+		if (typeof at !== "number")
+			return [d.positionStale ? d : { ...d, positionStale: true as const }];
+		return [at === d.line ? d : { ...d, line: at }];
+	});
+	if (carried.some((d) => !dispatchResult.stillObserved?.includes(d))) {
+		incrementDegradationCount({
+			kind: "blocker-carried-unobserved",
+			subject: normalizeMapKey(filePath),
+			reason:
+				"a recorded blocker's source reached no verdict on this write, so the blocker stays pending (#4484)",
+		});
+	}
+	return { carried, matched };
+}
+
+/**
+ * #4484 round 3: this run's bytes against the anchor of the file's blocker
+ * record. `positionOf` maps a recorded blocker's line of the anchor's bytes
+ * to this run's (R2): undefined when the line was edited or deleted. Round 4:
+ * with no alignment (no anchor, an anchor without hashes, bytes past the
+ * caps, or a change past the edit cap) it is {@link ANY_POSITION}, counted
+ * once per file. Round 5: so is a blocker whose line no longer holds its own
+ * text in the anchor's bytes (`lineHash`: an earlier write without alignment
+ * kept it at an older line number). `matchesAnywhere` then admits only an
+ * observed finding on a line with the blocker's text; #4509: so is one the
+ * record marks `positionStale`. `owed` is the anchor's
+ * owed lines per runner, in this run's bytes (R4): remapped ranges with an
+ * alignment, otherwise the lines whose text matches an owed line. `next` is
+ * the anchor this run's verdict hands on: its own line hashes, and for each
+ * runner that reached no verdict and is not still in flight (a collect-later
+ * run settles on its own), the lines it analysed for that runner; a run
+ * without authorship keeps every earlier owed line too.
+ */
+function anchorToPriorAnalysis(
+	prior: AnalysisAnchor | undefined,
+	fileContent: string | undefined,
+	fileBytes: Buffer | undefined,
+	filePath: string,
+) {
+	let hashes: Uint32Array | undefined | null = null;
+	const currentHashes = (): Uint32Array | undefined => {
+		// The inline blocker baseline's own cap.
+		hashes ??=
+			fileContent !== undefined &&
+			fileBytes !== undefined &&
+			fileBytes.byteLength <= 2 * 1024 * 1024
+				? lineHashesOf(fileContent)
+				: undefined;
+		return hashes ?? undefined;
+	};
+	let lines: string[] | undefined;
+	const lineCount = () =>
+		currentHashes()?.length ?? fileContent?.split(/\r?\n/).length ?? 0;
+	// One line's text in these bytes (undefined: unread).
+	const textAt = (line: number): string | undefined => {
+		if (fileContent === undefined) return undefined;
+		lines ??= fileContent.split(/\r?\n/);
+		return lines[line - 1];
+	};
+	// One line's hash in these bytes, also past the caps (undefined: unread).
+	const hashAt = (line: number): number | undefined => {
+		const all = currentHashes();
+		if (all) return all[line - 1];
+		const text = textAt(line);
+		return text === undefined ? undefined : lineHashOf(text);
+	};
+	let lineMap: LineMap | undefined | null = null;
+	const alignment = (): LineMap | undefined => {
+		if (lineMap === null) {
+			const now = currentHashes();
+			lineMap =
+				prior?.lineHashes && now
+					? alignLines(prior.lineHashes, now)
+					: undefined;
+		}
+		return lineMap;
+	};
+	const unplaced = () =>
+		recordDegradationOnce({
+			kind: "blocker-position-unaligned",
+			subject: normalizeMapKey(filePath),
+			reason:
+				"a recorded blocker could not be placed in the write's bytes (no alignment, or its line no longer holds its text); it matches its identity only on a line with its own text, and owed lines are matched by content (#4484)",
+		});
+	const positionOf = (d: {
+		line: number;
+		lineHash?: number | undefined;
+		positionStale?: true | undefined;
+	}): number | undefined | typeof ANY_POSITION => {
+		const map = alignment();
+		// #4509 (N3): a recorded stale entry is never placed by its old number.
+		const placed =
+			d.positionStale !== true &&
+			(d.lineHash === undefined ||
+				prior?.lineHashes?.[d.line - 1] === d.lineHash);
+		if (map && placed) return map(d.line);
+		unplaced();
+		return ANY_POSITION;
+	};
+	const matchesAnywhere = (prior: Diagnostic, observed: Diagnostic) => {
+		if (prior.lineHash === undefined || observed.line === undefined)
+			return true;
+		const text = hashAt(observed.line);
+		return text === undefined || text === prior.lineHash;
+	};
+	const owed = new Map<string, { start: number; end: number }[]>();
+	const owe = (runnerId: string, ranges: { start: number; end: number }[]) => {
+		if (ranges.length > 0) owed.set(runnerId, ranges);
+	};
+	for (const [runnerId, ranges] of prior?.owedRanges ?? []) {
+		const map = alignment();
+		if (!map) {
+			unplaced();
+			owe(
+				runnerId,
+				linesOwedByContent(
+					owedContentOf(ranges, prior?.lineHashes),
+					currentHashes(),
+					lineCount(),
+					textAt,
+				),
+			);
+			continue;
+		}
+		owe(
+			runnerId,
+			rangesOfLines(
+				linesOfRanges(ranges).flatMap((line) => {
+					const at = map(line);
+					return at === undefined ? [] : [at];
+				}),
+			),
+		);
+	}
+	for (const [runnerId, content] of prior?.owedContent ?? [])
+		owe(
+			runnerId,
+			linesOwedByContent(content, currentHashes(), lineCount(), textAt),
+		);
+	return {
+		positionOf,
+		matchesAnywhere,
+		owed,
+		next(
+			sources: InconclusiveSources | undefined,
+			modifiedRanges: { start: number; end: number }[] | undefined,
+			delivers: boolean,
+			editScoped: readonly string[] | undefined,
+		): AnalysisAnchor | undefined {
+			const lineHashes = currentHashes();
+			const owedRanges = owedRangesAfterDispatch({
+				delivers,
+				noVerdict: sources?.runnerIds ?? [],
+				editScoped,
+				collectLater: sources?.collectLaterRunnerIds ?? [],
+				modifiedRanges,
+				owed,
+				lineCount,
+			});
+			if (lineHashes === undefined && owedRanges.size === 0) return undefined;
+			return boundedAnchor(lineHashes, owedRanges);
+		},
+	};
+}
+
 export async function runPipeline(
 	ctx: PipelineContext,
 	deps: PipelineDeps,
@@ -1823,7 +2212,9 @@ async function analysePipeline(
 	let formattersUsed: string[] = [];
 	let formatFailures: string[] = [];
 	const piChangedFiles = new Set<string>();
-	const autoformatDisabled = !!getFlag("no-autoformat", filePath);
+	const autoformatDisabled =
+		resolveAnalysisRoot(filePath, ctx.projectRoot ?? cwd) === "adopted" ||
+		!!getFlag("no-autoformat", filePath);
 	const immediateFormat = !!getFlag("immediate-format");
 	const formatDeferred =
 		allowAutonomousWriters &&
@@ -1844,11 +2235,13 @@ async function analysePipeline(
 			undefined,
 			undefined,
 			writeHold,
+			ctx.projectRoot ?? cwd,
 		);
 		// #3858: a formatter the budget (or Escape) gave up on writes F later,
 		// after the sync below pushed the bytes from before. Sync that write too.
 		if (formatResult.abandoned)
-			chainLateFormatResync(
+			// The chain owns rejection handling; this continuation is intentionally detached.
+			void chainLateFormatResync(
 				formatResult.abandoned,
 				"inband",
 				{ toolName, filePath, startedAt: pipelineStart },
@@ -1924,6 +2317,7 @@ async function analysePipeline(
 			deps,
 			getFlagSource,
 			writeHold,
+			ctx.projectRoot ?? cwd,
 		));
 	// The restore waits for pi's queue entries (#3830), so this result never
 	// waits for it: F's diagnostics and blockers must not wait on whoever holds a
@@ -1982,10 +2376,7 @@ async function analysePipeline(
 		fileModified && targetFileModified
 			? (() => {
 					try {
-						return nodeCrypto
-							.createHash("sha256")
-							.update(nodeFs.readFileSync(filePath))
-							.digest("hex");
+						return hashFileBytes(filePath);
 					} catch (error) {
 						recordDegradationOnce({
 							kind: "pipeline-post-write-hash-unavailable",
@@ -2036,17 +2427,30 @@ async function analysePipeline(
 	// promise can yield to another writer. The blocker evidence below belongs to
 	// this analysis input, not to whatever happens to be on disk when the whole
 	// pipeline returns.
-	const inlineBlockerFileContent = fileBytes?.byteLength
-		? (() => {
-				const content = fileBytes;
-				return content.byteLength <= 2 * 1024 * 1024
-					? {
-							size: content.byteLength,
-							sha256: createHash("sha256").update(content).digest("hex"),
-						}
-					: undefined;
-			})()
-		: undefined;
+	const inlineBlockerFileContent =
+		fileBytes?.byteLength && fileBytes.byteLength <= 2 * 1024 * 1024
+			? (() => {
+					const content = fileBytes;
+					const stamp = stampContentBytes(content, 0);
+					return stamp.sha256
+						? { size: stamp.size, sha256: stamp.sha256 }
+						: undefined;
+				})()
+			: undefined;
+	// #4484 round 3 (R2, R4): place the last verdict's lines in these bytes,
+	// and hand each runner the lines an earlier write owes it.
+	const anchoring = anchorToPriorAnalysis(
+		ctx.priorAnalysisAnchor?.(),
+		fileContent,
+		fileBytes,
+		filePath,
+	);
+	// #4509: the runners that hold a recorded blocker here judge it themselves.
+	const recordedRunnerIds = new Set(
+		(ctx.priorInlineBlockers?.() ?? []).flatMap((d) =>
+			d.runnerId === undefined ? [] : [d.runnerId],
+		),
+	);
 	const dispatchResult = await dispatchLintWithResult(
 		filePath,
 		cwd,
@@ -2060,17 +2464,72 @@ async function analysePipeline(
 		},
 		{
 			projectRoot: ctx.projectRoot,
+			analysisRootMode: ctx.analysisRootMode,
 			// The runners' widget order (#3540).
 			writeIndex: widgetOrder(),
 			// #3568: a collect-later runner defers its result to a turn end.
 			sessionGeneration: ctx.sessionGeneration,
+			sessionId: ctx.telemetry?.sessionId,
 			telemetryModel: ctx.telemetry?.modelId,
 			telemetryProvider: ctx.telemetry?.provider,
+			// #4484 round 3 (R4): lines owed to runners that had no verdict.
+			owedRanges: anchoring.owed.size > 0 ? anchoring.owed : undefined,
+			recordedRunnerIds:
+				recordedRunnerIds.size > 0 ? recordedRunnerIds : undefined,
 		},
 	);
+	// #4484: the store, the widget and the published set hold the file's
+	// blockers, not only the ones the delta called new; a blocker held back as
+	// already seen is still on the file.
+	// #4484 r2: so does a recorded blocker this run did not retire: one an
+	// edit-range gate withheld or the delta held back as an old unused value
+	// (its observed copy), or one whose source reached no verdict (its recorded
+	// copy).
+	// #4484 round 3: a recorded blocker is matched only at its own position.
+	const heldBackBlockers = dispatchResult.heldBackBlockers ?? [];
+	// #4483: linter errors the file held before its first edit this session.
+	const seededFindings = dispatchResult.preExisting ?? [];
+	const ownFile = normalizeEphemeralMapKey(filePath);
+	const { carried: carriedBlockers, matched: matchedBlockers } =
+		carryRecordedBlockers(
+			ctx.priorInlineBlockers?.() ?? [],
+			[...dispatchResult.blockers, ...heldBackBlockers, ...seededFindings],
+			dispatchResult,
+			filePath,
+			(d) =>
+				d.line === undefined ||
+				(d.filePath && normalizeEphemeralMapKey(d.filePath) !== ownFile)
+					? d.line
+					: anchoring.positionOf({
+							line: d.line,
+							lineHash: d.lineHash,
+							positionStale: d.positionStale,
+						}),
+			anchoring.matchesAnywhere,
+			ctx.modifiedRanges,
+		);
+	// #4484 round 3 (F4): a held-back blocker no recorded blocker matched was
+	// never delivered (a new error that took a fixed one's line-bound id), so
+	// it renders in the STOP block, not as still unfixed.
+	const promotedBlockers = heldBackBlockers.flatMap((d) =>
+		matchedBlockers.has(d) ? [] : [d],
+	);
+	// #4483: the record wins over the seed. A pre-existing copy that a recorded
+	// blocker matched is still that blocker (recorded on another write, or
+	// carried over a session boundary), so it stays recorded and unfixed.
+	const preExisting = seededFindings.filter((d) => !matchedBlockers.has(d));
+	const recordedSeeded = seededFindings.filter((d) => matchedBlockers.has(d));
+	const keptBlockers =
+		carriedBlockers.length > 0 || recordedSeeded.length > 0
+			? [...heldBackBlockers, ...recordedSeeded, ...carriedBlockers]
+			: heldBackBlockers;
+	const storedDiagnostics =
+		keptBlockers.length > 0
+			? [...dispatchResult.diagnostics, ...keptBlockers]
+			: dispatchResult.diagnostics;
 	recordDiagnostics(
 		filePath,
-		dispatchResult.diagnostics,
+		storedDiagnostics,
 		widgetOrder(),
 		analysisReadAtMs,
 	);
@@ -2085,15 +2544,13 @@ async function analysePipeline(
 	{
 		const absPath = path.resolve(filePath);
 		const wasDirty = wasPreviouslyReportedDirty(absPath);
-		if (dispatchResult.diagnostics.length > 0 || wasDirty) {
+		if (storedDiagnostics.length > 0 || wasDirty) {
 			publishDiagnostics({
 				cwd,
 				files: [
 					{
 						path: absPath,
-						diagnostics: dispatchResult.diagnostics.map(
-							toPilensDiagnosticEntry,
-						),
+						diagnostics: storedDiagnostics.map(toPilensDiagnosticEntry),
 					},
 				],
 				dbg,
@@ -2133,14 +2590,34 @@ async function analysePipeline(
 	// the deleted file's content), so it is dropped here rather than re-asserted.
 	// One bounded stat per unique cited path, only when blockers exist — zero
 	// cost on the clean/fast paths.
-	const deliverableBlockers = hasBlockers
-		? dropFindingsForMissingPaths({
-				store: "stop-blocker",
-				findings: dispatchResult.blockers,
-				cwd,
-				citedPath: (b) => b.filePath || undefined,
-			})
-		: [];
+	//
+	// #4484: the gate runs over the file's current blocking set, the delta's
+	// blockers plus the ones it held back. The new ones render as the STOP
+	// block; the held-back ones get one line and stay in the record, so an
+	// empty delta no longer reads as a fix.
+	const currentBlockers =
+		keptBlockers.length > 0
+			? [...dispatchResult.blockers, ...keptBlockers]
+			: dispatchResult.blockers;
+	const liveBlockers =
+		currentBlockers.length > 0
+			? dropFindingsForMissingPaths({
+					store: "stop-blocker",
+					findings: currentBlockers,
+					cwd,
+					citedPath: (b) => b.filePath || undefined,
+				})
+			: [];
+	const newBlockers = new Set([
+		...(hasBlockers ? dispatchResult.blockers : []),
+		...(allowAutonomousWriters ? promotedBlockers : []),
+	]);
+	const deliverableBlockers =
+		newBlockers.size > 0 ? liveBlockers.filter((b) => newBlockers.has(b)) : [];
+	// The record's blockers: every live one, withheld like the STOP block from
+	// a run without authorship (#3226).
+	const recordBlockers = allowAutonomousWriters ? liveBlockers : [];
+	const stillUnfixed = recordBlockers.filter((b) => !newBlockers.has(b));
 	// #3190: ONE gate, applied once here, for EVERY surface. The durable record
 	// this function hands `runtime.recordInlineBlockers` (and through it the
 	// turn-end `Unresolved from this turn` re-serve) used to be built from the
@@ -2182,7 +2659,9 @@ async function analysePipeline(
 		!allowAutonomousWriters && dispatchResult.hasBlockers
 			? dispatchResult.output.slice(dispatchResult.blockerOutput.length)
 			: dispatchResult.output;
-	if (hasBlockers && fileContent) {
+	// #4484 round 3 (F4): a promoted held-back blocker opens the STOP block too.
+	const rendersStop = newBlockers.size > 0;
+	if (rendersStop && fileContent) {
 		// Enrich blocker output with a code snippet so the agent can see the
 		// exact line it wrote that caused each violation — no re-read needed.
 		if (deliverableBlockers.length > 0) {
@@ -2199,7 +2678,7 @@ async function analysePipeline(
 		// still cites possibly-deleted files. Re-render from the gated set
 		// (no snippets without fileContent) and keep the post-blocker slice.
 		if (
-			hasBlockers &&
+			rendersStop &&
 			deliverableBlockers.length !== dispatchResult.blockers.length
 		) {
 			let gatedOut = buildEnrichedBlockerOutput(deliverableBlockers);
@@ -2215,6 +2694,12 @@ async function analysePipeline(
 		} else {
 			output += `\n\n${deliveredOutput}`;
 		}
+	}
+	if (stillUnfixed.length > 0) {
+		output += `\n\n${formatStillUnfixedLine(stillUnfixed, filePath)}`;
+	}
+	if (preExisting.length > 0) {
+		output += `\n\n${formatPreExistingLine(preExisting, filePath)}`;
 	}
 	if (fixedCount > 0) {
 		const detail =
@@ -2363,57 +2848,25 @@ async function analysePipeline(
 		// drops something the stored text can no longer disagree with the tool
 		// result, and `inline-blocker-dispositions.ts`' re-render at turn end still
 		// matches this string exactly.
-		inlineBlockerSummary: hasDeliverableBlockers
-			? formatDiagnostics(deliverableBlockers, "blocking").trim() || undefined
-			: undefined,
+		// #4484: over the file's whole live blocking set (`recordBlockers`), so a
+		// write that adds nothing new refreshes the record instead of clearing it.
+		inlineBlockerSummary:
+			recordBlockers.length > 0
+				? formatDiagnostics(recordBlockers, "blocking").trim() || undefined
+				: undefined,
 		// #1561 F1: taken from the very diagnostics `blockerOutput` was rendered
 		// from, so the provenance can never disagree with the text it guards. An
 		// untagged diagnostic contributes the literal "unknown", which no verdict
 		// claims coverage for — it pins the entry rather than silently widening
 		// what an LSP check is allowed to clear.
-		inlineBlockerSources: hasDeliverableBlockers
-			? [
-					...new Set(
-						deliverableBlockers.map((d) => d.tool?.trim() || "unknown"),
-					),
-				]
-			: undefined,
-		inlineBlockerLines: hasDeliverableBlockers
-			? deliverableBlockers
-					// #1641 review F2: the blocker array (#3190: the deliverable subset
-					// of `dispatchResult.blockers`) is NOT guaranteed to be
-					// scoped to THIS file — a chart-wide runner (helm-lint, helm-render)
-					// reports blocking diagnostics against other files in the chart
-					// (e.g. `values.yaml`) alongside `ctx.filePath`. The precedent every
-					// per-file runner already follows (dotnet-build.ts, javac.ts) is to
-					// drop cross-file rows before they reach a per-file record; this is
-					// that same filter applied at the aggregation point instead, since
-					// `blockers` is pooled across every runner dispatched for this file.
-					// Without it, a cross-file line count gets attributed to THIS
-					// file's past-EOF check and can demote an in-bounds, fully valid
-					// blocker for content the diagnostic never described.
-					//
-					// #1641 review round 2 (LOW): `path.resolve` equality doesn't fold
-					// case, and an LSP-sourced diagnostic's `filePath` is stamped with
-					// realpath canonical casing (dispatch/runners/lsp.ts ->
-					// normalizeMapKey) while `ctx.filePath` can arrive lowercase-drive
-					// on Windows — the drive-letter class from #1139/#1150. A bare
-					// `path.resolve` equality then drops EVERY LSP blocker line and
-					// this record silently skips the past-EOF gate (fail-open, but
-					// exactly the pre-fix behavior on the surface #1641 targets).
-					// `normalizeEphemeralMapKey` slash-folds and (on win32)
-					// lowercase-folds both sides with no filesystem I/O — cheap enough
-					// for this per-blocker hot-path filter. `pathsEqual` was
-					// deliberately NOT used here: it calls `realpathSync` per
-					// comparison, which this filter cannot afford per blocker.
-					.filter(
-						(d) =>
-							normalizeEphemeralMapKey(d.filePath) ===
-							normalizeEphemeralMapKey(filePath),
-					)
-					.map((d) => d.line)
-					.filter((line): line is number => typeof line === "number")
-			: undefined,
+		inlineBlockerSources:
+			recordBlockers.length > 0
+				? inlineBlockerSources(recordBlockers)
+				: undefined,
+		inlineBlockerLines:
+			recordBlockers.length > 0
+				? inlineBlockerLines(recordBlockers, filePath)
+				: undefined,
 		actionableWarnings,
 		codeQualityWarnings,
 		diagnostics: dispatchResult.diagnostics,
@@ -2433,15 +2886,29 @@ async function analysePipeline(
 						source: "autofix",
 					}
 				: undefined,
-		inlineBlockerFileContent: hasBlockers
-			? inlineBlockerFileContent
-			: undefined,
+		inlineBlockerFileContent,
+		analysisAnchor: anchoring.next(
+			dispatchResult.inconclusiveSources,
+			ctx.modifiedRanges,
+			allowAutonomousWriters,
+			dispatchResult.editScopedRunnerIds,
+		),
 		// #3246: the very array `blockerOutput` above was rendered from, so the
 		// turn-end policy filter and its re-render can never disagree with the
 		// text they guard — the same provenance argument `inlineBlockerSources`
 		// makes one field up.
-		inlineBlockerDiagnostics: hasDeliverableBlockers
-			? deliverableBlockers
-			: undefined,
+		// #4484 round 5: each entry carries its own line's text, so a later write
+		// with no position for it matches only a line with that text.
+		inlineBlockerDiagnostics:
+			recordBlockers.length > 0
+				? stampLineHashes(
+						recordBlockers,
+						fileContent,
+						(d) =>
+							!d.filePath || normalizeEphemeralMapKey(d.filePath) === ownFile,
+					)
+				: undefined,
+		// #4484: what a clear must find empty, whatever the authorship.
+		currentBlockerCount: liveBlockers.length,
 	};
 }

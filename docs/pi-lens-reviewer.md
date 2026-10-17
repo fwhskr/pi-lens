@@ -4,7 +4,9 @@ Read first: the engineering principles (`docs/engineering-principles.md`), then
 `AGENTS.md`, then `docs/pi-lens-subagent.md`, then this contract. Then read the
 issue's acceptance criteria, the full merge-base diff
 (`git diff origin/master...HEAD`), the PR body, and merge state. Principles §3
-("Reviewing and delegating") is the base of this role and is not repeated.
+("Reviewing and delegating") is the base of this role and is not repeated. Lane mechanics (checkout, `TMPDIR`, push forms, Git grants,
+summary shape) are `docs/pi-lens-subagent.md` "Orchestrator lane mechanics";
+a brief supplies only `lane=<name>`, scope, and the grant.
 
 ## Mission
 
@@ -31,8 +33,7 @@ issue's acceptance criteria, the full merge-base diff
    exception). When the fixer settled before its evidence pass, run the
    mutation table yourself and say so.
 4. Attack with probes and quote the output. Probe scripts live outside the
-   worktree (`<worktree>/../probes-<pr>` or
-   `~/.local/share/pi-lens-orchestrator/tmp/<lane>`): an untracked `.mjs`
+   worktree (`<worktree>/../probes-<pr>` or the lane's `$TMPDIR`): an untracked `.mjs`
    inside it reds `tests/scripts/lint-js.test.ts` (#2865). Attack inversions
    (real failures downgraded, healthy paths narrowed); concurrency (shared
    state, retained settled promises, check-then-act across an await); session
@@ -51,10 +52,19 @@ issue's acceptance criteria, the full merge-base diff
 
 ## Verification
 
+For each new or changed `vi.mock` or hand-built double of a `clients/` module,
+check whether a real test seam exists (`set*`, `adopt*`, or `reset*`). If it
+does, treat the double as a finding and require the behavior to run through the
+real seam. Check that every gate the diff adds is exercised through that path.
+
 - **Name the behaviour population.** When a change replaces, moves, or widens
   a lifecycle, dispatch, or ownership seam, run EVERY suite that exercises the
   behaviour the seam governs and name the list; a curated file set cannot
   clear what it omits (#3622).
+- **Challenge the population query.** Re-run the fixer's sibling search with
+  a wider query of your own, by primitive or mechanism instead of the fixer's
+  call names. Report what the fixer's query missed; a population that a wider
+  query extends is a finding (#4536).
 - **Generalization verdict.** When a mechanism, policy, guard, or optimisation
   targets N of M members (registry entries, servers, tools, languages,
   stores), name M, why the others are excluded, and their default, and end
@@ -65,17 +75,25 @@ issue's acceptance criteria, the full merge-base diff
   runs the same gate after its build.
 - Require the exact-pin rule in `docs/pi-lens-subagent.md` on the MERGE of
   `origin/master` and the head.
-- Read the `Mutation diff` comment for the EXACT head: check its `Head:` line
-  (`node scripts/ci-verdict.mjs <pr>` prints `MUTATION` with `STALE` or
-  `PENDING`). Every survivor on an added line is killed by a folded test or
-  shown equivalent with a reason; triage "truncated test population"
-  survivors, never auto-accept them. Spot-check at most one of the fixer's
-  hand mutations. When the comment is absent or stale, read the
-  `mutation-report` artifact (`node scripts/mutation-report.mjs --report
-  <mutation.json>`). Absent, stale, `0 mutants evaluated`, partial, or
-  `no report` evidence goes under `Could not verify`.
+- Apply AGENTS.md's one mutation layer (#4005): required new-guard proof and
+  demonstrated correctness gaps gate the review. Spot-check at most one of the
+  fixer's hand mutations. There is no per-PR Stryker comment or `MUTATION`
+  line to read; the nightly Stryker report on master is exploratory and is not
+  a review input.
+- For every relaxed or rewritten existing assertion, mutate the behaviour the
+  test is named for; a rewrite that stays green is a finding (#4390). This is
+  the exception to the one-spot-check cap above.
 - Repeat the pattern and population sweeps. Check blast radius, bounded
   observability, changelog, commit, and PR-body requirements.
+- Re-run the PR's `## Class sweep` search yourself and widen it when the
+  named shape is broader than the touched seam (#4273, #4268).
+- On a bug-closing PR, check the `## Detection` lesson: the layer named under
+  `Should have been caught by:` must be one that would actually have caught
+  the bug, and `Gap:` must be a real issue, test, or reason (#4288). Judge
+  `Shape:` and `Enforcer:` too: the lint checks the catalog number and that the
+  path is on the base and named by the entry, not that the test scans the
+  shape's whole population, so open the enforcer and decide whether it does
+  (#4439).
 - For LSP, dispatch, cache, runner, or tool changes, test one non-TypeScript
   registry entry through the same seam.
 - On a net-count fold, mutate every predicate the deleted sibling used to
@@ -88,6 +106,9 @@ issue's acceptance criteria, the full merge-base diff
 ## Standing probes
 
 Run every probe the diff can trip and say which ran and what each returned.
+For LSP diagnostics, the formatter, the review graph and `rename_file`, start
+from the `verify-pi-lens` skill (`.claude/skills/verify-pi-lens/SKILL.md`)
+instead of rebuilding the probe.
 
 - **Ladder and deletion sweep.** Every ask names the ladder rung it serves. An
   ask that adds a guard names its recurrence; an ask that deletes a defensive
@@ -103,9 +124,16 @@ Run every probe the diff can trip and say which ran and what each returned.
 - **Model covers the change, not only TLC green (#3802).** When the diff
   touches a file mapped in `formal/coverage-map.json`, require a `.tla`/`.cfg`
   change under any one of the row's families or a `TLA+ unaffected: <family> —
-  <reason>` line for any one of them; rows of 4+ families only print a note. A
-  green `TLA+ models` run over an unchanged model proves nothing about the new
-  code.
+  <reason>` line for any one of them; rows of 4+ families only print a note,
+  except `index.ts`, which gates on the lifecycle hook handler a hunk lands in.
+  A green `TLA+ models` run over an unchanged model proves nothing about the
+  new code.
+  For a `TLA+ unaffected` line, read the family's as-built config constants:
+  a diff that changes a behaviour one of them encodes refutes the line and is
+  a finding (#4387: #4235 changed read-guard authorship while the as-built
+  switches kept the old behaviour). `formal/switch-pins.json` names each
+  pinned constant's test (#4393); a changed behaviour with no flipped value
+  and pin is the same finding.
 - **Red-proof audit.** A claimed red without its quoted transcript is a finding
   of its own; reproduce it (step 3).
 - **Quoted-evidence audit.** Diff every CI line the body quotes against the job
@@ -128,8 +156,11 @@ Run every probe the diff can trip and say which ran and what each returned.
   from each merged PR's `PR body (advisory)` row in `ci-verdict`
   (recurrence: #3873).
 - **Changelog fragment.** Front matter `section:` is one of Added, Changed,
-  Deprecated, Removed, Fixed, or Security, followed by exactly one top-level
-  entry. Bullet style and a bold or plain title are the author's choice
+  Deprecated, Removed, Fixed, or Security, and `audience:` is `user` or
+  `internal` (`user` = a pi-lens user or agent can observe it; `internal` = CI,
+  tests, `formal/`, contributor docs, orchestration, refactors), followed by
+  exactly one top-level entry. A missing or unknown `audience` is an error.
+  Bullet style and a bold or plain title are the author's choice
   (`.changelog/README.md`). `CHANGELOG.md` changes only in the rollups
   `npm run changelog:release` generates.
 - **Sort comparators.** Every new `.sort()` or `.toSorted()` has an explicit
@@ -140,6 +171,26 @@ Run every probe the diff can trip and say which ran and what each returned.
   `// flake-shape: <detector> — <reason>` header and `wallClockBudgetInclude`
   membership (#2547). A pinned file whose count falls below its pin needs its
   baseline tightened; a stale ceiling re-admits regrowth.
+- **Hot-path timing.** When the diff touches dispatch, `session_start`, LSP
+  diagnostics, a cache lookup or turn-end, re-run the body's before/after
+  timing on the real path, at a small and a large input (file size, file
+  count). A regression the body does not name and justify is a finding (#4344
+  r1: replay went from 6 ms to 321 ms; #4368 r1: import extraction took 190 ms
+  at 1.6k lines and 9.2 s at 12k). Read the `Hot-path latency (advisory)` job
+  summary on the head (#4363) first; it covers `session_start`, dispatch and
+  replay, and a red there is a finding unless the body justifies it. Green
+  means no regression of 1.25x and 5 ms; a "slower, below threshold" row is
+  still a number to read.
+- **Shutdown-path parity.** When the diff moves or rewraps code that stops a
+  child (a server, a client, a spawned tool), compare the stop path before and
+  after: does the child still get its graceful signal (stdin end, shutdown
+  request) before any kill, and do its exit-time records and files still
+  appear? Count them over a few runs on both heads. A green suite proves
+  nothing here (#4366 r2: a shared-client fold swapped stdin end for SIGTERM;
+  the shutdown record went from 3/3 to 0/12 and 11 sockets leaked).
+- **Windows path shapes.** A new test or runtime comparison of paths goes
+  through `toPosix` or `path.win32` (`AGENTS.md`). A host-default separator is
+  a finding even when Linux CI is green (#4356: Windows advisory red).
 - **Platform skips and session-start resets.** Apply the `AGENTS.md` test
   screens and the `SessionStartClassification` invariant.
 
@@ -151,8 +202,7 @@ each claim's edge, re-run the targeted suites, and read CI on that head. Attack
 the round's changed lines as a fresh PR; fix rounds introduce defects at about
 the rate they remove them.
 
-- First spot-check one previous round's mutation on the new head and read its
-  `Mutation diff` comment (#2583).
+- First spot-check one previous round's mutation on the new head (#2583).
 - When a round retunes a threshold, tier, or predicate, drive the boundary
   input the new condition cannot separate through the real seam: a cure for
   over-triggering tends to ship silent under-triggering (#2983).
@@ -210,3 +260,11 @@ merge-order interactions with other open PRs, plus:
 - Cleared categories (one compact list) and exact-head identity.
 
 Use short, active, plain prose.
+
+## Documentation and prose standard
+
+Apply this standard to PR and issue bodies, review comments, commit messages, documentation, and changelog entries. Lead with the outcome. Remove words that do no work. Use active voice and present tense. Use second person for instructions, and use the imperative for steps. Keep one idea per sentence, with about 20–25 words and no more than 30 words. Use consistent terminology and sentence-case headings. Define acronyms on first use. Prefer plain words over jargon. Avoid `please`, filler, noun piles, nested parentheticals, and em-dash chains. Use the Oxford comma.
+
+The mechanical rules are checked by `scripts/check-prose.mjs`. The checker ignores fenced code, inline code, URLs, quoted log lines, blockquotes, and tables. It blocks long sentences, filler, and title-case headings. It warns on passive voice. The CLI accepts a body file or standard input and supports `--json`.
+
+Reviewers judge clarity, terminology, active voice, sentence structure, and whether each list uses parallel grammar. Treat a mechanically clean result as necessary, not sufficient. Report prose that obscures the outcome or makes a user infer the action.

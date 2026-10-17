@@ -37,6 +37,10 @@ import {
 	getLatencyLogPath,
 } from "../../clients/latency-logger.js";
 import { TypeScriptServer } from "../../clients/lsp/server.js";
+import {
+	resetProjectTrust,
+	setProjectTrustState,
+} from "../../clients/project-trust.js";
 
 // TASK-188: emulate the external wrapper's temporaryFile({name: "tscancellation"})
 // allocation, not a real process or a patch to installed node_modules. The wrapper
@@ -53,6 +57,8 @@ describe("TypeScript cancellation scratch ownership", () => {
 
 	beforeEach(() => {
 		vi.stubEnv("PI_LENS_TEST_MODE", "0");
+		// #4299: a project-supplied compiler launches only for a trusted session.
+		setProjectTrustState("trusted");
 		failRemoval.value = false;
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-task-188-"));
 		home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-task-188-home-"));
@@ -93,6 +99,7 @@ describe("TypeScript cancellation scratch ownership", () => {
 		await flushLatencyLog();
 		failRemoval.value = false;
 		vi.unstubAllEnvs();
+		resetProjectTrust();
 		for (const launch of launches.splice(0)) {
 			launch.child.emit("close", 0, null);
 			// Pre-fix red runs can leave children in the isolated ambient temp root.
@@ -104,7 +111,10 @@ describe("TypeScript cancellation scratch ownership", () => {
 	});
 
 	it("removes its private cancellation namespace after normal shutdown", async () => {
-		const result = await TypeScriptServer.spawn(root, { allowInstall: false });
+		const result = await TypeScriptServer.spawn(root, {
+			allowInstall: false,
+			projectCodeAllowed: true,
+		});
 		const launch = launches[0];
 		expect(result?.launchVariant).toBe("classic");
 		expect(fs.existsSync(launch.cancellation)).toBe(true);
@@ -148,14 +158,20 @@ describe("TypeScript cancellation scratch ownership", () => {
 			throw failure;
 		});
 		await expect(
-			TypeScriptServer.spawn(root, { allowInstall: false }),
+			TypeScriptServer.spawn(root, {
+				allowInstall: false,
+				projectCodeAllowed: true,
+			}),
 		).rejects.toBe(failure);
 		expect(fs.existsSync(launches[0].cancellation)).toBe(false);
 		expect(fs.existsSync(launches[0].temp)).toBe(false);
 	});
 
 	it("records a cleanup failure without rejecting shutdown", async () => {
-		await TypeScriptServer.spawn(root, { allowInstall: false });
+		await TypeScriptServer.spawn(root, {
+			allowInstall: false,
+			projectCodeAllowed: true,
+		});
 		const launch = launches[0];
 		failRemoval.value = true;
 		launch.child.emit("close", 0, null);
@@ -198,7 +214,10 @@ describe("TypeScript cancellation scratch ownership", () => {
 			result.process.emit("close", 0, null);
 			return result;
 		});
-		await TypeScriptServer.spawn(root, { allowInstall: false });
+		await TypeScriptServer.spawn(root, {
+			allowInstall: false,
+			projectCodeAllowed: true,
+		});
 		expect(fs.existsSync(launches[0].temp)).toBe(false);
 	});
 
@@ -206,8 +225,14 @@ describe("TypeScript cancellation scratch ownership", () => {
 		const foreign = path.join(root, "fedcba9876543210fedcba9876543210");
 		fs.mkdirSync(foreign);
 		await Promise.all([
-			TypeScriptServer.spawn(root, { allowInstall: false }),
-			TypeScriptServer.spawn(root, { allowInstall: false }),
+			TypeScriptServer.spawn(root, {
+				allowInstall: false,
+				projectCodeAllowed: true,
+			}),
+			TypeScriptServer.spawn(root, {
+				allowInstall: false,
+				projectCodeAllowed: true,
+			}),
 		]);
 		const [first, second] = launches;
 		expect(first.temp).not.toBe(second.temp);
