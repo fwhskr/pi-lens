@@ -420,6 +420,18 @@ file-scoped worklist and receives no project-wide scanner output.
     or says `none: <reason>` naming each file (`check-pr-body` prompts for it);
     a test reads a record back, and a reason is judged by the reviewer
     (#3875; recurrence #3873: the S2/S3 fixes could not be shown to fire live).
+    A new or changed `catch` handler in `clients/`, `mcp/`, `tools/` or
+    `index.ts` is judged by `tests/config/silent-catch-sweep.test.ts`: a record
+    seam on every path, an unconditional `throw`, or a `none: <reason>` marker,
+    and the file's pinned set re-pinned in the same change (`PI_LENS_PRINT_PINS=1`
+    prints the rows). `scripts/` and `tests/` stay outside its scope.
+
+75. **Swallowed failure recorded as a different event:** a `catch` that drops a
+    failure and lets the normal path continue makes the log report success or
+    an event that never happened (an unreadable subtree counted as deleted, a
+    rejected save counted as sent). A catch on a runtime path records the
+    failure under its own kind, or says `none: <reason>`. Screen: force the
+    failure through the real entry point and read the record it wrote.
 
 43. **Prose mistaken for executable structure:** define lexical states and
     reachability before scanning shell, workflow, or source text.
@@ -670,6 +682,10 @@ file-scoped worklist and receives no project-wide scanner output.
     the sink) and fail closed on an unrecognised form. Screen: plant an
     alias, an indirect call and a value reached through another binding,
     and quote each result; every green plant is fixed or named as a residual.
+    On 2026-10-18 five detector PRs took two to six rounds each because
+    every verify found one more spelling. A detector's first round therefore lists its admitted forms
+    and refuses everything else; a residual names an admitted form that is
+    too broad, never a spelling the detector does not read.
 
 73. **Fixture adopts an ancestor root:** a fixture created with no project
     marker inherits whatever root sits above it, so one stray `.git` at the tmp
@@ -1134,6 +1150,23 @@ file-scoped worklist and receives no project-wide scanner output.
 - `clients/dispatch/runners/runner-spawn-cwd-sweep.test.ts` is the population
   guard for child cwd derivation. Add a reasoned migration row instead of a
   pin-only update.
+- Each real-bytes fixture under `tests/fixtures/runner-output/` records the
+  availability probe its runner sends (`availability`: the argv, the binary
+  that answered from its own banner, and the real exit status) and a real clean
+  run (`clean`; there is no prose alternative). The clean record is the
+  fixture's own invocation run in `tests/fixtures/runner-output-clean/<runner>`,
+  whose inputs are un-ignored by `.gitignore` on purpose. One gate,
+  `recordProblems` in `scripts/capture-runner-output.mjs`, refuses a record whose
+  version its own answer never printed, and a clean run whose argv is not this
+  fixture's; the capture and the census both call it.
+  `captured-real-output.test.ts` runs the REAL checker against that record
+  instead of mocking it, so a tool that rejects its own probe — helm 4 rejects
+  `--version` — reaches the replay; the clean bytes are what the matrix's clean
+  cell replays, in the clean workspace. `scripts/capture-runner-fixtures.mjs
+  --records-only` retrofits those records onto an existing fixture without
+  touching its work bytes, keyed on the fixture's own case.
+  Enforced by `tests/clients/dispatch/smoke-fixture-coverage.test.ts` and
+  `tests/clients/dispatch/tool-state-matrix.test.ts`.
 - Every `parseToolRun` runner documents its nonzero-exit table; the documented
   `ran` codes are pinned exactly so adding or removing one does not pass
   silently, and each documented code needs an executable status fixture in the
