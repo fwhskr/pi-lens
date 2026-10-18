@@ -203,8 +203,12 @@ jobs:
     # #4053: only master (or a schedule) may publish, so a `republish`
     # dispatched from a TAG ref (`--ref vX.Y.Z`) is now skipped. Dispatch it
     # from master: `publish_ref` still checks out the existing tag's tree.
+    # TASK-314: publish only after prepare passed its gates. Its outputs are set
+    # before the changelog gate runs, so without this check a failed gate still
+    # reached npm publish.
     if: >-
       ${{ !cancelled()
+          && needs.prepare.result == 'success'
           && needs.prepare.outputs.should_publish == 'true'
           && (github.event_name == 'schedule' || github.ref == 'refs/heads/master')
           && (needs.release.result == 'success' || needs.release.result == 'skipped') }}
