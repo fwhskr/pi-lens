@@ -213,6 +213,8 @@ export const TEST_TREE_GOVERNANCE_TESTS = [
 	"tests/config/env-path-key-composition-sweep.test.ts",
 	// #4589: walks tests/ for env writes with no restore in the same file.
 	"tests/config/test-env-restore-sweep.test.ts",
+	// #4589: walks tests/ for listeners with no awaited teardown.
+	"tests/config/test-server-teardown-sweep.test.ts",
 	// #3472: the tests-tree scanners the census finds through tests/support.
 	"tests/config/module-instance-coverage.test.ts",
 	// #4518: walks .github/ producer files through
@@ -226,6 +228,9 @@ export const TEST_TREE_GOVERNANCE_TESTS = [
 	// #4561 D1: walks tests/ for `describe` shuffle opt-outs and checks the
 	// by-design registry in both directions.
 	"tests/scripts/ci-shuffle-census.test.ts",
+	// #4606: reads both AST sweeps' sources and censuses the tests/support
+	// tree, so a tests-tree change must arm it.
+	"tests/support/ast-census.test.ts",
 	"tests/support/host-event-shape-scan.test.ts",
 	// #4522: walks both captured-fixture trees (and asks git which inputs are
 	// ignored), so a fixture change must arm it; neither pass above selects it
